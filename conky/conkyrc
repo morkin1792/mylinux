@@ -1,0 +1,89 @@
+-- # Fonts
+-- https://www.dafont.com/openlogos.font
+-- http://www.fontspace.com/curtis-clark/pie-charts-for-maps
+-- https://www.dafont.com/pizzadude-bullets.font
+-- https://www.dafont.com/style-bats.font
+-- https://www.dafont.com/wifi.font
+-- # Source: https://www.reddit.com/r/Conkyporn/comments/83d4jw/my_conky/
+
+
+background no
+
+use_xft yes
+xftfont Lucida Grande:size=12
+
+update_interval 1
+total_run_times 0
+double_buffer yes
+no_buffers no
+text_buffer_size 1024
+
+own_window yes
+own_window_type conky
+own_window_transparent yes
+own_window_argb_visual yes
+own_window_argb_value 70
+own_window_class override
+
+own_window_hints undecorated,below,sticky,skip_taskbar,skip_pager
+double_buffer yes
+draw_shades no
+draw_outline no
+draw_borders no
+draw_graph_borders no
+
+minimum_size 185 205
+maximum_width 195
+
+default_color white
+draw_shades no
+
+color0 white
+color1 FCAF3E
+color2 white
+
+
+alignment top_right
+gap_x 1710
+gap_y 170
+
+no_buffers yes
+net_avg_samples 2
+
+override_utf8_locale yes
+
+TEXT
+
+SYSTEM ${hr 2}
+
+${color0}${font StyleBats:size=14}A${font}${color lightgrey} CPU ${font Liberation Sans:style=Bold:size=12}${color2}${cpu cpu0}%${color}${font} ${alignr}${color2}${cpubar cpu0 8,60}${color}
+ └ ${color lightgrey}temp ${alignr}${texeci 10 sensors | grep Core | awk '!/-/' | awk '{ print $3}' | sort -r | head -n 1}
+${alignc}${color #000000}${cpugraph 20,190 000000 FFFFFF}${color}
+${color0}${font StyleBats:size=14}g${font}${color lightgrey} RAM ${alignr}${font Liberation Sans:style=Bold:size=12}${color2}$memperc%${color}${font} ${alignr}${color2}${membar 8,60}${color}
+${color0}${font StyleBats:size=14}j${font}${color lightgrey} swap ${alignr}${font Liberation Sans:style=Bold:size=12}${color2}$swapperc%${color}${font} ${alignr}${color2}${swapbar 8,60}${color}
+${color0}${font StyleBats:size=14}t${font}${color lightgrey} uptime ${alignr}${color2}${uptime}${color}
+${color0}${font StyleBats:size=14}q${font}${color lightgrey} battery ${alignr}${color2}${battery_percent}%${color}
+
+DISK ${hr 2}
+
+${voffset 4}${font Pie charts for maps:size=14}7${font} ${voffset -5}${color lightgrey} system
+${color}${voffset 4}${fs_used /}/${fs_size /} ${alignr}${fs_bar 8,60 /}
+${voffset 4}${font Pie charts for maps:size=14}7${font} ${voffset -5}${color lightgrey} data
+${color}${voffset 4}${fs_used /var/media/data}/${fs_size /var/media/data} ${alignr}${fs_bar 8,60 /var/media/data}
+${voffset 4}${font Pie charts for maps:size=14}7${font} ${voffset -5}${color lightgrey} tmp
+${color}${voffset 4}${fs_used /tmp}/${fs_size /tmp} ${alignr}${fs_bar 8,60 /tmp}
+
+${font StyleBats:size=14}A ${font}${color lightgrey}R: ${color FF5C2B}${diskio_read}${exec echo -e '\t\t'}${color lightgrey}W: ${color 77B753}${diskio_write}
+${color #000000}${diskiograph_read 20,90 000000 FF5C2B}${alignr}${color #000000}${diskiograph_write 20,90 000000 77B753}
+
+${color}NETWORK ${hr 2}
+
+${voffset 4}${font WIFI:size=14}B${font} ${color lightgrey} SSID: ${color}${alignr}${wireless_essid wlp2s0}
+
+${voffset -6}${font PizzaDude Bullets:size=14}O${font}${color lightgrey} upload ${color FF5C2B}${alignr}${upspeed wlp2s0}
+${color}${voffset 4} └${font}${color lightgrey} TX ${color}${alignr}${totalup wlp2s0}
+${offset 15}${upspeedgraph wlp2s0 40,168 4B1B0C FF5C2B 100 -l}
+${voffset 4}${font PizzaDude Bullets:size=14}U${font}${color lightgrey} download ${color 77B753}${alignr}${downspeed wlp2s0}
+${color}${voffset 4} └${font}${color lightgrey} RX${color} ${alignr}${totaldown wlp2s0}
+${offset 15}${downspeedgraph wlp2s0 40,167 324D23 77B753 100 -l}
+

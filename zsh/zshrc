@@ -1,0 +1,34 @@
+# install packages
+## grml-zsh-config
+## powerline2 
+## zsh 
+## zsh-autosuggestions 
+## zsh-completions 
+## zsh-doc 
+## zsh-history-substring-search 
+## zsh-lovers 
+## zsh-syntax-highlighting 
+## zsh-theme-powerlevel10k
+
+# and run
+## p10k configure  
+
+alias yay='yay --color=auto'
+alias pacman='pacman --color=auto'
+
+. /usr/share/zsh/plugins/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh
+. /usr/share/zsh/plugins/zsh-autosuggestions/zsh-autosuggestions.zsh
+
+
+## optional
+. /usr/share/zsh-theme-powerlevel9k/powerlevel9k.zsh-theme
+
+POWERLEVEL9K_LEFT_PROMPT_ELEMENTS=(host dir rbenv virtualenv vcs)
+POWERLEVEL9K_RIGHT_PROMPT_ELEMENTS=(status root_indicator background_jobs ssh ram time)
+POWERLEVEL9K_DIR_HOME_FOREGROUND="white"
+POWERLEVEL9K_DIR_DEFAULT_FOREGROUND="white"
+POWERLEVEL9K_DIR_HOME_SUBFOLDER_FOREGROUND="white"
+
+POWERLEVEL9K_DIR_HOME_BACKGROUND="125"
+POWERLEVEL9K_DIR_DEFAULT_BACKGROUND="125"
+POWERLEVEL9K_DIR_HOME_SUBFOLDER_BACKGROUND="125"

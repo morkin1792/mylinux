@@ -1,0 +1,4 @@
+
+/dev/sdxY /location ntfs-3g rw,auto,users,exec,nls=utf8,umask=007,gid=1002,uid=1001    0   0
+
+/var/swapfile       none swap sw 0 0  
