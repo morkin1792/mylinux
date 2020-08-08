@@ -1,3 +1,13 @@
+echo -e '[KDE Action Restrictions]\naction/start_new_session=false' >> ~/.config/kdeglobals
+
+Window Management > Task Switcher > Thumbnail Grid > Disable show selected window
+Window Management > Window Behavior > Advanced > Window placement > Centered
+Workspace Behavior > Desktop Effects > Magic Lamp > 400ms
+Workspace Behavior > Desktop Effects > Wobbly Windows > 50% moving and resizing
+
+Global Theme
+Materia Manjaro
+
 Look and feel 
 Breeze Dark
 
@@ -9,11 +19,8 @@ Materia Dark
 
 Window Decorations/Titles
 Breeze
-Configure Breeze->Window-Specific Overrides->Add->No border
 Breezemite Dark
 
-Desktop Behavior->Desktop Effects->Blur
+Desktop Effects > Blur
 
-Toggle Menu bar -> konsole, vscode
 
-echo -e '[KDE Action Restrictions]\naction/start_new_session=false' >> ~/.config/kdeglobals

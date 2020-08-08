@@ -1,3 +1,6 @@
+
+## nvidia
+
 1. Abrir nvidia-settings como root
 2. Navegar até X Server Display Configuration
 3. Escolher Advanced
