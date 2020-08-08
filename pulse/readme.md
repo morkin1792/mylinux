@@ -1,0 +1,1 @@
+systemctl enable --user pulseaudio.service
