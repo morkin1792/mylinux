@@ -1,5 +1,5 @@
 # install packages:
-## grml-zsh-config
+## grml-zsh-config (for non-archlinux run: $ wget -O .zshrc https://git.grml.org/f/grml-etc-core/etc/zsh/zshrc)
 ## powerline
 ## zsh 
 ## zsh-autosuggestions 
