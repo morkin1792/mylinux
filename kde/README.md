@@ -23,4 +23,4 @@ Breezemite Dark
 
 Desktop Effects > Blur
 
-
+balooctl disable
