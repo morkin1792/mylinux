@@ -1,5 +1,5 @@
 # install packages:
-## grml-zsh-config (for non-archlinux run: $ wget -O .zshrc https://git.grml.org/f/grml-etc-core/etc/zsh/zshrc)
+## grml-zsh-config (for non-archlinux: wget -O ~/.zshrc https://git.grml.org/f/grml-etc-core/etc/zsh/zshrc)
 ## powerline
 ## zsh 
 ## zsh-autosuggestions 
@@ -13,6 +13,8 @@
 # create .zshrc with:
 alias yay='yay --color=auto'
 alias pacman='pacman --color=auto'
+
+bindkey \^U backward-kill-line
 
 . /usr/share/zsh/plugins/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh
 . /usr/share/zsh/plugins/zsh-autosuggestions/zsh-autosuggestions.zsh
