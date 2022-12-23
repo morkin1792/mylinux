@@ -5,3 +5,8 @@ https://wiki.archlinux.org/index.php/Dm-crypt/Encrypting_an_entire_system#Encryp
 ```zsh
 pacman -S earlyoom
 ```
+
+```zsh
+# /etc/default/earlyoom
+EARLYOOM_ARGS="... -m 4"
+```
