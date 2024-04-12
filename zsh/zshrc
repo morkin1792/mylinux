@@ -11,6 +11,10 @@
 ## zsh-theme-powerlevel10k
 
 # create .zshrc with:
+HISTFILE=~/.histfile
+HISTSIZE=10000
+SAVEHIST=10000
+
 alias yay='yay --color=auto'
 alias pacman='pacman --color=auto'
 
