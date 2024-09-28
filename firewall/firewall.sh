@@ -51,6 +51,22 @@ function set_gateway() {
     sudo iptables -t nat -A POSTROUTING -p tcp --source $deviceAddr -j MASQUERADE
 }
 
+function forward_interface() {
+    targetIP=$1
+    srcInterface=$2
+    dstInterface=$3
+    mark="111"
+    table="11"
+    ## marking target packages
+    sudo iptables -t mangle -A PREROUTING -i $srcInterface -s $targetIP -j MARK --set-mark $mark
+    ## setting table
+    sudo ip route add default dev $dstInterface table $table
+    sudo ip rule add fwmark $mark table $table
+    sudo ip route flush cache
+    ## adding the original destination ip address to response packages
+    sudo iptables -t nat -A POSTROUTING -o $dstInterface -j MASQUERADE
+}
+
 ###### arptables ######
 sudo arptables-nft -F
 sudo arptables-nft -P INPUT DROP
