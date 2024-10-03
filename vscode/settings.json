@@ -1,5 +1,6 @@
 {
     "editor.find.seedSearchStringFromSelection": false,
+    "output.smartScroll.enabled": false,
     "workbench.colorTheme": "Monokai Dimmed",
     "window.menuBarVisibility": "toggle",
     "window.zoomLevel": 1,
