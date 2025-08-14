@@ -37,6 +37,8 @@ sudo ip6tables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 
 function set_gateway() {
     deviceAddr="$1"
+    sudo sysctl -w net.ipv4.ip_forward=1
+    
     sudo arptables-nft -A INPUT -s $deviceAddr -j ACCEPT
     ## allow dns server
     sudo iptables -A INPUT -p udp --source $deviceAddr --dport 53 -j ACCEPT
