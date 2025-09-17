@@ -1,8 +1,9 @@
 {
-    "editor.find.seedSearchStringFromSelection": false,
+    "editor.find.seedSearchStringFromSelection": "never",
+    "editor.pasteAs.enabled": false,
     "output.smartScroll.enabled": false,
-    "workbench.colorTheme": "Monokai Dimmed",
     "window.menuBarVisibility": "toggle",
-    "window.zoomLevel": 1,
     "workbench.editor.enablePreview": false,
+    // "window.zoomLevel": 1,
+    // "workbench.colorTheme": "Monokai",
 } 
