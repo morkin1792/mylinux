@@ -27,10 +27,15 @@ sudo ip6tables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 #sudo iptables -I DOCKER-USER -i docker0 -d 172.16.0.0/12 -p all -j ACCEPT 
 
 ###### persistence ######
+# arch-based
 # iptables-save -f /etc/iptables/iptables.rules
 # systemctl enable iptables
 # ip6tables-save -f /etc/iptables/ip6tables.rules
 # systemctl enable ip6tables
+
+# debian-based
+# sudo apt install iptables-persistent 
+# sudo netfilter-persistent save
 
 
 ###### gateway setup ######
