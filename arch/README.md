@@ -4,6 +4,7 @@ https://wiki.archlinux.org/index.php/Dm-crypt/Encrypting_an_entire_system#Encryp
 ## post-installation
 ```zsh
 pacman -S earlyoom
+systemctl enable --now earlyoom
 ```
 
 ```zsh

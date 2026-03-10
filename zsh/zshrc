@@ -1,19 +1,12 @@
-# install packages:
-## grml-zsh-config (for non-archlinux: wget -O ~/.zshrc https://git.grml.org/f/grml-etc-core/etc/zsh/zshrc)
-## powerline
-## zsh 
-## zsh-autosuggestions 
-## zsh-completions 
-## zsh-doc 
-## zsh-history-substring-search 
-## zsh-lovers 
-## zsh-syntax-highlighting 
-## zsh-theme-powerlevel10k
+## sudo pacman -S --needed zsh powerline powerline-fonts grml-zsh-config zsh-autosuggestions zsh-completions zsh-doc zsh-history-substring-search zsh-lovers
+## yay -S oh-my-posh-bin #zsh-theme-powerlevel10k
+## for non-archlinux: wget -O ~/.zshrc https://git.grml.org/f/grml-etc-core/etc/zsh/zshrc)
+##
 
 # create .zshrc with:
 HISTFILE=~/.histfile
-HISTSIZE=10000
-SAVEHIST=10000
+HISTSIZE=20000
+SAVEHIST=20000
 
 alias yay='yay --color=auto'
 alias pacman='pacman --color=auto'
@@ -22,8 +15,7 @@ bindkey \^U backward-kill-line
 
 . /usr/share/zsh/plugins/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh
 . /usr/share/zsh/plugins/zsh-autosuggestions/zsh-autosuggestions.zsh
-. /usr/share/zsh-theme-powerlevel10k/powerlevel10k.zsh-theme
+. /usr/share/zsh/plugins/zsh-history-substring-search/zsh-history-substring-search.zsh
 
-# and run
-## p10k configure  
+eval "$(oh-my-posh init zsh --config ~/.zsh.craver.omp.json)"
 
