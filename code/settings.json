@@ -3,7 +3,8 @@
     "editor.pasteAs.enabled": false,
     "output.smartScroll.enabled": false,
     "window.menuBarVisibility": "toggle",
-    "workbench.editor.enablePreview": false,
+    "diffEditor.renderSideBySide": false
+    //"workbench.editor.enablePreview": false,
     // "window.zoomLevel": 1,
     // "workbench.colorTheme": "Monokai",
 } 
