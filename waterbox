@@ -1,0 +1,469 @@
+#!/usr/bin/env bash
+
+# a simple sandbox for running CLI agents
+
+set -e
+
+# --- Configuration ---
+JAIL_ROOT="$HOME/.waterbox/root"
+CONFIG_DIR="$HOME/.waterbox"
+SHARE_LIST="$CONFIG_DIR/shared_paths"
+USER_NAME="water"
+MACHINE_NAME="waterbox"      # external name: systemd unit, machinectl, ve-* iface
+INSIDE_HOSTNAME="box"        # hostname shown inside the container
+TMUX_SESSION="box"           # tmux session that wraps the interactive shell
+CONTAINER_WORKSPACE="/home/$USER_NAME/workspace"
+
+# --- Network parameters ---
+HOST_IP="10.20.30.1"
+CONTAINER_IP="10.20.30.2"
+NET_CIDR="24"
+HOST_ALIAS="host"           # name resolved to $HOST_IP inside the container
+VE_IFACE="ve-$MACHINE_NAME" # systemd-nspawn names the host side ve-<machine>
+
+# If true, the container (10.20.30.0/24) is allowed to reach ANY port the host
+# listens on. Combined with the DNAT rule below, this lets the container hit
+# host loopback services (MCP servers, dev servers, etc.) as `host:PORT` even
+# when the host has a restrictive INPUT policy (ufw, firewalld, etc.).
+# Set to false to leave the host's INPUT chain alone.
+ALLOW_CONTAINER_TO_HOST_PORTS=true
+
+# DNS servers used inside the container. Override by editing here, or by
+# editing /etc/resolv.conf inside the running sandbox. A VPN client inside
+# is free to replace /etc/resolv.conf at runtime.
+DNS_SERVERS=("8.8.8.8" "1.1.1.1")
+
+mkdir -p "$CONFIG_DIR"
+touch "$SHARE_LIST"
+
+# --- Logging ---
+log_info()    { echo -e "\e[34m[INFO]\e[0m $1"; }
+log_success() { echo -e "\e[32m[ OK ]\e[0m $1"; }
+log_warn()    { echo -e "\e[33m[WARN]\e[0m $1"; }
+log_error()   { echo -e "\e[31m[ERR ]\e[0m $1"; exit 1; }
+
+show_help() {
+    cat <<EOF
+Usage: waterbox [command] [arguments]
+
+Namespace-isolated Arch sandbox powered by systemd-nspawn. Intended for tools
+like claude-code that you want to run in bypass mode without giving them the
+keys to your whole machine.
+
+Commands:
+  start             Boot the sandbox (if not already running) and attach to it.
+                    The attached shell lives in a persistent tmux session named
+                    "$TMUX_SESSION" — detach with Ctrl+b d to keep state across
+                    re-attaches. Typing 'exit' ends the tmux session.
+  stop              Power off the running sandbox.
+  restart           stop + start (use after 'share add' to mount the new path).
+  status            Show whether the sandbox is currently running.
+  reset             Wipe the sandbox filesystem and rebuild it from scratch.
+  share add <path>  Expose a host directory inside the workspace.
+                    Requires 'waterbox restart' to take effect.
+  share del <path>  Stop exposing a host directory. Live-unmounts immediately
+                    if the sandbox is running; no restart needed.
+  share list        List directories currently mapped into the workspace.
+  help              Show this help.
+
+Paths:
+  Rootfs:                 $JAIL_ROOT
+  Workspace inside:       $CONTAINER_WORKSPACE
+  Host reachable inside:  $HOST_ALIAS  ($HOST_IP)
+                          \`host:PORT\` is DNAT'd to 127.0.0.1:PORT on the host,
+                          so MCP servers bound to localhost are reachable as-is.
+EOF
+}
+
+# --- Bootstrap (runs once) ---
+bootstrap_sandbox() {
+    if [ -d "$JAIL_ROOT/usr" ]; then
+        return 0
+    fi
+
+    log_info "Bootstrapping Arch rootfs at $JAIL_ROOT (this takes a few minutes)..."
+    sudo mkdir -p "$JAIL_ROOT"
+    sudo chown root:root "$JAIL_ROOT"
+
+    local pkgs=(
+        base base-devel bash git nodejs npm sudo coreutils
+        iproute2 iputils dbus
+        zsh powerline powerline-fonts grml-zsh-config
+        zsh-autosuggestions zsh-completions
+        zsh-history-substring-search zsh-syntax-highlighting
+        ripgrep tmux bind vim less
+    )
+
+    sudo pacstrap -K "$JAIL_ROOT" "${pkgs[@]}"
+
+    log_info "Configuring locale, user, networking..."
+
+    echo "$INSIDE_HOSTNAME" | sudo tee "$JAIL_ROOT/etc/hostname" > /dev/null
+
+    # Static resolv.conf — nspawn won't touch it (we use --resolv-conf=off).
+    # systemd-resolved is masked below so it can't reclaim the file or symlink
+    # /etc/resolv.conf to its stub. A VPN client inside is free to overwrite.
+    sudo rm -f "$JAIL_ROOT/etc/resolv.conf"
+    {
+        for dns in "${DNS_SERVERS[@]}"; do
+            echo "nameserver $dns"
+        done
+    } | sudo tee "$JAIL_ROOT/etc/resolv.conf" > /dev/null
+
+    # /etc/hosts: name the host so it's easy to reach from inside.
+    sudo tee -a "$JAIL_ROOT/etc/hosts" > /dev/null <<EOF
+$HOST_IP    $HOST_ALIAS
+EOF
+
+    # Locale
+    echo "en_US.UTF-8 UTF-8" | sudo tee "$JAIL_ROOT/etc/locale.gen" > /dev/null
+    sudo systemd-nspawn -q -D "$JAIL_ROOT" locale-gen
+    echo "LANG=en_US.UTF-8" | sudo tee "$JAIL_ROOT/etc/locale.conf" > /dev/null
+
+    # User
+    sudo systemd-nspawn -q -D "$JAIL_ROOT" \
+        useradd -m -s /usr/bin/zsh -u 1000 "$USER_NAME" 2>/dev/null || true
+    echo "$USER_NAME ALL=(ALL) NOPASSWD: ALL" \
+        | sudo tee "$JAIL_ROOT/etc/sudoers.d/10-$USER_NAME" > /dev/null
+    sudo chmod 0440 "$JAIL_ROOT/etc/sudoers.d/10-$USER_NAME"
+
+    sudo mkdir -p "$JAIL_ROOT$CONTAINER_WORKSPACE"
+    sudo chown -R 1000:1000 "$JAIL_ROOT$CONTAINER_WORKSPACE"
+
+    # Static network config for host0 (the container side of the veth pair).
+    # Name matches the file shipped in /usr/lib/systemd/network so this one
+    # overrides it; otherwise the lib version (DHCP + link-local) wins.
+    sudo mkdir -p "$JAIL_ROOT/etc/systemd/network"
+    {
+        echo "[Match]"
+        echo "Name=host0"
+        echo ""
+        echo "[Network]"
+        echo "Address=$CONTAINER_IP/$NET_CIDR"
+        echo "Gateway=$HOST_IP"
+        for dns in "${DNS_SERVERS[@]}"; do
+            echo "DNS=$dns"
+        done
+    } | sudo tee "$JAIL_ROOT/etc/systemd/network/80-container-host0.network" > /dev/null
+    sudo systemd-nspawn -q -D "$JAIL_ROOT" \
+        systemctl enable systemd-networkd dbus systemd-logind >/dev/null 2>&1 || true
+    # Mask resolved so it can't hijack /etc/resolv.conf with its stub.
+    sudo systemd-nspawn -q -D "$JAIL_ROOT" \
+        systemctl mask systemd-resolved >/dev/null 2>&1 || true
+
+    # AUR + extras (yay, claude-code, etc). pacstrap container has its own network.
+    sudo sed -i 's/^CheckSpace/#CheckSpace/' "$JAIL_ROOT/etc/pacman.conf"
+    log_info "Installing yay + claude-code + extras inside the rootfs..."
+    sudo systemd-nspawn -q -D "$JAIL_ROOT" --user "$USER_NAME" bash -c "
+        cd /tmp &&
+        git clone https://aur.archlinux.org/yay.git &&
+        cd yay &&
+        makepkg -si --noconfirm &&
+        yay -S --noconfirm oh-my-posh-bin claude-code
+    "
+    sudo sed -i 's/#CheckSpace/CheckSpace/' "$JAIL_ROOT/etc/pacman.conf"
+
+    # .zshrc
+    sudo tee "$JAIL_ROOT/home/$USER_NAME/.zshrc" > /dev/null <<'EOF'
+HISTFILE=~/.histfile
+HISTSIZE=20000
+SAVEHIST=20000
+
+alias yay='yay --color=auto'
+alias pacman='pacman --color=auto'
+
+bindkey '^U' backward-kill-line
+
+. /usr/share/zsh/plugins/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh
+. /usr/share/zsh/plugins/zsh-autosuggestions/zsh-autosuggestions.zsh
+. /usr/share/zsh/plugins/zsh-history-substring-search/zsh-history-substring-search.zsh
+
+eval "$(oh-my-posh init zsh --config blue-owl)"
+export PATH="$HOME/.local/bin:$PATH"
+EOF
+    sudo chown 1000:1000 "$JAIL_ROOT/home/$USER_NAME/.zshrc"
+
+    # tmux: enable mouse so scroll wheel + pane select + resize work.
+    sudo tee "$JAIL_ROOT/home/$USER_NAME/.tmux.conf" > /dev/null <<'EOF'
+set -g mouse on
+set -g history-limit 50000
+EOF
+    sudo chown 1000:1000 "$JAIL_ROOT/home/$USER_NAME/.tmux.conf"
+
+    # claude-code defaults: bypass permissions, opus + xhigh effort, auto-memory on.
+    sudo mkdir -p "$JAIL_ROOT/home/$USER_NAME/.claude"
+    sudo tee "$JAIL_ROOT/home/$USER_NAME/.claude/settings.json" > /dev/null <<'EOF'
+{
+  "permissions": {
+    "defaultMode": "bypassPermissions"
+  },
+  "model": "opus",
+  "effortLevel": "xhigh",
+  "autoMemoryEnabled": true,
+  "skipDangerousModePermissionPrompt": true
+}
+EOF
+    sudo chown -R 1000:1000 "$JAIL_ROOT/home/$USER_NAME/.claude"
+
+    log_success "Rootfs ready at $JAIL_ROOT"
+}
+
+# --- Helpers ---
+is_running() {
+    sudo machinectl show "$MACHINE_NAME" --property=State 2>/dev/null \
+        | grep -q "State=running"
+}
+
+build_bind_args() {
+    local args=()
+    while IFS= read -r host_path || [ -n "$host_path" ]; do
+        [ -z "$host_path" ] && continue
+        local folder_name
+        folder_name=$(basename "$host_path")
+        sudo mkdir -p "$JAIL_ROOT$CONTAINER_WORKSPACE/$folder_name"
+        sudo chown 1000:1000 "$JAIL_ROOT$CONTAINER_WORKSPACE/$folder_name"
+        args+=("--bind=$host_path:$CONTAINER_WORKSPACE/$folder_name")
+    done < "$SHARE_LIST"
+    printf '%s\n' "${args[@]}"
+}
+
+# --- Network setup on host ---
+# Configure ve-waterbox after the container is up. NAT outbound, and DNAT
+# 10.10.0.1 -> 127.0.0.1 so host loopback services are reachable from inside.
+configure_host_network() {
+    # Wait for ve-waterbox to appear (systemd-nspawn creates it once boot starts)
+    local tries=30
+    while [ $tries -gt 0 ] && ! ip link show "$VE_IFACE" >/dev/null 2>&1; do
+        sleep 0.2
+        tries=$((tries - 1))
+    done
+    ip link show "$VE_IFACE" >/dev/null 2>&1 \
+        || log_error "Host-side veth $VE_IFACE never appeared. Check: journalctl -u $MACHINE_NAME"
+
+    sudo ip addr add "$HOST_IP/$NET_CIDR" dev "$VE_IFACE" 2>/dev/null || true
+    sudo ip link set "$VE_IFACE" up
+
+    sudo sysctl -wq net.ipv4.ip_forward=1
+    # Allow packets destined to 127.0.0.1 to arrive via the veth (needed for DNAT below).
+    sudo sysctl -wq "net.ipv4.conf.$VE_IFACE.route_localnet=1"
+
+    # DNAT: container -> host:* gets rewritten to 127.0.0.1:* on the host.
+    sudo iptables -t nat -C PREROUTING -i "$VE_IFACE" -d "$HOST_IP" -j DNAT --to-destination 127.0.0.1 2>/dev/null \
+        || sudo iptables -t nat -A PREROUTING -i "$VE_IFACE" -d "$HOST_IP" -j DNAT --to-destination 127.0.0.1
+
+    # NAT outbound: match by SOURCE, not by output interface. This way the
+    # rule keeps working when the host's default route flips to a VPN tun
+    # (ProtonVPN, wireguard, etc.) — packets just get masqueraded with
+    # whatever the current uplink is, including the VPN.
+    sudo iptables -t nat -C POSTROUTING -s "$HOST_IP/$NET_CIDR" ! -o "$VE_IFACE" -j MASQUERADE 2>/dev/null \
+        || sudo iptables -t nat -A POSTROUTING -s "$HOST_IP/$NET_CIDR" ! -o "$VE_IFACE" -j MASQUERADE
+
+    # FORWARD: INSERT at top so we sit ahead of any VPN killswitch DROP rules
+    # (ProtonVPN, NetworkManager kill switches, ufw, firewalld all insert
+    # their own rules; appending would put ours behind their drops).
+    sudo iptables -C FORWARD -i "$VE_IFACE" -j ACCEPT 2>/dev/null \
+        || sudo iptables -I FORWARD 1 -i "$VE_IFACE" -j ACCEPT
+    sudo iptables -C FORWARD -o "$VE_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null \
+        || sudo iptables -I FORWARD 1 -o "$VE_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+    # INPUT: optionally let the container reach any host-local port. After the
+    # PREROUTING DNAT above, traffic to 10.10.0.1 lands on the host as input
+    # to 127.0.0.1 — a restrictive INPUT policy would otherwise drop it.
+    if [ "$ALLOW_CONTAINER_TO_HOST_PORTS" = "true" ]; then
+        sudo iptables -C INPUT -i "$VE_IFACE" -s "$HOST_IP/$NET_CIDR" -j ACCEPT 2>/dev/null \
+            || sudo iptables -I INPUT 1 -i "$VE_IFACE" -s "$HOST_IP/$NET_CIDR" -j ACCEPT
+    fi
+}
+
+teardown_host_network() {
+    sudo iptables -t nat -D PREROUTING -i "$VE_IFACE" -d "$HOST_IP" -j DNAT --to-destination 127.0.0.1 2>/dev/null || true
+    sudo iptables -t nat -D POSTROUTING -s "$HOST_IP/$NET_CIDR" ! -o "$VE_IFACE" -j MASQUERADE 2>/dev/null || true
+    sudo iptables -D FORWARD -i "$VE_IFACE" -j ACCEPT 2>/dev/null || true
+    sudo iptables -D FORWARD -o "$VE_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+    sudo iptables -D INPUT -i "$VE_IFACE" -s "$HOST_IP/$NET_CIDR" -j ACCEPT 2>/dev/null || true
+}
+
+# --- Start: boot if needed, attach a shell ---
+start_sandbox() {
+    bootstrap_sandbox
+
+    if is_running; then
+        log_info "Sandbox already running, attaching..."
+    else
+        log_info "Booting sandbox as transient systemd unit '$MACHINE_NAME.service'..."
+
+        local bind_args=()
+        while IFS= read -r line; do
+            [ -n "$line" ] && bind_args+=("$line")
+        done < <(build_bind_args)
+
+        sudo systemd-run \
+            --unit="$MACHINE_NAME" \
+            --collect \
+            --service-type=notify \
+            --description="Waterbox container ($MACHINE_NAME)" \
+            systemd-nspawn \
+                --boot \
+                --quiet \
+                --keep-unit \
+                --notify-ready=yes \
+                --directory="$JAIL_ROOT" \
+                --machine="$MACHINE_NAME" \
+                --network-veth \
+                --resolv-conf=off \
+                --capability=CAP_NET_ADMIN,CAP_NET_RAW \
+                --bind=/dev/net/tun \
+                "${bind_args[@]}"
+
+        # systemd-run with --service-type=notify only returns after the
+        # container's systemd has finished boot (sd_notify READY=1), so
+        # by here dbus + logind are guaranteed up.
+        is_running || log_error "Sandbox failed to boot. Check: journalctl -u $MACHINE_NAME -e"
+
+        configure_host_network
+        log_success "Sandbox up. Host reachable inside as '$HOST_ALIAS' ($HOST_IP)."
+    fi
+
+    # Pass ANTHROPIC_API_KEY through to this session only, if set.
+    local env_args=()
+    [ -n "$ANTHROPIC_API_KEY" ] && env_args+=(-E "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
+
+    # Wrap the shell in a persistent tmux session so re-attaches restore the
+    # same state (cwd, running processes, etc). The session is created on
+    # first attach and reused on subsequent ones via -A.
+    exec sudo machinectl shell "${env_args[@]}" \
+        "$USER_NAME@$MACHINE_NAME" \
+        /usr/bin/tmux new-session -A -s "$TMUX_SESSION"
+}
+
+restart_sandbox() {
+    stop_sandbox
+    start_sandbox
+}
+
+# --- Stop ---
+stop_sandbox() {
+    if is_running; then
+        log_info "Powering off sandbox..."
+        sudo machinectl poweroff "$MACHINE_NAME" || true
+        # Wait for it to actually stop so we don't tear down the network
+        # before nspawn releases the veth.
+        local tries=40
+        while [ $tries -gt 0 ] && is_running; do
+            sleep 0.25
+            tries=$((tries - 1))
+        done
+    else
+        log_info "Sandbox not running."
+    fi
+    teardown_host_network
+    log_success "Sandbox stopped."
+}
+
+# --- Status ---
+status_sandbox() {
+    if is_running; then
+        log_success "Sandbox is running."
+        sudo machinectl status "$MACHINE_NAME" --no-pager 2>/dev/null | head -n 12 || true
+    else
+        log_info "Sandbox is stopped."
+    fi
+}
+
+# --- Reset ---
+reset_sandbox() {
+    log_info "About to wipe the waterbox environment."
+    read -p "Delete $JAIL_ROOT and rebuild from scratch? [y/N]: " -r confirmation
+    if [[ ! "$confirmation" =~ ^[Yy]$ ]]; then
+        log_info "Reset aborted."
+        return 0
+    fi
+    if is_running; then
+        sudo machinectl poweroff "$MACHINE_NAME" || true
+        sleep 2
+    fi
+    teardown_host_network
+    sudo rm -rf "$JAIL_ROOT"
+    bootstrap_sandbox
+}
+
+# --- Shares ---
+manage_share() {
+    local action="$1"
+    local target_path="$2"
+    [ -z "$target_path" ] && log_error "Missing path. Usage: waterbox share [add|del] <path>"
+
+    local absolute_path
+    absolute_path=$(realpath "$target_path" 2>/dev/null || echo "$target_path")
+    local folder_name
+    folder_name=$(basename "$absolute_path")
+    local mount_target="$CONTAINER_WORKSPACE/$folder_name"
+
+    case "$action" in
+        add)
+            [ -d "$absolute_path" ] || log_error "Directory does not exist on host: $absolute_path"
+            if grep -Fxq "$absolute_path" "$SHARE_LIST"; then
+                log_info "'$absolute_path' is already shared."
+                return 0
+            fi
+            echo "$absolute_path" >> "$SHARE_LIST"
+            if is_running; then
+                log_success "Added '$absolute_path'. Run 'waterbox restart' to mount it inside."
+            else
+                log_success "Added '$absolute_path' (will mount on next start)."
+            fi
+            ;;
+        del)
+            if ! grep -Fxq "$absolute_path" "$SHARE_LIST"; then
+                log_error "Path '$absolute_path' is not currently shared."
+            fi
+            grep -vFx "$absolute_path" "$SHARE_LIST" > "${SHARE_LIST}.tmp" \
+                && mv "${SHARE_LIST}.tmp" "$SHARE_LIST"
+
+            if is_running; then
+                # Live-unmount in the container's mount namespace. Lazy umount
+                # so it succeeds even if something inside has the dir open.
+                local leader_pid
+                leader_pid=$(sudo machinectl show "$MACHINE_NAME" -p Leader --value 2>/dev/null)
+                if [ -n "$leader_pid" ] && [ "$leader_pid" != "0" ]; then
+                    sudo nsenter --target "$leader_pid" --mount \
+                        umount -l "$mount_target" 2>/dev/null || true
+                fi
+            fi
+            # Clean up the (now-empty) mount point in the rootfs.
+            [ -d "$JAIL_ROOT$mount_target" ] \
+                && sudo rmdir "$JAIL_ROOT$mount_target" 2>/dev/null || true
+            log_success "Removed '$absolute_path'."
+            ;;
+    esac
+}
+
+list_shares() {
+    log_info "Paths exposed to waterbox:"
+    if [ ! -s "$SHARE_LIST" ]; then
+        echo "  (none)"
+    else
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            echo "  -> $line  (inside: $CONTAINER_WORKSPACE/$(basename "$line"))"
+        done < "$SHARE_LIST"
+    fi
+}
+
+# --- Argument routing ---
+case "$1" in
+    start)   start_sandbox ;;
+    stop)    stop_sandbox ;;
+    restart) restart_sandbox ;;
+    status)  status_sandbox ;;
+    reset)   reset_sandbox ;;
+    share)
+        case "$2" in
+            add|del) manage_share "$2" "$3" ;;
+            list)    list_shares ;;
+            *)       log_error "Usage: waterbox share [add|del|list] [path]" ;;
+        esac
+        ;;
+    help|--help|-h|"") show_help ;;
+    *) log_error "Unknown command '$1'. See 'waterbox --help'." ;;
+esac

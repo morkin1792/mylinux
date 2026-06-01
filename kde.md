@@ -1,3 +1,8 @@
+```sh
+balooctl disable
+```
+
+<strike>
 echo -e '[KDE Action Restrictions]\naction/start_new_session=false' >> ~/.config/kdeglobals
 
 Window Management > Task Switcher > Thumbnail Grid > Disable show selected window
@@ -22,5 +27,4 @@ Breeze
 Breezemite Dark
 
 Desktop Effects > Blur
-
-balooctl disable
+</strike>

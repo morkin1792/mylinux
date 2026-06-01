@@ -1,0 +1,721 @@
+#!/usr/bin/env python3
+"""
+pvpn - a single-file companion to the Proton VPN CLI.
+
+It does three jobs from one script:
+
+  1. Wrapper. Expands single-letter shortcuts and passes everything else
+     straight through to the installed `protonvpn` CLI:
+         pvpn c [args]   -> protonvpn connect [args]   (+ shows a tray icon)
+         pvpn d          -> protonvpn disconnect
+         pvpn s          -> protonvpn status
+         pvpn h | help   -> this help (see below)
+
+  2. System tray. After a successful `connect`, it relaunches itself in the
+     background as a tray icon (purple = connected, gray = disconnected) with a
+     right-click menu: Connect / Disconnect / Close. The icon image is the
+     Proton VPN favicon, downloaded once and cached; the disconnected variant
+     is a grayscale copy. Everything here is best-effort: with no graphical
+     session or tray libraries it is silently skipped and the CLI is unaffected.
+
+  3. Self help. `pvpn h` / `pvpn help` explains pvpn itself, while `-h` and
+     `--help` are passed through to `protonvpn`.
+
+Environment overrides:
+  PROTONVPN_BIN        path to the protonvpn CLI   (default: protonvpn on PATH)
+  PVPN_NO_TRAY=1       never launch the tray
+  PVPN_POLL_SECONDS    tray status refresh seconds (default: 5; see note in
+                       `pvpn help` about going lower)
+  PVPN_ICON_URL        override the tray icon image URL
+
+Dependencies for the tray only (already present on most desktops): python3-gi,
+GTK 3, GdkPixbuf and an AppIndicator backend (Ayatana or legacy AppIndicator3).
+"""
+import json
+import os
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import warnings
+import zlib
+from typing import Optional, Tuple
+
+# Internal flag used when the script relaunches itself as the tray process.
+_TRAY_FLAG = "--__tray-daemon"
+
+SHORTCUTS = {"c": "connect", "d": "disconnect", "s": "status"}
+
+PROTONVPN_BIN = os.environ.get("PROTONVPN_BIN") or shutil.which("protonvpn")
+
+ICON_URL = os.environ.get(
+    "PVPN_ICON_URL", "https://protonvpn.com/favicons/favicon-32x32.png"
+)
+
+# Tray status is read from Proton's connection-persistence file and refreshed
+# instantly via a file monitor, so this periodic re-read is only a cheap safety
+# net for any missed file-monitor event.
+try:
+    POLL_INTERVAL_SECONDS = max(1, int(os.environ.get("PVPN_POLL_SECONDS", "10")))
+except ValueError:
+    POLL_INTERVAL_SECONDS = 10
+
+INDICATOR_ID = "pvpn-tray"
+INDICATOR_TITLE = "Proton VPN"
+
+# Fallback colors used only if the icon image can't be downloaded/recolored.
+CONNECTED_COLOR = (109, 74, 255)      # Proton purple
+DISCONNECTED_COLOR = (107, 114, 128)  # gray
+
+# GLib.unix_signal_add is flagged deprecated by newer PyGObject but is still
+# the correct, widely-available way to wake the GTK loop on a signal.
+warnings.filterwarnings("ignore", message=".*unix_signal_add.*")
+
+
+# ==========================================================================
+# Paths / single-instance / last-server state
+# ==========================================================================
+
+def _runtime_dir() -> str:
+    return os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+
+
+def _cache_dir() -> str:
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    path = os.path.join(base, "pvpn")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _pidfile_path() -> str:
+    return os.path.join(_runtime_dir(), "pvpn-tray.pid")
+
+
+def _last_server_path() -> str:
+    return os.path.join(_cache_dir(), "last-server")
+
+
+def _read_pid() -> Optional[int]:
+    try:
+        with open(_pidfile_path(), encoding="utf-8") as file:
+            return int(file.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _process_alive(pid: Optional[int]) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    # The pid is live, but it may be a recycled pid (our tray was killed
+    # without cleaning its pidfile). Confirm it's actually our tray process.
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as file:
+            cmdline = file.read()
+        return _TRAY_FLAG.encode() in cmdline
+    except OSError:
+        # No /proc to consult: trust the liveness check we already passed.
+        return True
+
+
+def _tray_already_running() -> bool:
+    return _process_alive(_read_pid())
+
+
+def _write_pid() -> None:
+    with open(_pidfile_path(), "w", encoding="utf-8") as file:
+        file.write(str(os.getpid()))
+
+
+def _remove_pidfile() -> None:
+    try:
+        os.remove(_pidfile_path())
+    except OSError:
+        pass
+
+
+def _set_last_server(server_name: str) -> None:
+    try:
+        with open(_last_server_path(), "w", encoding="utf-8") as file:
+            file.write(server_name)
+    except OSError:
+        pass
+
+
+def _get_last_server() -> Optional[str]:
+    try:
+        with open(_last_server_path(), encoding="utf-8") as file:
+            return file.read().strip() or None
+    except OSError:
+        return None
+
+
+def _has_display() -> bool:
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+# ==========================================================================
+# Connection status (cheap: read Proton's connection-persistence file).
+#
+# Proton writes <cache>/connection/connection_persistence.json when a
+# connection becomes active (Connected/Error states) and removes it on
+# disconnect. Reading it is a tiny file op, versus ~0.75s for `protonvpn
+# status`, and it carries the server name for "reconnect last server".
+# ==========================================================================
+
+def _persistence_file() -> str:
+    try:
+        from proton.utils.environment import \
+            VPNExecutionEnvironment  # pylint: disable=import-outside-toplevel
+        cache = VPNExecutionEnvironment().path_cache
+    except Exception:  # pylint: disable=broad-except
+        # Fall back to the well-known XDG location if the helper isn't importable.
+        cache = os.path.join(
+            os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+            "Proton", "VPN",
+        )
+    return os.path.join(cache, "connection", "connection_persistence.json")
+
+
+def _read_status() -> Tuple[Optional[bool], Optional[dict]]:
+    """Returns (connected, details).
+
+    connected is True/False from the file's presence, or None if the file is
+    momentarily unreadable (e.g. mid-write) so the caller can skip the update.
+    details (when connected) holds server_name, server_ip and protocol.
+    """
+    try:
+        with open(_persistence_file(), encoding="utf-8") as file:
+            data = json.load(file)
+        server = data.get("server") or {}
+        details = {
+            "server_name": server.get("server_name"),
+            "server_ip": server.get("server_ip"),
+            "protocol": data.get("protocol"),
+        }
+        return True, details
+    except FileNotFoundError:
+        return False, None
+    except (OSError, ValueError):
+        return None, None  # unreadable / partial write: treat as "unknown"
+
+
+# ==========================================================================
+# Countries list (for the "All countries" submenu).
+#
+# `protonvpn countries list` is slow to run, and the list rarely changes, so we
+# cache it: show the cached list immediately and refresh once in the background
+# when the tray starts.
+# ==========================================================================
+
+def _countries_cache_path() -> str:
+    return os.path.join(_cache_dir(), "countries.json")
+
+
+def _parse_countries(output: str):
+    """Parses the `countries list` table into [(name, code), ...]."""
+    countries = []
+    for line in output.splitlines():
+        line = line.rstrip()
+        if not line or line.startswith("Country"):
+            continue
+        if set(line) <= set("- "):  # the dashes separator row
+            continue
+        parts = line.rsplit(None, 1)  # code is always the last token
+        if len(parts) != 2:
+            continue
+        name, code = parts[0].strip(), parts[1].strip()
+        if len(code) == 2 and code.isalpha():
+            countries.append((name, code.upper()))
+    return countries
+
+
+def _read_cached_countries():
+    try:
+        with open(_countries_cache_path(), encoding="utf-8") as file:
+            return [(name, code) for name, code in json.load(file)]
+    except (OSError, ValueError, TypeError):
+        return []
+
+
+def _write_cached_countries(countries) -> None:
+    try:
+        with open(_countries_cache_path(), "w", encoding="utf-8") as file:
+            json.dump(countries, file)
+    except OSError:
+        pass
+
+
+def _fetch_countries():
+    """Runs `protonvpn countries list` and returns [(name, code), ...] or None."""
+    if not PROTONVPN_BIN:
+        return None
+    try:
+        result = subprocess.run(
+            [PROTONVPN_BIN, "countries", "list"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    countries = _parse_countries(result.stdout or "")
+    return countries or None
+
+
+# ==========================================================================
+# Icons: download the favicon (cached), gray it for the disconnected state,
+# and fall back to simple generated discs if anything goes wrong (offline).
+# ==========================================================================
+
+def _write_disc_png(path: str, color, size: int = 64) -> None:
+    """Generates a solid colored disc PNG (no Pillow needed)."""
+    cx = cy = (size - 1) / 2
+    radius = size / 2 - 3
+    red, green, blue = color
+
+    raw = bytearray()
+    for y in range(size):
+        raw.append(0)  # filter type 0 per scanline
+        for x in range(size):
+            distance = ((x - cx) ** 2 + (y - cy) ** 2) ** 0.5
+            alpha = max(0.0, min(1.0, radius - distance + 0.5))
+            raw += bytes((red, green, blue, int(alpha * 255)))
+
+    def chunk(tag, data):
+        out = struct.pack(">I", len(data)) + tag + data
+        return out + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    ihdr = struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0)  # 8-bit RGBA
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+        + chunk(b"IEND", b"")
+    )
+    with open(path, "wb") as file:
+        file.write(png)
+
+
+def _generated_disc(name: str, color) -> str:
+    path = os.path.join(_cache_dir(), f"fallback-{name}.png")
+    if not os.path.exists(path):
+        _write_disc_png(path, color)
+    return path
+
+
+def _download_icon() -> Optional[str]:
+    """Returns the cached icon image path, downloading it once if missing."""
+    path = os.path.join(_cache_dir(), "icon.png")
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        return path
+    try:
+        import urllib.request  # pylint: disable=import-outside-toplevel
+        with urllib.request.urlopen(ICON_URL, timeout=10) as response:
+            data = response.read()
+        if not data:
+            return None
+        with open(path, "wb") as file:
+            file.write(data)
+        return path
+    except Exception:  # pylint: disable=broad-except
+        return None
+
+
+def _grayscale_copy(src: str) -> Optional[str]:
+    """Returns a grayscale copy of `src` (cached), via GdkPixbuf."""
+    out = os.path.join(_cache_dir(), "icon-gray.png")
+    if os.path.exists(out) and os.path.getmtime(out) >= os.path.getmtime(src):
+        return out
+    try:
+        import gi  # pylint: disable=import-outside-toplevel
+        gi.require_version("GdkPixbuf", "2.0")
+        from gi.repository import GdkPixbuf  # pylint: disable=import-outside-toplevel
+        pixbuf = GdkPixbuf.Pixbuf.new_from_file(src)
+        gray = pixbuf.copy()
+        # saturation 0.0 desaturates to grayscale; pixelate disabled.
+        pixbuf.saturate_and_pixelate(gray, 0.0, False)
+        gray.savev(out, "png", [], [])
+        return out
+    except Exception:  # pylint: disable=broad-except
+        return None
+
+
+def _resolve_icons() -> Tuple[str, str]:
+    """Returns (connected_icon_path, disconnected_icon_path)."""
+    base = _download_icon()
+    if base:
+        gray = _grayscale_copy(base)
+        if gray:
+            return base, gray
+        # Image is fine but graying failed: use a generated gray disc.
+        return base, _generated_disc("disconnected", DISCONNECTED_COLOR)
+    # Offline / download failed: fall back to generated discs entirely.
+    return (
+        _generated_disc("connected", CONNECTED_COLOR),
+        _generated_disc("disconnected", DISCONNECTED_COLOR),
+    )
+
+
+# ==========================================================================
+# Tray
+# ==========================================================================
+
+def _load_tray_libraries():
+    """Imports GTK + an AppIndicator backend (Ayatana preferred)."""
+    import gi  # pylint: disable=import-outside-toplevel
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gtk, GLib  # pylint: disable=import-outside-toplevel
+
+    appindicator = None
+    for namespace in ("AyatanaAppIndicator3", "AppIndicator3"):
+        try:
+            gi.require_version(namespace, "0.1")
+            appindicator = getattr(
+                __import__("gi.repository", fromlist=[namespace]), namespace
+            )
+            break
+        except (ValueError, ImportError):
+            continue
+
+    if appindicator is None:
+        raise ImportError("No AppIndicator backend (Ayatana or legacy) available.")
+
+    return Gtk, GLib, appindicator
+
+
+class Tray:
+    """Builds the indicator and its menu, and drives status polling."""
+
+    def __init__(self, gtk, glib, appindicator):
+        self._gtk = gtk
+        self._glib = glib
+        self._connected_icon, self._disconnected_icon = _resolve_icons()
+        self._connected: Optional[bool] = None
+        self._persistence_file = _persistence_file()
+        self._monitor = None  # GFileMonitor, kept alive for event-driven updates
+
+        self._indicator = appindicator.Indicator.new(
+            INDICATOR_ID,
+            self._disconnected_icon,
+            appindicator.IndicatorCategory.APPLICATION_STATUS,
+        )
+        self._indicator.set_status(appindicator.IndicatorStatus.ACTIVE)
+        self._indicator.set_title(INDICATOR_TITLE)
+        self._indicator.set_menu(self._build_menu())
+
+    def _build_menu(self):
+        gtk = self._gtk
+        menu = gtk.Menu()
+
+        # Title header (non-selectable).
+        title = gtk.MenuItem(label=INDICATOR_TITLE)
+        title.set_sensitive(False)
+        menu.append(title)
+
+        # Connection details, shown only while connected (non-selectable).
+        self._protocol_item = gtk.MenuItem(label="")
+        self._server_item = gtk.MenuItem(label="")
+        self._ip_item = gtk.MenuItem(label="")
+        for item in (self._protocol_item, self._server_item, self._ip_item):
+            item.set_sensitive(False)
+            menu.append(item)
+
+        menu.append(gtk.SeparatorMenuItem())
+
+        self._connect_item = gtk.MenuItem(label="Connect")
+        self._connect_item.connect("activate", self._on_connect)
+        menu.append(self._connect_item)
+
+        # "All countries" -> submenu populated from the cached/fetched list.
+        self._countries_item = gtk.MenuItem(label="All countries")
+        self._countries_submenu = gtk.Menu()
+        self._countries_item.set_submenu(self._countries_submenu)
+        menu.append(self._countries_item)
+
+        self._disconnect_item = gtk.MenuItem(label="Disconnect")
+        self._disconnect_item.connect("activate", self._on_disconnect)
+        menu.append(self._disconnect_item)
+
+        menu.append(gtk.SeparatorMenuItem())
+
+        close_item = gtk.MenuItem(label="Close")
+        close_item.connect("activate", self._quit)
+        menu.append(close_item)
+
+        menu.show_all()
+        # Connection-detail rows stay hidden until we know we're connected.
+        for item in (self._protocol_item, self._server_item, self._ip_item):
+            item.hide()
+        return menu
+
+    # --- menu actions ---------------------------------------------------
+
+    def _on_connect(self, _menu_item):
+        threading.Thread(target=self._connect_worker, daemon=True).start()
+
+    def _connect_worker(self):
+        # Reconnect the last server if known; fall back to the fastest server
+        # (bare `connect`) if unknown or if that fails (e.g. free tier can't
+        # select a server by id).
+        last_server = _get_last_server()
+        ok = self._run_cli(["connect", last_server]) if last_server else False
+        if not ok:
+            self._run_cli(["connect"])
+        self._glib.idle_add(self._refresh)
+
+    def _on_disconnect(self, _menu_item):
+        def worker():
+            self._run_cli(["disconnect"])
+            self._glib.idle_add(self._refresh)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_country(self, _menu_item, code):
+        def worker():
+            self._run_cli(["connect", "--country", code])
+            self._glib.idle_add(self._refresh)
+        threading.Thread(target=worker, daemon=True).start()
+
+    # --- "All countries" submenu ----------------------------------------
+
+    def _load_countries(self):
+        """Populates the submenu from cache now, then refreshes in background."""
+        self._set_countries(_read_cached_countries())
+
+        def worker():
+            countries = _fetch_countries()
+            if countries:
+                _write_cached_countries(countries)
+                self._glib.idle_add(self._set_countries, countries)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _set_countries(self, countries):
+        for child in self._countries_submenu.get_children():
+            self._countries_submenu.remove(child)
+        if countries:
+            for name, code in countries:
+                item = self._gtk.MenuItem(label=name)
+                item.connect("activate", self._on_country, code)
+                self._countries_submenu.append(item)
+        else:
+            placeholder = self._gtk.MenuItem(label="(unavailable - sign in?)")
+            placeholder.set_sensitive(False)
+            self._countries_submenu.append(placeholder)
+        self._countries_submenu.show_all()
+        return False  # one-shot when scheduled via idle_add
+
+    def _run_cli(self, args) -> bool:
+        if not PROTONVPN_BIN:
+            return False
+        try:
+            result = subprocess.run(
+                [PROTONVPN_BIN, *args],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            return result.returncode == 0
+        except OSError:
+            return False
+
+    def _quit(self, *_args):
+        self._gtk.main_quit()
+        return False
+
+    # --- status (file-based, event-driven) ------------------------------
+
+    def _setup_file_monitor(self):
+        """Watches the persistence file's directory for instant updates."""
+        try:
+            from gi.repository import Gio  # pylint: disable=import-outside-toplevel
+            directory = os.path.dirname(self._persistence_file)
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+            self._monitor = Gio.File.new_for_path(directory).monitor_directory(
+                Gio.FileMonitorFlags.NONE, None
+            )
+            self._monitor.connect("changed", self._on_file_changed)
+        except Exception:  # pylint: disable=broad-except
+            # No file monitor: the periodic re-read below still keeps us current.
+            self._monitor = None
+
+    def _on_file_changed(self, _monitor, _file, _other_file, _event_type):
+        self._refresh()
+
+    def _on_timer(self):
+        self._refresh()
+        return True  # keep the periodic safety re-read running
+
+    def _refresh(self):
+        connected, details = _read_status()
+        if connected and details and details.get("server_name"):
+            _set_last_server(details["server_name"])
+        self._apply_status(connected, details)
+        return False  # one-shot when scheduled via idle_add
+
+    def _apply_status(self, connected: Optional[bool], details: Optional[dict] = None):
+        if connected is None:
+            return False  # unknown (e.g. mid-write): keep current state
+
+        self._update_details(connected, details)
+
+        if connected != self._connected:
+            self._connected = connected
+            icon = self._connected_icon if connected else self._disconnected_icon
+            label = "Connected" if connected else "Disconnected"
+            if os.environ.get("PVPN_DEBUG") == "1":
+                print(f"pvpn tray: {label.lower()}", file=sys.stderr, flush=True)
+            self._indicator.set_icon_full(icon, label)
+            self._connect_item.set_sensitive(not connected)
+            self._disconnect_item.set_sensitive(connected)
+        return False
+
+    def _update_details(self, connected: bool, details: Optional[dict]):
+        """Shows/hides the protocol/server/IP rows below the title."""
+        rows = (self._protocol_item, self._server_item, self._ip_item)
+        details = details or {}
+        if connected and any(details.values()):
+            self._protocol_item.set_label(f"Protocol: {details.get('protocol') or 'n/a'}")
+            self._server_item.set_label(f"Server: {details.get('server_name') or 'n/a'}")
+            self._ip_item.set_label(f"IP: {details.get('server_ip') or 'n/a'}")
+            for item in rows:
+                item.show()
+        else:
+            for item in rows:
+                item.hide()
+
+    # --- main loop ------------------------------------------------------
+
+    def run(self):
+        self._refresh()
+        self._load_countries()
+        self._setup_file_monitor()
+        self._glib.timeout_add_seconds(POLL_INTERVAL_SECONDS, self._on_timer)
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            self._glib.unix_signal_add(self._glib.PRIORITY_DEFAULT, sig, self._quit)
+        self._gtk.main()
+
+
+def run_tray() -> None:
+    """Entry point for the background tray process."""
+    if _tray_already_running():
+        return
+    if not PROTONVPN_BIN:
+        print("pvpn: 'protonvpn' CLI not found on PATH.", file=sys.stderr)
+        return
+    try:
+        gtk, glib, appindicator = _load_tray_libraries()
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"pvpn: tray unavailable ({exc}).", file=sys.stderr)
+        return
+
+    _write_pid()
+    try:
+        Tray(gtk, glib, appindicator).run()
+    finally:
+        _remove_pidfile()
+
+
+def _launch_tray_detached() -> None:
+    """Relaunches this script as a detached tray process (best-effort)."""
+    try:
+        if os.environ.get("PVPN_NO_TRAY") == "1":
+            return
+        if not _has_display() or _tray_already_running():
+            return
+        subprocess.Popen(  # pylint: disable=consider-using-with
+            [sys.executable, os.path.realpath(__file__), _TRAY_FLAG],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except Exception:  # pylint: disable=broad-except
+        pass  # the tray is optional; never let it break the CLI
+
+
+# ==========================================================================
+# Wrapper
+# ==========================================================================
+
+PVPN_HELP = """\
+pvpn - a thin wrapper around the Proton VPN CLI.
+
+Shortcuts:
+  pvpn c [args]    connect to Proton VPN   (and show a system tray icon)
+  pvpn c br        connect to a country by code/name  (= connect --country br)
+  pvpn d           disconnect
+  pvpn s           status
+  pvpn h | help    show this message
+
+Anything else is passed straight through to `protonvpn`, for example:
+  pvpn c --country US
+  pvpn c --p2p
+  pvpn connect IT#23      (use the full word for a raw server id)
+  pvpn signin <account>
+
+For the full Proton VPN CLI help, use protonvpn's own flags:
+  pvpn -h          (or  pvpn --help)
+
+The tray (shown after `pvpn c`) has a right-click menu: Connect / Disconnect /
+Close. Disable it with PVPN_NO_TRAY=1. Its status comes from Proton's local
+connection file and updates instantly via a file monitor (no `protonvpn status`
+polling), with a cheap re-read every %(poll)s s (PVPN_POLL_SECONDS) as a safety
+net.
+""" % {"poll": POLL_INTERVAL_SECONDS}
+
+
+def main() -> int:
+    args = sys.argv[1:]
+
+    # Background tray mode (script relaunching itself).
+    if args and args[0] == _TRAY_FLAG:
+        run_tray()
+        return 0
+
+    # pvpn's own help.
+    if args and args[0] in ("h", "help"):
+        print(PVPN_HELP, end="")
+        return 0
+
+    if not PROTONVPN_BIN:
+        print("pvpn: 'protonvpn' CLI not found on PATH.", file=sys.stderr)
+        return 127
+
+    # Expand a shortcut in the first position; pass everything else through.
+    first = args[0] if args else None
+    subcommand = SHORTCUTS.get(first, first) if args else None
+    if subcommand is not None:
+        rest = args[1:]
+        # `pvpn c <country>`: a single bare argument is treated as a country,
+        # so `pvpn c br` means `connect --country br`. Only for the `c`
+        # shortcut and only when the argument isn't an option/flag; use the
+        # full `pvpn connect ...` for raw passthrough (e.g. a server id).
+        if first == "c" and len(rest) == 1 and not rest[0].startswith("-"):
+            rest = ["--country", rest[0]]
+        args = [subcommand, *rest]
+
+    is_help = any(arg in ("-h", "--help") for arg in args)
+
+    # Run the real CLI, inheriting the terminal (so prompts/output work).
+    exit_code = subprocess.run([PROTONVPN_BIN, *args], check=False).returncode
+
+    # Bring up the tray after a successful, non-help connect.
+    if subcommand == "connect" and exit_code == 0 and not is_help:
+        _launch_tray_detached()
+
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

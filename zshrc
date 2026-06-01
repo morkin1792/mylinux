@@ -1,9 +1,7 @@
 ## sudo pacman -S --needed zsh powerline powerline-fonts grml-zsh-config zsh-autosuggestions zsh-completions zsh-doc zsh-history-substring-search zsh-lovers
 ## yay -S oh-my-posh-bin #zsh-theme-powerlevel10k
 ## for non-archlinux: wget -O ~/.zshrc https://git.grml.org/f/grml-etc-core/etc/zsh/zshrc)
-##
 
-# create .zshrc with:
 HISTFILE=~/.histfile
 HISTSIZE=20000
 SAVEHIST=20000
