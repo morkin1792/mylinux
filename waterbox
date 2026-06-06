@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# a simple sandbox for running CLI agents
+# simple sandbox for running CLI AI agents
 
 set -e
 
@@ -52,9 +52,14 @@ keys to your whole machine.
 
 Commands:
   start             Boot the sandbox (if not already running) and attach to it.
-                    The attached shell lives in a persistent tmux session named
-                    "$TMUX_SESSION" — detach with Ctrl+b d to keep state across
-                    re-attaches. Typing 'exit' ends the tmux session.
+                    This is the default — running 'waterbox' with no command
+                    does the same thing.
+                    Each attached shell lives in its own persistent tmux session
+                    inside the same instance — detach with Ctrl+b d to keep state
+                    across re-attaches; typing 'exit' ends that session. When
+                    sessions already exist, 'start' shows an arrow-key menu to
+                    attach to one or open a new session, so you can run several
+                    independent terminals (e.g. parallel tasks) at once.
   stop              Power off the running sandbox.
   restart           stop + start (use after 'share add' to mount the new path).
   status            Show whether the sandbox is currently running.
@@ -218,6 +223,15 @@ build_bind_args() {
     local args=()
     while IFS= read -r host_path || [ -n "$host_path" ]; do
         [ -z "$host_path" ] && continue
+        # A previously-shared path may have been deleted/moved on the host.
+        # systemd-nspawn refuses to boot if a --bind source is missing, so skip
+        # it with a warning (to stderr — this function's stdout is the arg list)
+        # instead of taking down the whole sandbox. The entry stays in
+        # $SHARE_LIST and remounts automatically if the path reappears.
+        if [ ! -d "$host_path" ]; then
+            log_warn "Shared path no longer exists, skipping: $host_path" >&2
+            continue
+        fi
         local folder_name
         folder_name=$(basename "$host_path")
         sudo mkdir -p "$JAIL_ROOT$CONTAINER_WORKSPACE/$folder_name"
@@ -225,6 +239,97 @@ build_bind_args() {
         args+=("--bind=$host_path:$CONTAINER_WORKSPACE/$folder_name")
     done < "$SHARE_LIST"
     printf '%s\n' "${args[@]}"
+}
+
+# Run tmux inside the running container as the water user (uid 1000),
+# non-interactively, so the host can query/list sessions. Uses the leader-PID +
+# nsenter pattern (same as manage_share) so output is a clean pipe with no
+# machinectl-shell pty preamble. The interactive sessions live on tmux's default
+# socket (/tmp/tmux-1000/default), reachable by entering the mount ns as uid 1000.
+container_tmux() {
+    local leader_pid
+    leader_pid=$(sudo machinectl show "$MACHINE_NAME" -p Leader --value 2>/dev/null)
+    [ -n "$leader_pid" ] && [ "$leader_pid" != "0" ] || return 1
+    sudo nsenter --target "$leader_pid" --mount --setuid 1000 --setgid 1000 \
+        env TMUX_TMPDIR=/tmp HOME="/home/$USER_NAME" /usr/bin/tmux "$@"
+}
+
+# Arrow-key selectable menu, drawn directly on the terminal (/dev/tty) so it is
+# independent of stdout/stderr redirection. Navigate with ↑/↓ (or k/j), Enter
+# selects. Sets the global MENU_CHOICE to the 0-based index of the chosen option.
+MENU_CHOICE=0
+choose_menu() {
+    local prompt="$1"; shift
+    local options=("$@")
+    local selected=0 key count=${#options[@]} first=1 i
+
+    printf '\e[?25l' > /dev/tty                  # hide cursor
+    echo "$prompt" > /dev/tty
+    while true; do
+        [ -z "$first" ] && printf '\e[%dA' "$count" > /dev/tty
+        first=
+        for i in "${!options[@]}"; do
+            if [ "$i" -eq "$selected" ]; then
+                printf '\e[K  \e[36m❯ %s\e[0m\n' "${options[$i]}" > /dev/tty
+            else
+                printf '\e[K    %s\n' "${options[$i]}" > /dev/tty
+            fi
+        done
+        IFS= read -rsn1 key < /dev/tty
+        case "$key" in
+            $'\e')
+                read -rsn2 key < /dev/tty
+                case "$key" in
+                    '[A'|'OA') selected=$(( (selected - 1 + count) % count )) ;;
+                    '[B'|'OB') selected=$(( (selected + 1) % count )) ;;
+                esac ;;
+            k) selected=$(( (selected - 1 + count) % count )) ;;
+            j) selected=$(( (selected + 1) % count )) ;;
+            '') break ;;
+        esac
+    done
+    printf '\e[?25h' > /dev/tty                   # show cursor
+    MENU_CHOICE=$selected
+}
+
+# Pick a tmux session inside the running container, then exec an attached shell.
+# No sessions yet -> create+attach "$TMUX_SESSION". Otherwise offer an arrow-key
+# menu of existing sessions plus a "new session" entry (auto-numbered box-2, ...).
+# Independent sessions = independent terminals against the same instance.
+attach_session() {
+    # Pass ANTHROPIC_API_KEY through to this session only, if set.
+    local env_args=()
+    [ -n "$ANTHROPIC_API_KEY" ] && env_args+=(-E "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
+
+    local sessions=()
+    while IFS= read -r s; do
+        [ -n "$s" ] && sessions+=("$s")
+    done < <(container_tmux list-sessions -F '#{session_name}' 2>/dev/null | sort)
+
+    # Always show the picker — even with no sessions yet it offers "+ new session"
+    # so the entry point is consistent every time.
+    local target
+    choose_menu "Select a session to attach (↑/↓, Enter):" \
+        "${sessions[@]}" "+ new session"
+    if [ "$MENU_CHOICE" -lt "${#sessions[@]}" ]; then
+        target="${sessions[$MENU_CHOICE]}"
+        log_info "Attaching to '$target'."
+    else
+        # New session, auto-numbered: box, box-2, box-3, ...
+        target="$TMUX_SESSION"
+        local n=2
+        while printf '%s\n' "${sessions[@]}" | grep -Fxq "$target"; do
+            target="$TMUX_SESSION-$n"; n=$((n + 1))
+        done
+        log_info "Creating new session '$target'."
+    fi
+
+    # new-session -A attaches if the session exists, creates it otherwise.
+    # -c sets the working directory for newly created sessions to the workspace
+    # (ignored when attaching to an existing session, which keeps its own cwd).
+    exec sudo machinectl shell "${env_args[@]}" \
+        "$USER_NAME@$MACHINE_NAME" \
+        /usr/bin/tmux new-session -A -s "$target" -c "$CONTAINER_WORKSPACE"
 }
 
 # --- Network setup on host ---
@@ -324,16 +429,10 @@ start_sandbox() {
         log_success "Sandbox up. Host reachable inside as '$HOST_ALIAS' ($HOST_IP)."
     fi
 
-    # Pass ANTHROPIC_API_KEY through to this session only, if set.
-    local env_args=()
-    [ -n "$ANTHROPIC_API_KEY" ] && env_args+=(-E "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
-
-    # Wrap the shell in a persistent tmux session so re-attaches restore the
-    # same state (cwd, running processes, etc). The session is created on
-    # first attach and reused on subsequent ones via -A.
-    exec sudo machinectl shell "${env_args[@]}" \
-        "$USER_NAME@$MACHINE_NAME" \
-        /usr/bin/tmux new-session -A -s "$TMUX_SESSION"
+    # Each attach lives in a persistent tmux session so re-attaches restore the
+    # same state (cwd, running processes, etc). Multiple named sessions let you
+    # drive several independent terminals against the same running instance.
+    attach_session
 }
 
 restart_sandbox() {
@@ -452,7 +551,7 @@ list_shares() {
 
 # --- Argument routing ---
 case "$1" in
-    start)   start_sandbox ;;
+    start|"") start_sandbox ;;
     stop)    stop_sandbox ;;
     restart) restart_sandbox ;;
     status)  status_sandbox ;;
@@ -464,6 +563,6 @@ case "$1" in
             *)       log_error "Usage: waterbox share [add|del|list] [path]" ;;
         esac
         ;;
-    help|--help|-h|"") show_help ;;
+    help|--help|-h) show_help ;;
     *) log_error "Unknown command '$1'. See 'waterbox --help'." ;;
 esac
