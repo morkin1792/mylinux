@@ -97,6 +97,7 @@ bootstrap_sandbox() {
         zsh-autosuggestions zsh-completions
         zsh-history-substring-search zsh-syntax-highlighting
         ripgrep tmux bind vim less
+        openssh nano openbsd-netcat
     )
 
     sudo pacstrap -K "$JAIL_ROOT" "${pkgs[@]}"
@@ -194,6 +195,40 @@ set -g mouse on
 set -g history-limit 50000
 EOF
     sudo chown 1000:1000 "$JAIL_ROOT/home/$USER_NAME/.tmux.conf"
+
+    # Inherit the host user's global git identity (name + email), if set, so
+    # commits made inside the sandbox are attributed the same as on the host.
+    local host_git_name host_git_email
+    host_git_name=$(git config --global user.name 2>/dev/null || true)
+    host_git_email=$(git config --global user.email 2>/dev/null || true)
+    if [ -n "$host_git_name" ] || [ -n "$host_git_email" ]; then
+        {
+            echo "[user]"
+            [ -n "$host_git_name" ]  && echo "    name = $host_git_name"
+            [ -n "$host_git_email" ] && echo "    email = $host_git_email"
+        } | sudo tee "$JAIL_ROOT/home/$USER_NAME/.gitconfig" > /dev/null
+        sudo chown 1000:1000 "$JAIL_ROOT/home/$USER_NAME/.gitconfig"
+        log_info "Copied host git identity ($host_git_name <$host_git_email>) into the sandbox."
+    fi
+
+    # Fetch personal vim/nano dotfiles into the user's home. Best-effort: if a
+    # URL is dead or curl is missing, warn and move on rather than abort the
+    # whole bootstrap. Downloaded to a temp file first so a failed/partial
+    # fetch never lands a broken rc file (curl -f fails on HTTP errors).
+    local rc url dest tmpfile
+    for rc in vimrc nanorc; do
+        url="https://raw.githubusercontent.com/morkin1792/mylinux/master/$rc"
+        dest="$JAIL_ROOT/home/$USER_NAME/.$rc"
+        tmpfile=$(mktemp)
+        if curl -fsSL "$url" -o "$tmpfile" 2>/dev/null && [ -s "$tmpfile" ]; then
+            sudo cp "$tmpfile" "$dest"
+            sudo chown 1000:1000 "$dest"
+            log_success "Installed .$rc from $url"
+        else
+            log_warn "Could not download .$rc from $url — skipping it."
+        fi
+        rm -f "$tmpfile"
+    done
 
     # claude-code defaults: bypass permissions, opus + xhigh effort, auto-memory on.
     sudo mkdir -p "$JAIL_ROOT/home/$USER_NAME/.claude"
@@ -402,11 +437,22 @@ start_sandbox() {
             [ -n "$line" ] && bind_args+=("$line")
         done < <(build_bind_args)
 
+        # KillMode=mixed is critical: on stop (incl. host shutdown) systemd then
+        # sends SIGTERM only to the main process (systemd-nspawn), which turns it
+        # into a clean container poweroff. The default control-group mode instead
+        # broadcasts SIGTERM to the container's PID 1, where SIGTERM means
+        # "reexec" not "poweroff" — so the container never stops and the host
+        # hangs for DefaultTimeoutStopSec (90s) before SIGKILL. TimeoutStopSec
+        # bounds the worst case; SuccessExitStatus=133 is nspawn's shutdown code
+        # (so the unit isn't marked failed). Mirrors systemd-nspawn@.service.
         sudo systemd-run \
             --unit="$MACHINE_NAME" \
             --collect \
             --service-type=notify \
             --description="Waterbox container ($MACHINE_NAME)" \
+            --property=KillMode=mixed \
+            --property=TimeoutStopSec=30 \
+            --property=SuccessExitStatus=133 \
             systemd-nspawn \
                 --boot \
                 --quiet \
