@@ -3,13 +3,13 @@
 ## personal linux desktop config
 
 - [Arch Linux](arch.md)
-- [Code](code.md)
-- [.conkyrc](conkyrc)
-- [Firewall settings](firewall.sh)
 - [KDE settings](kde.md)
+- [Firewall settings](firewall.sh)
 - [Virtualbox settings](virtualbox.sh)
-- [.vimrc](vimrc)
 - [.zshrc](zshrc)
+- [Code](code.md)
+- [.vimrc](vimrc)
+- [.nanorc](nanorc)
 
 ## small tools
 - [Waterbox: simple sandbox for running CLI agents](waterbox)

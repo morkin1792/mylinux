@@ -1,0 +1,55 @@
+# from https://www.reddit.com/user/p4bl0/, https://www.reddit.com/r/linux/comments/1f3jeoo/what_does_your_nanorc_look_like/
+include "/usr/share/nano/*.nanorc"
+
+# editing
+
+set softwrap
+set atblanks
+
+set autoindent
+set trimblanks
+set tabsize 4
+set tabstospaces
+extendsyntax makefile tabgives "	"
+
+set cutfromcursor
+set zap
+
+set smarthome
+
+set nonewlines
+
+# editor
+
+set minibar
+set indicator
+set linenumbers
+set positionlog
+set constantshow
+set stateflags
+
+set mouse
+
+set backup
+set historylog
+
+set multibuffer
+
+# colors
+
+set titlecolor bold,white,latte
+set statuscolor white,latte
+set errorcolor bold,lightwhite,red
+set selectedcolor lightwhite,slate
+set stripecolor ,yellow
+set scrollercolor latte
+set numbercolor latte
+set keycolor latte
+set functioncolor lightblack
+set minicolor bold,white,latte
+set promptcolor bold,white,latte
+
+# key bindings
+
+bind M-/ comment main
+bind M-w copy all
