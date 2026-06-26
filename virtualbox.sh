@@ -1,6 +1,8 @@
-## making virtualbox a bit less visible
 VM_NAME="mint1"
+## avoiding output audio device (speaker) locking issues
+VBoxManage modifyvm $VM_NAME --audio-driver pulse
 
+## making virtualbox a bit less visible
 ### may need to change "pcbios" to "efi" (do not use both, if this happens you will need to wipe the other)
 TYPE="pcbios"
 
