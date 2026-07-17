@@ -485,6 +485,12 @@ set -g status-left-length 40
 set -g status-right-length 20
 set -g status-left  ' #{?@ce_name,#[bold]#{@ce_name}#[nobold] · ,}#S '
 set -g status-right '%H:%M '
+
+# New windows/splits start in the current pane's directory, not $HOME. So if you
+# cd to /tmp and hit Ctrl-b c, the new window opens in /tmp too.
+bind c new-window      -c "#{pane_current_path}"
+bind % split-window -h -c "#{pane_current_path}"
+bind '"' split-window -v -c "#{pane_current_path}"
 EOF
     sudo chown 1000:1000 "$JAIL_ROOT/home/$USER_NAME/.tmux.conf"
 
