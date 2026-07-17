@@ -4,34 +4,80 @@
 
 set -e
 
+WATERBOX_VERSION="1.6"
+
+# Absolute path to this script, recorded so the shell-completion snippet can fall
+# back to it when 'waterbox' isn't on $PATH (e.g. run by ./waterbox, or moved).
+SELF_PATH="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo "$0")"
+
 # --- Configuration ---
 JAIL_ROOT="$HOME/.waterbox/root"
 CONFIG_DIR="$HOME/.waterbox"
 SHARE_LIST="$CONFIG_DIR/shared_paths"
-USER_NAME="water"
-MACHINE_NAME="waterbox"      # external name: systemd unit, machinectl, ve-* iface
-INSIDE_HOSTNAME="box"        # hostname shown inside the container
-TMUX_SESSION="box"           # tmux session that wraps the interactive shell
+GUI_ENV_FILE="$CONFIG_DIR/gui_env"       # export VAR="val" lines; helper copies into the rootfs
+GUI_BINDS_FILE="$CONFIG_DIR/gui_binds"   # --bind spec lines the helper validates at boot
+USER_NAME="water"               # user inside the container (uid 1000 == host user)
+RUN_USER="$(id -un)"            # the host user invoking this script
+MACHINE_NAME="waterbox"         # external name: systemd unit, machinectl, ve-* iface
+INSIDE_HOSTNAME="box"           # hostname shown inside the container
+TMUX_SESSION="box"              # tmux session that wraps the interactive shell
 CONTAINER_WORKSPACE="/home/$USER_NAME/workspace"
+
+# Root helper (req: safe privilege model). All privileged RUNTIME ops go through
+# this root-owned, uid-1000-immutable binary so the sudoers rule can be NOPASSWD
+# for THIS one file only (fixed verbs, no argument-injection path). bootstrap/reset
+# stay on interactive sudo (inherently broad; you're present for them).
+HELPER_DIR="/usr/local/lib/waterbox"
+HELPER_PATH="$HELPER_DIR/waterbox-helper"
+HELPER_SUDOERS="/etc/sudoers.d/waterbox-helper"
 
 # --- Network parameters ---
 HOST_IP="10.20.30.1"
 CONTAINER_IP="10.20.30.2"
 NET_CIDR="24"
-HOST_ALIAS="host"           # name resolved to $HOST_IP inside the container
-VE_IFACE="ve-$MACHINE_NAME" # systemd-nspawn names the host side ve-<machine>
+HOST_ALIAS="host"               # name resolved to $HOST_IP inside the container
+VE_IFACE="ve-$MACHINE_NAME"     # systemd-nspawn names the host side ve-<machine>
 
 # If true, the container (10.20.30.0/24) is allowed to reach ANY port the host
 # listens on. Combined with the DNAT rule below, this lets the container hit
 # host loopback services (MCP servers, dev servers, etc.) as `host:PORT` even
 # when the host has a restrictive INPUT policy (ufw, firewalld, etc.).
-# Set to false to leave the host's INPUT chain alone.
 ALLOW_CONTAINER_TO_HOST_PORTS=true
 
-# DNS servers used inside the container. Override by editing here, or by
-# editing /etc/resolv.conf inside the running sandbox. A VPN client inside
-# is free to replace /etc/resolv.conf at runtime.
+# DNS servers used inside the container. A VPN client inside is free to replace
+# /etc/resolv.conf at runtime.
 DNS_SERVERS=("8.8.8.8" "1.1.1.1")
+
+# --- Arch bootstrap image (req 6: no host pacstrap, works on any distro) ------
+# We fetch the official signed Arch bootstrap tarball and install packages
+# *inside* it with the container's own pacman, so the host only needs
+# systemd-nspawn + iptables + curl + gpg/pacman-key + zstd/tar (all on Mint via
+# apt). The big tarball comes from a fast geo mirror, but the signature comes
+# from archlinux.org (an independent canonical origin) and is verified against a
+# pinned key — so a malicious mirror can't slip in a forged image.
+ARCH_MIRROR="https://geo.mirror.pkgbuild.com/iso/latest"
+ARCH_SIG_ORIGIN="https://archlinux.org/iso/latest"
+ARCH_BOOTSTRAP_TARBALL="archlinux-bootstrap-x86_64.tar.zst"
+# Verified live (2026-06): the bootstrap image is signed by Pierre Schmitz.
+# Update from https://archlinux.org/ (master keys) over HTTPS if Arch rotates it.
+ARCH_BOOTSTRAP_KEY="3E80CA1A8B89F69CBA57D98A76A5EF9054449A5C"
+
+PKGS=(
+    base base-devel bash git nodejs npm sudo coreutils
+    iproute2 iputils dbus
+    zsh powerline powerline-fonts grml-zsh-config
+    zsh-autosuggestions zsh-completions
+    zsh-history-substring-search zsh-syntax-highlighting
+    ripgrep tmux bind vim less
+    openssh nano openbsd-netcat curl
+)
+
+# GUI: display forwarding. Default "auto" = ON when the host is Wayland (clients are
+# well-isolated), OFF on X11 (any X client can keylog/screenshot the whole session).
+# Force with --gui / --no-gui, or WATERBOX_GUI=1/0. GPU (/dev/dri) is shared, not
+# exclusive, so it's bound by default; --no-gpu off.
+WATERBOX_GUI="${WATERBOX_GUI:-auto}"
+WATERBOX_NO_GPU="${WATERBOX_NO_GPU:-0}"
 
 mkdir -p "$CONFIG_DIR"
 touch "$SHARE_LIST"
@@ -42,79 +88,252 @@ log_success() { echo -e "\e[32m[ OK ]\e[0m $1"; }
 log_warn()    { echo -e "\e[33m[WARN]\e[0m $1"; }
 log_error()   { echo -e "\e[31m[ERR ]\e[0m $1"; exit 1; }
 
+# Ctrl-C anywhere: restore the terminal cursor (menus hide it) and exit cleanly with
+# no error code or stack — the user asked that interrupting a menu not look like a
+# crash. Menus also offer an in-list 'quit' + 'q' to back out without leaving.
+_on_interrupt() { printf '\e[?25h\n' > /dev/tty 2>/dev/null || true; exit 0; }
+trap _on_interrupt INT
+
 show_help() {
     cat <<EOF
-Usage: waterbox [command] [arguments]
+waterbox v$WATERBOX_VERSION
+Usage: waterbox [command] [arguments] [--gui|--no-gui] [--no-gpu]
 
-Namespace-isolated Arch sandbox powered by systemd-nspawn. Intended for tools
-like claude-code that you want to run in bypass mode without giving them the
-keys to your whole machine.
+Namespace-isolated Arch sandbox powered by systemd-nspawn — for running tools
+like claude-code in bypass mode without handing them your whole machine. Bare
+'waterbox' boots the box (if needed) and attaches; several commands with no
+arguments open an interactive TUI (↑/↓ · a add · d delete · q quit).
 
-Commands:
-  start             Boot the sandbox (if not already running) and attach to it.
-                    This is the default — running 'waterbox' with no command
-                    does the same thing.
-                    Each attached shell lives in its own persistent tmux session
-                    inside the same instance — detach with Ctrl+b d to keep state
-                    across re-attaches; typing 'exit' ends that session. When
-                    sessions already exist, 'start' shows an arrow-key menu to
-                    attach to one or open a new session, so you can run several
-                    independent terminals (e.g. parallel tasks) at once.
-  stop              Power off the running sandbox.
-  restart           stop + start (use after 'share add' to mount the new path).
-  status            Show whether the sandbox is currently running.
-  reset             Wipe the sandbox filesystem and rebuild it from scratch.
-  share add <path>  Expose a host directory inside the workspace.
-                    Requires 'waterbox restart' to take effect.
-  share del <path>  Stop exposing a host directory. Live-unmounts immediately
-                    if the sandbox is running; no restart needed.
-  share list        List directories currently mapped into the workspace.
+Running the box:
+  start [--gui]     Boot if needed and attach (the default; 'waterbox' alone).
+                    Each attach is its own persistent tmux session — Ctrl-b d
+                    detaches, 'exit' ends it. Display forwarding is auto-on for
+                    Wayland hosts (off on X11); force with --gui / --no-gui.
+  stop              Power the box off.
+  restart           stop + start (needed after 'share' changes or to toggle --gui).
+  status            Show whether the box is running.
+  reset             Wipe the rootfs and rebuild from scratch.
+
+Sharing folders with the box:
+  share             Manage shared host folders (TUI). CLI: share add/detach/list;
+                    see 'waterbox share --help'.
+
+Scheduling:
+  wake-claude       Manage quota wakes (TUI) — fire a tiny Haiku 'hi' to open an
+                    account's fresh 5-hour window. Runs even while the box is
+                    stopped and you're offline. See 'waterbox wake-claude --help'.
+  schedule-command  Manage scheduled commands (TUI) — type a command + Enter into
+                    a live session at a set time (needs the box running). See
+                    'schedule-command --help'.
+
   help              Show this help.
+
+(Host privileges — a root-owned helper reached via a narrow, passwordless sudoers
+ rule — are installed automatically on the first 'start'/'reset'; no manual setup.)
+
+Update an existing box after upgrading waterbox:  waterbox refresh-config
+  (also applied automatically on the next 'start' when no session is live.)
 
 Paths:
   Rootfs:                 $JAIL_ROOT
   Workspace inside:       $CONTAINER_WORKSPACE
   Host reachable inside:  $HOST_ALIAS  ($HOST_IP)
-                          \`host:PORT\` is DNAT'd to 127.0.0.1:PORT on the host,
-                          so MCP servers bound to localhost are reachable as-is.
+                          \`host:PORT\` is DNAT'd to 127.0.0.1:PORT on the host.
+  Back up your accounts:  $JAIL_ROOT/home/$USER_NAME/.claude-env
+                          (all Claude logins + the shared chat history — copy this
+                          directory somewhere safe to preserve everything.)
 EOF
 }
 
-# --- Bootstrap (runs once) ---
+# Per-command detail (the CLI forms). The bare command opens the TUI manager; the
+# top-level help stays short and points here.
+help_wake() {
+    cat <<'EOF'
+Usage: waterbox wake-claude [<profile> <HH:MM> [once|daily]]
+
+Fire a tiny Haiku 'hi' at <HH:MM> to open that account's fresh 5-hour quota
+window — no session needed, output discarded, nothing saved to history. Backed by
+a HOST systemd timer, so it fires even while the box is stopped and you're offline
+(the root helper boots the box, primes the account, and powers it back off).
+
+  (no args)                             Open the live manager (a add · d del · q quit).
+  <profile> <HH:MM> [once|daily]        Add a wake directly (default: daily).
+  list                                  List wakes with time-to-trigger.
+  del <id>                              Remove a wake (id from 'list', e.g. wake-1).
+EOF
+}
+help_schedule() {
+    cat <<'EOF'
+Usage: waterbox schedule-command [<session> <HH:MM> [once|daily] "<command>"]
+
+At <HH:MM>, type <command> + Enter into an existing tmux session (e.g. fire a
+prompt the moment your quota resets). The session must exist when you add it.
+
+  (no args)                                    Open the live manager (a add · d del · q quit).
+  <session> <HH:MM> [once|daily] "<command>"   Add directly (default: once).
+  list                                         List scheduled commands with time-to-trigger.
+  del <id>                                     Remove one (id from 'list', e.g. schd-com-1).
+EOF
+}
+help_share() {
+    cat <<'EOF'
+Usage: waterbox share [add <path> | detach <path> | list]
+
+Expose a host directory inside the box's ~/workspace. For safety 'add' allows only
+a directory inside your home (e.g. a project subdir) or a folder you own under
+/mnt, /media or /run/media — a sandboxed root (container root == host root here)
+could abuse anything else to escape, and the privileged boot would refuse it
+anyway. Adding/detaching takes effect on the next 'waterbox restart'. A leading ~
+is expanded to your home. 'detach' only unmounts — it never deletes files.
+
+  (no args)      Open the live manager (a add · d detach · q quit).
+  add <path>     Share a directory.
+  detach <path>  Stop sharing it (unmount only).
+  list           List shared directories.
+EOF
+}
+
+# --- Bootstrap image verification (req 6) -------------------------------------
+verify_tarball() {
+    local tarball="$1" sig="$2"
+    log_info "Verifying the Arch bootstrap image signature..."
+
+    # Preferred on Arch hosts: the official, self-maintaining pacman keyring.
+    if command -v pacman-key >/dev/null 2>&1 \
+       && sudo pacman-key -v "$sig" >/dev/null 2>&1; then
+        log_success "Signature verified via pacman-key (official keyring)."
+        return 0
+    fi
+
+    # Portable path (e.g. Linux Mint): gpg against the pinned signing key.
+    command -v gpg >/dev/null 2>&1 \
+        || log_error "Need 'gpg' (or pacman-key) to verify the image. Install gnupg."
+    local gdir ks ok=1
+    gdir="$(mktemp -d)"
+    for ks in hkps://keyserver.ubuntu.com hkps://keys.openpgp.org; do
+        if gpg --homedir "$gdir" --batch --keyserver "$ks" \
+               --recv-keys "$ARCH_BOOTSTRAP_KEY" >/dev/null 2>&1; then
+            ok=0; break
+        fi
+    done
+    [ "$ok" -eq 0 ] \
+        || { rm -rf "$gdir"; log_error "Could not fetch Arch signing key $ARCH_BOOTSTRAP_KEY from any keyserver."; }
+
+    if gpg --homedir "$gdir" --status-fd 1 --verify "$sig" "$tarball" 2>/dev/null \
+         | grep -q "VALIDSIG $ARCH_BOOTSTRAP_KEY"; then
+        log_success "Signature verified via gpg (pinned key $ARCH_BOOTSTRAP_KEY)."
+        rm -rf "$gdir"; return 0
+    fi
+    rm -rf "$gdir"
+    log_error "Bootstrap image FAILED signature verification. Aborting."
+}
+
+# Nameserver lines for the container's /etc/resolv.conf, derived from the HOST's DNS
+# so the box resolves names the same way the host does (incl. split-DNS / internal
+# domains). Key case: a host-local resolver on 127.0.0.1:53 is unreachable as-is from
+# inside (loopback is the container's own), so it's remapped to HOST_IP — which the
+# container->host DNAT forwards to the host's 127.0.0.1:53. Other loopback stubs (e.g.
+# systemd-resolved's 127.0.0.53) are skipped in favour of its real upstreams in
+# /run/systemd/resolve/resolv.conf. Public DNS_SERVERS are appended as a fallback so
+# there's always something that works. Deduped, order preserved.
+#
+# The remapped HOST_IP resolver is reachable even when the host binds DNS to 127.0.0.1
+# only (not 0.0.0.0): the DNAT to 127.0.0.1 + route_localnet (both set by net_up) hand
+# the query to the loopback-bound listener. If that resolver has a source ACL and drops
+# or refuses the container's query, glibc moves to the next nameserver — so the public
+# fallback still answers. 'options timeout:2 attempts:2' keeps that fall-through quick
+# (≈2s) instead of the default 5s-per-query stall.
+_container_nameservers() {
+    local kw val seen=" " src
+    for src in /etc/resolv.conf /run/systemd/resolve/resolv.conf; do
+        [ -r "$src" ] || continue
+        while read -r kw val _; do
+            [ "$kw" = nameserver ] || continue
+            case "$val" in
+                127.0.0.1)    val="$HOST_IP" ;;   # host-local resolver: reach via DNAT
+                127.*|::1|::) continue ;;         # other loopback stubs: unreachable
+            esac
+            case "$seen" in *" $val "*) continue ;; esac
+            seen="$seen$val "; echo "nameserver $val"
+        done < "$src"
+    done
+    for val in "${DNS_SERVERS[@]}"; do
+        case "$seen" in *" $val "*) continue ;; esac
+        seen="$seen$val "; echo "nameserver $val"
+    done
+    echo "options timeout:2 attempts:2"   # fall through to the fallback quickly
+}
+
+# --- Bootstrap (runs once) ----------------------------------------------------
 bootstrap_sandbox() {
-    if [ -d "$JAIL_ROOT/usr" ]; then
+    # A sentinel written only at the very end marks a *complete* build. Testing
+    # for it (not just $JAIL_ROOT/usr) means a bootstrap that dies mid-way — e.g.
+    # a network hiccup during the pacman/yay steps — is retried cleanly instead
+    # of leaving a half-configured rootfs that the next run mistakes for ready.
+    if [ -f "$JAIL_ROOT/.waterbox-ready" ]; then
         return 0
     fi
 
     log_info "Bootstrapping Arch rootfs at $JAIL_ROOT (this takes a few minutes)..."
-    sudo mkdir -p "$JAIL_ROOT"
-    sudo chown root:root "$JAIL_ROOT"
+    # WB_TMP is script-scope (not local) so the EXIT trap can remove it even when
+    # set -e aborts mid-bootstrap — the ~200 MB tarball must not leak on failure.
+    WB_TMP="$(mktemp -d)"
+    trap 'rm -rf "$WB_TMP"' EXIT
 
-    local pkgs=(
-        base base-devel bash git nodejs npm sudo coreutils
-        iproute2 iputils dbus
-        zsh powerline powerline-fonts grml-zsh-config
-        zsh-autosuggestions zsh-completions
-        zsh-history-substring-search zsh-syntax-highlighting
-        ripgrep tmux bind vim less
-        openssh nano openbsd-netcat
-    )
+    log_info "Downloading $ARCH_BOOTSTRAP_TARBALL ..."
+    curl -fSL --progress-bar "$ARCH_MIRROR/$ARCH_BOOTSTRAP_TARBALL" -o "$WB_TMP/img.tar.zst"
+    # Signature from the canonical origin (not the mirror), verified vs pinned key.
+    curl -fsSL "$ARCH_SIG_ORIGIN/$ARCH_BOOTSTRAP_TARBALL.sig" -o "$WB_TMP/img.tar.zst.sig"
 
-    sudo pacstrap -K "$JAIL_ROOT" "${pkgs[@]}"
+    verify_tarball "$WB_TMP/img.tar.zst" "$WB_TMP/img.tar.zst.sig"
+
+    log_info "Extracting rootfs (needs root to preserve ownership/devices)..."
+    sudo mkdir -p "$(dirname "$JAIL_ROOT")"
+    sudo tar --zstd -xpf "$WB_TMP/img.tar.zst" -C "$WB_TMP"   # unpacks to $WB_TMP/root.x86_64
+    sudo rm -rf "$JAIL_ROOT"
+    sudo mv "$WB_TMP/root.x86_64" "$JAIL_ROOT"
+    rm -rf "$WB_TMP"
 
     log_info "Configuring locale, user, networking..."
 
+    # The bootstrap ships a commented mirrorlist; point it at the geo mirror.
+    echo 'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch' \
+        | sudo tee "$JAIL_ROOT/etc/pacman.d/mirrorlist" > /dev/null
+    # CheckSpace mis-reports on overlay/df; disable while we install.
+    sudo sed -i 's/^CheckSpace/#CheckSpace/' "$JAIL_ROOT/etc/pacman.conf"
+
+    log_info "Initializing pacman keyring inside the rootfs..."
+    sudo systemd-nspawn -q -D "$JAIL_ROOT" bash -c \
+        'pacman-key --init && pacman-key --populate archlinux'
+
+    log_info "Installing base packages inside the rootfs..."
+    # pacman 7's download sandbox needs a WORKING kernel Landlock; live-ISO / VM /
+    # older kernels (e.g. Linux Mint on VirtualBox) don't have one, so the sync aborts
+    # with "Landlock is not supported by the kernel". Detecting that from outside is
+    # unreliable (the LSM can be listed yet non-functional), so just try once and, on
+    # failure, disable pacman's sandbox in the rootfs and retry. It then stays disabled
+    # so the files DB, yay, and in-box pacman all keep working on that same kernel;
+    # Landlock-capable hosts never hit this and keep the sandbox.
+    if ! sudo systemd-nspawn -q -D "$JAIL_ROOT" \
+            pacman -Syu --noconfirm --needed "${PKGS[@]}"; then
+        log_warn "pacman couldn't use its download sandbox (kernel Landlock unavailable) — disabling it and retrying."
+        sudo sed -i '/^\[options\]/a DisableSandbox' "$JAIL_ROOT/etc/pacman.conf"
+        sudo systemd-nspawn -q -D "$JAIL_ROOT" \
+            pacman -Syu --noconfirm --needed "${PKGS[@]}"
+    fi
+
+    # Download the files database too, so `pacman -F` / `pkgfile` work and there's no
+    # "database file for 'core' does not exist (use '-Fy')" warning later.
+    log_info "Syncing the pacman files database (pacman -Fy)..."
+    sudo systemd-nspawn -q -D "$JAIL_ROOT" pacman -Fy --noconfirm || true
+
     echo "$INSIDE_HOSTNAME" | sudo tee "$JAIL_ROOT/etc/hostname" > /dev/null
 
-    # Static resolv.conf — nspawn won't touch it (we use --resolv-conf=off).
-    # systemd-resolved is masked below so it can't reclaim the file or symlink
-    # /etc/resolv.conf to its stub. A VPN client inside is free to overwrite.
+    # resolv.conf derived from the host's DNS (see _container_nameservers) — nspawn
+    # won't touch it (--resolv-conf=off), systemd-resolved is masked below so it can't
+    # reclaim it, and a VPN client inside is free to overwrite it.
     sudo rm -f "$JAIL_ROOT/etc/resolv.conf"
-    {
-        for dns in "${DNS_SERVERS[@]}"; do
-            echo "nameserver $dns"
-        done
-    } | sudo tee "$JAIL_ROOT/etc/resolv.conf" > /dev/null
+    _container_nameservers | sudo tee "$JAIL_ROOT/etc/resolv.conf" > /dev/null
 
     # /etc/hosts: name the host so it's easy to reach from inside.
     sudo tee -a "$JAIL_ROOT/etc/hosts" > /dev/null <<EOF
@@ -126,19 +345,24 @@ EOF
     sudo systemd-nspawn -q -D "$JAIL_ROOT" locale-gen
     echo "LANG=en_US.UTF-8" | sudo tee "$JAIL_ROOT/etc/locale.conf" > /dev/null
 
-    # User
+    # User (uid 1000 == host user, so bind-mounted shares keep correct ownership)
     sudo systemd-nspawn -q -D "$JAIL_ROOT" \
         useradd -m -s /usr/bin/zsh -u 1000 "$USER_NAME" 2>/dev/null || true
     echo "$USER_NAME ALL=(ALL) NOPASSWD: ALL" \
         | sudo tee "$JAIL_ROOT/etc/sudoers.d/10-$USER_NAME" > /dev/null
     sudo chmod 0440 "$JAIL_ROOT/etc/sudoers.d/10-$USER_NAME"
 
+    # GPU access for the user (best-effort: groups may not match host gids, in
+    # which case GUI apps fall back to software rendering — fine for occasional use).
+    sudo systemd-nspawn -q -D "$JAIL_ROOT" bash -c '
+        getent group render >/dev/null || groupadd -r render
+        getent group video  >/dev/null || groupadd -r video
+        usermod -aG video,render '"$USER_NAME"'' 2>/dev/null || true
+
     sudo mkdir -p "$JAIL_ROOT$CONTAINER_WORKSPACE"
     sudo chown -R 1000:1000 "$JAIL_ROOT$CONTAINER_WORKSPACE"
 
-    # Static network config for host0 (the container side of the veth pair).
-    # Name matches the file shipped in /usr/lib/systemd/network so this one
-    # overrides it; otherwise the lib version (DHCP + link-local) wins.
+    # Static network config for host0 (container side of the veth pair).
     sudo mkdir -p "$JAIL_ROOT/etc/systemd/network"
     {
         echo "[Match]"
@@ -147,18 +371,21 @@ EOF
         echo "[Network]"
         echo "Address=$CONTAINER_IP/$NET_CIDR"
         echo "Gateway=$HOST_IP"
-        for dns in "${DNS_SERVERS[@]}"; do
-            echo "DNS=$dns"
-        done
+        for dns in "${DNS_SERVERS[@]}"; do echo "DNS=$dns"; done
     } | sudo tee "$JAIL_ROOT/etc/systemd/network/80-container-host0.network" > /dev/null
+
+    # Enable the container's network/login stack; mask resolved (so it can't
+    # hijack /etc/resolv.conf → 127.0.0.53 stub) and tmp.mount (so it doesn't
+    # tmpfs-shadow /tmp, which would hide the GUI X11 socket under /tmp/.X11-unix).
+    # Separate calls so one failing doesn't skip the others; also disable resolved
+    # outright. (start still re-asserts a working resolv.conf via 'ensure-dns'.)
     sudo systemd-nspawn -q -D "$JAIL_ROOT" \
         systemctl enable systemd-networkd dbus systemd-logind >/dev/null 2>&1 || true
-    # Mask resolved so it can't hijack /etc/resolv.conf with its stub.
-    sudo systemd-nspawn -q -D "$JAIL_ROOT" \
-        systemctl mask systemd-resolved >/dev/null 2>&1 || true
+    sudo systemd-nspawn -q -D "$JAIL_ROOT" systemctl disable systemd-resolved >/dev/null 2>&1 || true
+    sudo systemd-nspawn -q -D "$JAIL_ROOT" systemctl mask systemd-resolved >/dev/null 2>&1 || true
+    sudo systemd-nspawn -q -D "$JAIL_ROOT" systemctl mask tmp.mount >/dev/null 2>&1 || true
 
-    # AUR + extras (yay, claude-code, etc). pacstrap container has its own network.
-    sudo sed -i 's/^CheckSpace/#CheckSpace/' "$JAIL_ROOT/etc/pacman.conf"
+    # AUR + extras (yay, claude-code, oh-my-posh). No veth here => host network.
     log_info "Installing yay + claude-code + extras inside the rootfs..."
     sudo systemd-nspawn -q -D "$JAIL_ROOT" --user "$USER_NAME" bash -c "
         cd /tmp &&
@@ -169,7 +396,19 @@ EOF
     "
     sudo sed -i 's/#CheckSpace/CheckSpace/' "$JAIL_ROOT/etc/pacman.conf"
 
-    # .zshrc
+    configure_dotfiles
+    install_claude_env
+    write_task_helper
+
+    # Mark the build complete (see the sentinel check at the top) and drop the
+    # tmp-cleanup trap now that bootstrap succeeded.
+    sudo touch "$JAIL_ROOT/.waterbox-ready"
+    trap - EXIT
+    log_success "Rootfs ready at $JAIL_ROOT"
+}
+
+# Dotfiles, claude defaults, git identity — all per-user, written once.
+configure_dotfiles() {
     sudo tee "$JAIL_ROOT/home/$USER_NAME/.zshrc" > /dev/null <<'EOF'
 HISTFILE=~/.histfile
 HISTSIZE=20000
@@ -186,18 +425,70 @@ bindkey '^U' backward-kill-line
 
 eval "$(oh-my-posh init zsh --config blue-owl)"
 export PATH="$HOME/.local/bin:$PATH"
+
+# Enable the completion system so claude-env (and others) get Tab-completion.
+autoload -Uz compinit && compinit -u
+
+# Source AFTER compinit so claude-env can register its Tab-completion.
+[ -f "$HOME/.config/claude-env.zsh" ] && source "$HOME/.config/claude-env.zsh"
+
+# GUI display env, written at boot by 'waterbox … --gui'. Sourcing it here makes
+# DISPLAY / WAYLAND_DISPLAY available in every session, independent of how the
+# session was spawned — so X/Wayland apps launched from the box just work.
+[ -f /etc/waterbox/gui-env ] && source /etc/waterbox/gui-env
+
+# Small orientation banner, printed once per tmux session.
+waterbox_welcome() {
+    print -P "%F{cyan}── waterbox ─────────────────────────────────────────%f"
+    print    "  claude-env          switch / create a Claude account (active one colours the status bar)"
+    print    "  claude-env default  set the account new sessions start on (Tab-completes names)"
+    print    "  claude              run Claude Code in the active account"
+    print    "  Ctrl-b d            detach (session keeps running) — re-attach with 'waterbox' on the host"
+    print    "  exit / Ctrl-d       end this session"
+    print    "  Ctrl-b c            new window   ·   Ctrl-b n / p   next / previous window"
+    print    "  Ctrl-b <number>     jump to window N (1, 2, …)   ·   more: https://tmuxai.dev/tmux-shortcuts/"
+    print -P "%F{cyan}─%f Tip: copy ~/.claude-env off the box to back up every account + the shared chats."
+    print -P "%F{cyan}─────────────────────────────────────────────────────%f"
+}
+# Key the "already welcomed" marker to the tmux SERVER pid + session id. The pid
+# is unique per boot, so markers left in /tmp by a previous boot (/tmp is NOT a
+# tmpfs here — tmp.mount is masked) can't collide and silently suppress the banner
+# in a brand-new session that happens to reuse an old session id.
+if [[ -o interactive && -n "$TMUX" ]]; then
+    _wb_sid=$(tmux display -p '#{pid}_#{session_id}' 2>/dev/null)
+    _wb_mark="/tmp/.waterbox-welcomed-${_wb_sid//[^0-9_]/}"
+    [[ -n "$_wb_sid" && ! -e "$_wb_mark" ]] && { waterbox_welcome; : > "$_wb_mark"; }
+    unset _wb_sid _wb_mark
+fi
 EOF
     sudo chown 1000:1000 "$JAIL_ROOT/home/$USER_NAME/.zshrc"
 
-    # tmux: enable mouse so scroll wheel + pane select + resize work.
     sudo tee "$JAIL_ROOT/home/$USER_NAME/.tmux.conf" > /dev/null <<'EOF'
 set -g mouse on
 set -g history-limit 50000
+
+# When a session ends (e.g. you type 'exit'), drop any scheduled commands that
+# targeted it, so they don't linger pointing at a dead session (req 14).
+set-hook -g session-closed 'run-shell "waterbox-fire cleanup-session #{hook_session_name}"'
+
+# Tint the WHOLE status bar with the active pane's Claude profile colour, so you
+# can tell which account you're on at a glance. claude-env sets @ce_name/@ce_color
+# on the pane (see .config/claude-env.zsh) and forces a redraw; the bar falls back
+# to a neutral grey when no profile is active. Formats in styles are expanded per
+# active pane, so the colour tracks whichever pane you're in.
+set -g status-style 'bg=colour#{?@ce_color,#{@ce_color},250},fg=colour16'
+set -g window-status-current-style 'bold,reverse'
+# status-left = "profile · session" (the identity); centre the window list so it no
+# longer crowds the session name; clock on the right.
+set -g status-justify centre
+set -g status-left-length 40
+set -g status-right-length 20
+set -g status-left  ' #{?@ce_name,#[bold]#{@ce_name}#[nobold] · ,}#S '
+set -g status-right '%H:%M '
 EOF
     sudo chown 1000:1000 "$JAIL_ROOT/home/$USER_NAME/.tmux.conf"
 
-    # Inherit the host user's global git identity (name + email), if set, so
-    # commits made inside the sandbox are attributed the same as on the host.
+    # Inherit the host user's global git identity (name + email), if set.
     local host_git_name host_git_email
     host_git_name=$(git config --global user.name 2>/dev/null || true)
     host_git_email=$(git config --global user.email 2>/dev/null || true)
@@ -211,10 +502,7 @@ EOF
         log_info "Copied host git identity ($host_git_name <$host_git_email>) into the sandbox."
     fi
 
-    # Fetch personal vim/nano dotfiles into the user's home. Best-effort: if a
-    # URL is dead or curl is missing, warn and move on rather than abort the
-    # whole bootstrap. Downloaded to a temp file first so a failed/partial
-    # fetch never lands a broken rc file (curl -f fails on HTTP errors).
+    # Personal vim/nano dotfiles (best-effort; a dead URL just warns).
     local rc url dest tmpfile
     for rc in vimrc nanorc; do
         url="https://raw.githubusercontent.com/morkin1792/mylinux/master/$rc"
@@ -230,7 +518,8 @@ EOF
         rm -f "$tmpfile"
     done
 
-    # claude-code defaults: bypass permissions, opus + xhigh effort, auto-memory on.
+    # claude-code defaults (the template each profile is seeded from): bypass
+    # permissions, opus + xhigh effort, auto-memory on.
     sudo mkdir -p "$JAIL_ROOT/home/$USER_NAME/.claude"
     sudo tee "$JAIL_ROOT/home/$USER_NAME/.claude/settings.json" > /dev/null <<'EOF'
 {
@@ -244,264 +533,911 @@ EOF
 }
 EOF
     sudo chown -R 1000:1000 "$JAIL_ROOT/home/$USER_NAME/.claude"
+}
 
-    log_success "Rootfs ready at $JAIL_ROOT"
+# --- claude-env: multiple Claude accounts inside one box ----------------------
+# Profiles are isolated Claude config dirs (CLAUDE_CONFIG_DIR), so each holds its
+# own login/credentials and history. write_claude_env_zsh writes just the zsh
+# switcher (re-runnable by 'refresh-config'); install_claude_env also seeds the
+# default 'personal' profile so the box is ready out of the box.
+write_claude_env_zsh() {
+    sudo mkdir -p "$JAIL_ROOT/home/$USER_NAME/.config"
+    sudo tee "$JAIL_ROOT/home/$USER_NAME/.config/claude-env.zsh" > /dev/null <<'CLAUDEENV'
+# claude-env — switch the Claude Code account/profile for this shell.
+# Profiles live in ~/.claude-env/<name>. Selecting one points CLAUDE_CONFIG_DIR
+# at it, so `claude` opens in that account; the active profile shows in the prompt.
+# Each profile keeps its OWN login/credentials, but chat history (projects/todos)
+# is SHARED across all profiles — so you can switch accounts and keep the same
+# conversations. See _claude_env_share_history.
+
+CLAUDE_ENV_HOME="$HOME/.claude-env"
+CLAUDE_ENV_SHARED="$CLAUDE_ENV_HOME/.shared"   # transcripts shared by every profile
+CLAUDE_ENV_DEFAULT_FILE="$CLAUDE_ENV_HOME/.default"  # profile new sessions start on
+
+# Which profile a new shell should start on: the configured default if it still
+# exists, else 'personal', else the first profile alphabetically, else empty. So a
+# deleted or missing default never leaves a session with no account selected.
+_claude_env_resolve_default() {
+    local d="" p
+    [[ -r "$CLAUDE_ENV_DEFAULT_FILE" ]] && d="$(<"$CLAUDE_ENV_DEFAULT_FILE")"
+    [[ -n "$d" && -d "$CLAUDE_ENV_HOME/$d" ]] && { print -r -- "$d"; return; }
+    [[ -d "$CLAUDE_ENV_HOME/personal" ]] && { print -r -- personal; return; }
+    for p in "$CLAUDE_ENV_HOME"/*(N/); do print -r -- "${p:t}"; return; done
+}
+_claude_env_set_default() {   # $1 = profile name (must exist)
+    [[ -d "$CLAUDE_ENV_HOME/$1" ]] || { print "No such profile: '$1'."; return 1; }
+    print -r -- "$1" > "$CLAUDE_ENV_DEFAULT_FILE"
+    print "Default Claude profile set to '$1' (new sessions start here)."
+}
+
+_claude_env_seed() {   # $1 = profile dir; seed defaults from the base template
+    [[ -f "$1/settings.json" ]] && return 0
+    [[ -f "$HOME/.claude/settings.json" ]] && cp "$HOME/.claude/settings.json" "$1/settings.json"
+}
+
+# Point a profile's projects/ and todos/ at the shared store (symlinks), so chat
+# history follows you across accounts. Any real dir already there is migrated into
+# the shared store first (union-merged), then replaced by the symlink. Idempotent:
+# once linked, re-running is a no-op. Credentials (.credentials.json) stay per
+# profile, so this shares history WITHOUT sharing logins.
+_claude_env_share_history() {   # $1 = profile dir
+    local d="$1" sub
+    mkdir -p "$CLAUDE_ENV_SHARED"
+    for sub in projects todos; do
+        if [[ -d "$d/$sub" && ! -L "$d/$sub" ]]; then
+            mkdir -p "$CLAUDE_ENV_SHARED/$sub"
+            cp -a "$d/$sub/." "$CLAUDE_ENV_SHARED/$sub/" 2>/dev/null && rm -rf "$d/$sub" || continue
+        fi
+        mkdir -p "$CLAUDE_ENV_SHARED/$sub"
+        ln -sfn "$CLAUDE_ENV_SHARED/$sub" "$d/$sub"
+    done
+}
+
+# A stable tmux colour for a profile name (same name → same colour). 16 bright tones
+# (readable with black text); green is fine here since "no profile" is grey, not green.
+_claude_env_color() {
+    local pal=(2 3 6 10 11 14 208 214 220 45 213 118 51 205 154 111) h
+    h=$(print -rn -- "$1" | cksum | cut -d' ' -f1)
+    print -r -- "${pal[ h % ${#pal} + 1 ]}"
+}
+# Publish the active profile (+ its colour) onto the tmux pane so the status bar
+# can show it. No-op outside tmux.
+_claude_env_tmux_status() {
+    [[ -n "$TMUX" ]] || return 0
+    tmux set -p @ce_name "$1" 2>/dev/null
+    [[ -n "$1" ]] && tmux set -p @ce_color "$(_claude_env_color "$1")" 2>/dev/null
+    tmux refresh-client -S 2>/dev/null   # repaint the bar now, don't wait for the interval
+}
+
+_claude_env_select() { # $1 = profile name
+    export CLAUDE_CONFIG_DIR="$CLAUDE_ENV_HOME/$1"
+    export CLAUDE_ENV_PROFILE="$1"
+    [[ -d "$CLAUDE_CONFIG_DIR" ]] && _claude_env_share_history "$CLAUDE_CONFIG_DIR"
+    _claude_env_tmux_status "$1"
+}
+
+_claude_env_menu() {   # args = options; sets REPLY to the chosen option, or:
+    #   '(delete)' if 'd' is pressed (MENU_NAME = highlighted profile), or
+    #   '(new)'    if the inline input row (last option, when MENU_INPUT_ROW=1) is
+    #              confirmed (MENU_NAME = the typed name; its text is the label).
+    # The input row shows a block cursor when selected; ↑/↓ move off it and back
+    # with the text preserved, printable keys append, Backspace deletes to empty.
+    local opts=("$@") sel=1 n=$# key i buf="" first=1
+    local input_row=${MENU_INPUT_ROW:-0}; MENU_INPUT_ROW=0; MENU_NAME=""
+    print -u2 -- "Select a Claude profile (↑/↓, Enter · d delete):"
+    print -nu2 -- $'\e[?25l'
+    while true; do
+        (( first )) || print -nu2 -- $'\e['"$n"'A'
+        first=0
+        for (( i = 1; i <= n; i++ )); do
+            if (( input_row )) && (( i == n )); then
+                if (( i == sel )); then
+                    print -nu2 -- $'\r\e[K  \e[36m> '"${opts[i]}${buf}"$'\e[0m\e[7m \e[0m\n'
+                else
+                    print -nu2 -- $'\r\e[K    '"${opts[i]}${buf}"$'\n'
+                fi
+            elif (( i == sel )); then
+                print -nu2 -- $'\r\e[K  \e[36m> '"${opts[i]}"$'\e[0m\n'
+            else
+                print -nu2 -- $'\r\e[K    '"${opts[i]}"$'\n'
+            fi
+        done
+        read -k1 -s key
+        if [[ "$key" == $'\e' ]]; then
+            read -k2 -s key
+            case "$key" in
+                '[A'|'OA') (( sel = sel > 1 ? sel - 1 : n ));;
+                '[B'|'OB') (( sel = sel < n ? sel + 1 : 1 ));;
+            esac
+            continue
+        fi
+        # Editing the inline input row (type-on-select).
+        if (( input_row )) && (( sel == n )); then
+            case "$key" in
+                ''|$'\n'|$'\r') print -nu2 -- $'\e[?25h'; MENU_NAME="$buf"; REPLY='(new)'; return 0 ;;
+                $'\177'|$'\b')  buf="${buf%?}" ;;
+                *)              buf="$buf$key" ;;
+            esac
+            continue
+        fi
+        # 'd' on a highlighted profile → delete flow (handled by the caller).
+        if [[ "$key" == d ]]; then
+            print -nu2 -- $'\e[?25h'; MENU_NAME="${opts[sel]}"; REPLY='(delete)'; return 0
+        fi
+        if [[ -z "$key" || "$key" == $'\n' || "$key" == $'\r' ]]; then
+            print -nu2 -- $'\e[?25h'; REPLY="${opts[sel]}"; return 0
+        fi
+    done
+}
+
+# Print (but never run) how to delete a profile — the user copy-pastes it.
+_claude_env_delete_hint() {
+    local p="$1"
+    if [[ -z "$p" || ! -d "$CLAUDE_ENV_HOME/$p" ]]; then
+        print "No profile selected to delete."; return 0
+    fi
+    print -P "%F{yellow}Deleting '$p' removes only its Claude login/credentials. Chat history is%f"
+    print -P "%F{yellow}shared across all accounts, so your conversations are kept.%f"
+    print "If you're sure, copy-paste this:"
+    print -P "    %F{cyan}claude-env delete $p%f"
+}
+
+claude-env() {
+    emulate -L zsh
+    mkdir -p "$CLAUDE_ENV_HOME"
+    local sub="$1" ans name dir target d
+    local profiles=()
+
+    if [[ "$sub" == default ]]; then
+        if [[ -n "$2" ]]; then _claude_env_set_default "$2"; return $?; fi
+        print "Default Claude profile: '$(_claude_env_resolve_default)'."
+        print "Change it with: claude-env default <name>   (Tab-completes profile names)"
+        return 0
+    fi
+
+    if [[ "$sub" == delete || "$sub" == rm ]]; then
+        target="$2"
+        [[ -z "$target" ]] && { print "usage: claude-env delete <profile>"; return 1; }
+        [[ -d "$CLAUDE_ENV_HOME/$target" ]] || { print "No such profile: $target"; return 1; }
+        print -n "Delete account '$target' (its login only — shared chats are kept)? [y/N] "; read -r ans
+        if [[ "$ans" == [Yy]* ]]; then
+            rm -rf "${CLAUDE_ENV_HOME:?}/$target"
+            # If it was the configured default, forget it so the default re-resolves.
+            [[ "$(<"$CLAUDE_ENV_DEFAULT_FILE" 2>/dev/null)" == "$target" ]] && rm -f "$CLAUDE_ENV_DEFAULT_FILE"
+            print "Deleted account '$target' (chat history kept in the shared store)."
+            # If it was the active one, switch to another rather than leaving none.
+            if [[ "$CLAUDE_ENV_PROFILE" == "$target" ]]; then
+                local nx="$(_claude_env_resolve_default)"
+                if [[ -n "$nx" ]]; then
+                    _claude_env_select "$nx"; print "Switched to '$nx'."
+                else
+                    unset CLAUDE_ENV_PROFILE CLAUDE_CONFIG_DIR; _claude_env_tmux_status ""
+                fi
+            fi
+        else
+            print "Aborted."
+        fi
+        return 0
+    fi
+
+    name="$sub"
+    if [[ -z "$name" ]]; then
+        for d in "$CLAUDE_ENV_HOME"/*(N/); do profiles+=("${d:t}"); done
+        if (( ${#profiles} == 0 )); then
+            print -n "No profiles yet. Name for a new profile: "; read -r name
+            [[ -z "$name" ]] && { print "No name given."; return 1; }
+        else
+            MENU_INPUT_ROW=1
+            _claude_env_menu "${profiles[@]}" "+ new profile: "
+            case "$REPLY" in
+                '(delete)') _claude_env_delete_hint "$MENU_NAME"; return 0 ;;
+                '(new)')    name="$MENU_NAME"
+                            [[ -z "$name" ]] && { print "No name given."; return 1; } ;;
+                *)          name="$REPLY" ;;
+            esac
+        fi
+    fi
+
+    if [[ -z "$name" || "$name" == */* || "$name" == .* ]]; then
+        print "Invalid profile name: '$name'"; return 1
+    fi
+
+    dir="$CLAUDE_ENV_HOME/$name"
+    if [[ ! -d "$dir" ]]; then
+        print -n "Profile '$name' doesn't exist. Create it? [Y/n] "; read -r ans
+        [[ "$ans" == [Nn]* ]] && { print "Ok, leaving things as they are."; return 0; }
+        mkdir -p "$dir"; _claude_env_seed "$dir"
+        print "Created profile '$name'."
+    fi
+    _claude_env_select "$name"
+    print "Active Claude profile: $name  (run 'claude')"
+}
+
+# claude-desktop (AUR) is a SEPARATE Electron app with its own login store; it does
+# not read the CLI's CLAUDE_CONFIG_DIR, so it can't inherit a claude-env login. This
+# wrapper does two things:
+#   1) points its user-data-dir at a PER-PROFILE folder (kept under the active
+#      claude-env profile), so its login is scoped to and switches with the profile
+#      — you log in once per profile and it sticks (best-effort: only if the app
+#      honours --user-data-dir; if not, it uses its default and this is a no-op).
+#   2) launches it FULLY DETACHED (new session, no controlling tty), so closing the
+#      window frees your shell — the raw binary stays attached and hangs the terminal.
+if [[ -x /usr/bin/claude-desktop ]]; then
+    claude-desktop() {
+        emulate -L zsh
+        local dd
+        if [[ -n "$CLAUDE_ENV_PROFILE" && -d "$CLAUDE_ENV_HOME/$CLAUDE_ENV_PROFILE" ]]; then
+            dd="$CLAUDE_ENV_HOME/$CLAUDE_ENV_PROFILE/desktop"; mkdir -p "$dd"
+        else
+            dd="$HOME/.config/Claude"   # no active profile: the app's default location
+        fi
+        setsid -f /usr/bin/claude-desktop --user-data-dir="$dd" "$@" </dev/null >/dev/null 2>&1
+        print "claude-desktop launched detached (profile: ${CLAUDE_ENV_PROFILE:-none}). Shell is free; close the window to quit."
+    }
+fi
+
+# The active profile is shown in the tmux status bar (colored per profile), so no
+# in-prompt indicator is needed. Strip any indicator a previous version left in
+# RPROMPT, once, so upgrades don't leave a stale "(name)" behind.
+_claude_env_prompt_cleanup() {
+    if [[ "$RPROMPT" == %F\{cyan\}\(*%f\ * ]]; then
+        RPROMPT="${RPROMPT#*%f }"
+    fi
+    add-zsh-hook -d precmd _claude_env_prompt_cleanup
+}
+autoload -Uz add-zsh-hook
+add-zsh-hook precmd _claude_env_prompt_cleanup
+
+# Tab-completion for claude-env: subcommands + existing profile names.
+_claude_env_complete() {
+    local -a subcmds profiles
+    subcmds=(default delete rm)
+    profiles=("$CLAUDE_ENV_HOME"/*(N/:t))
+    if (( CURRENT == 2 )); then
+        _describe -t commands 'claude-env command' subcmds
+        _describe -t profiles 'profile' profiles
+    elif (( CURRENT == 3 )); then
+        case "${words[2]}" in
+            default|delete|rm) _describe -t profiles 'profile' profiles ;;
+        esac
+    fi
+}
+(( $+functions[compdef] )) && compdef _claude_env_complete claude-env 2>/dev/null
+
+# Auto-select a profile for every new shell — the configured default, else a
+# fallback — so a session is never left with no account selected (req: avoid none).
+if [[ -z "$CLAUDE_ENV_PROFILE" ]]; then
+    _wb_def="$(_claude_env_resolve_default)"
+    [[ -n "$_wb_def" ]] && _claude_env_select "$_wb_def"
+    unset _wb_def
+fi
+CLAUDEENV
+    sudo chown -R 1000:1000 "$JAIL_ROOT/home/$USER_NAME/.config"
+}
+
+install_claude_env() {
+    write_claude_env_zsh
+    # Auto-create the 'personal' profile once, seeded with the default settings.
+    sudo mkdir -p "$JAIL_ROOT/home/$USER_NAME/.claude-env/personal"
+    sudo cp "$JAIL_ROOT/home/$USER_NAME/.claude/settings.json" \
+            "$JAIL_ROOT/home/$USER_NAME/.claude-env/personal/settings.json"
+    sudo chown -R 1000:1000 "$JAIL_ROOT/home/$USER_NAME/.claude-env"
+    log_info "Created default Claude profile 'personal'."
+    _write_config_version   # a fresh box is current for this waterbox version
 }
 
 # --- Helpers ---
+# Container state via the root helper (passwordless) once it's installed; before
+# that (fresh bootstrap) fall back to a plain read — the box isn't up yet anyway.
 is_running() {
-    sudo machinectl show "$MACHINE_NAME" --property=State 2>/dev/null \
-        | grep -q "State=running"
+    if _helper_current; then
+        [ "$(sudo -n "$HELPER_PATH" state 2>/dev/null)" = running ]
+    else
+        machinectl show "$MACHINE_NAME" --property=State 2>/dev/null | grep -q "State=running"
+    fi
 }
 
-build_bind_args() {
-    local args=()
-    while IFS= read -r host_path || [ -n "$host_path" ]; do
-        [ -z "$host_path" ] && continue
-        # A previously-shared path may have been deleted/moved on the host.
-        # systemd-nspawn refuses to boot if a --bind source is missing, so skip
-        # it with a warning (to stderr — this function's stdout is the arg list)
-        # instead of taking down the whole sandbox. The entry stays in
-        # $SHARE_LIST and remounts automatically if the path reappears.
-        if [ ! -d "$host_path" ]; then
-            log_warn "Shared path no longer exists, skipping: $host_path" >&2
-            continue
+# GUI display passthrough. Runs AS THE USER (needs your DISPLAY/XAUTHORITY/runtime
+# dir) and writes two spec files the root helper consumes at boot:
+#   GUI_BINDS_FILE  — one "<src>[:<dst>]" per line; the helper validates each (only
+#                     the display sockets + our own xauth file) before binding.
+#   GUI_ENV_FILE    — "export VAR=..." lines; the helper copies these into the
+#                     rootfs /etc/waterbox/gui-env, which the login shell sources
+#                     (the reliable path — DISPLAY reaching a session must not
+#                     depend on tmux/machinectl env propagation).
+# Both files are cleared first, so a boot WITHOUT --gui leaves nothing stale.
+#
+# It auto-detects the host's display server from which socket actually binds, then
+# sets the matching toolkit backend env so GUI apps "just work" without per-app
+# flags: Wayland when a wayland socket is present (Wayland hosts), else X11 (Xorg
+# hosts like Mint Cinnamon). Fallback lists keep the other backend reachable.
+build_gui_bind_args() {
+    : > "$GUI_ENV_FILE"; : > "$GUI_BINDS_FILE"
+    [ "$WATERBOX_GUI" = "1" ] || return 0
+    local env_lines=() l have_x=0 have_wl=0
+
+    # X11. Bind the specific socket FILE (X<n>), not the /tmp/.X11-unix dir: the
+    # container's systemd-tmpfiles wipes that dir at boot, which would empty a dir
+    # bind; a file mountpoint survives it. If the display's socket isn't a real
+    # file on the host (abstract-only Xwayland), we skip X and rely on Wayland.
+    # Auth: the host cookie is keyed to the HOST hostname, but inside gethostname()
+    # is 'box' — so rewrite the cookie to FamilyWild ('ffff' matches any hostname).
+    local dnum="${DISPLAY#*:}"; dnum="${dnum%%.*}"
+    local xsock="/tmp/.X11-unix/X$dnum"
+    if [ -n "$DISPLAY" ] && [ -S "$xsock" ]; then
+        echo "$xsock" >> "$GUI_BINDS_FILE"
+        env_lines+=("DISPLAY=:$dnum")
+        have_x=1
+        local xsrc="${XAUTHORITY:-}"
+        [ -f "$xsrc" ] || xsrc=$(xauth info 2>/dev/null | sed -n 's/.*Authority file:[[:space:]]*//p' | head -n1)
+        [ -f "$xsrc" ] || xsrc="$HOME/.Xauthority"
+        if command -v xauth >/dev/null 2>&1 && [ -f "$xsrc" ]; then
+            local wx="$CONFIG_DIR/xauth"
+            rm -f "$wx"; (umask 077; : > "$wx")
+            xauth -f "$xsrc" nlist "$DISPLAY" 2>/dev/null \
+                | sed -e 's/^..../ffff/' \
+                | xauth -f "$wx" nmerge - 2>/dev/null || true
+            if [ -s "$wx" ]; then
+                echo "$wx:/tmp/.waterbox-xauth" >> "$GUI_BINDS_FILE"
+                env_lines+=("XAUTHORITY=/tmp/.waterbox-xauth")
+            fi
         fi
-        local folder_name
-        folder_name=$(basename "$host_path")
-        sudo mkdir -p "$JAIL_ROOT$CONTAINER_WORKSPACE/$folder_name"
-        sudo chown 1000:1000 "$JAIL_ROOT$CONTAINER_WORKSPACE/$folder_name"
-        args+=("--bind=$host_path:$CONTAINER_WORKSPACE/$folder_name")
-    done < "$SHARE_LIST"
-    printf '%s\n' "${args[@]}"
+        command -v xhost >/dev/null 2>&1 && xhost +SI:localuser:"$RUN_USER" >/dev/null 2>&1 || true
+    fi
+
+    # Wayland (native). Bind the socket under /tmp — NOT /run/user/1000, which the
+    # container's logind tmpfs-shadows after boot — and point WAYLAND_DISPLAY at the
+    # absolute path (libwayland accepts an absolute socket path).
+    local wlsock="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/$WAYLAND_DISPLAY"
+    [ -S "$wlsock" ] || wlsock="$WAYLAND_DISPLAY"
+    if [ -n "$WAYLAND_DISPLAY" ] && [ -S "$wlsock" ]; then
+        echo "$wlsock:/tmp/.waterbox-wayland" >> "$GUI_BINDS_FILE"
+        env_lines+=("WAYLAND_DISPLAY=/tmp/.waterbox-wayland")
+        have_wl=1
+    fi
+
+    # Pick a default backend from what actually bound: prefer Wayland if present
+    # (with X11 fallbacks), else X11. So bare `chromium`/GTK/Qt apps use the right
+    # one with no flags. Values with ';'/',' are quoted when written to gui-env.
+    if [ "$have_wl" = 1 ]; then
+        env_lines+=("XDG_SESSION_TYPE=wayland" "OZONE_PLATFORM=wayland" \
+                    "MOZ_ENABLE_WAYLAND=1" "GDK_BACKEND=wayland,x11" "QT_QPA_PLATFORM=wayland;xcb" \
+                    "ELECTRON_OZONE_PLATFORM_HINT=auto")
+    elif [ "$have_x" = 1 ]; then
+        env_lines+=("XDG_SESSION_TYPE=x11" "OZONE_PLATFORM=x11" \
+                    "GDK_BACKEND=x11" "QT_QPA_PLATFORM=xcb")
+    fi
+
+    # gui-env is sourced by the login shell, so quote values (they may hold ';'/',').
+    { for l in "${env_lines[@]}"; do
+          printf 'export %s="%s"\n' "${l%%=*}" "${l#*=}"
+      done; } > "$GUI_ENV_FILE"
+    return 0
 }
 
-# Run tmux inside the running container as the water user (uid 1000),
-# non-interactively, so the host can query/list sessions. Uses the leader-PID +
-# nsenter pattern (same as manage_share) so output is a clean pipe with no
-# machinectl-shell pty preamble. The interactive sessions live on tmux's default
-# socket (/tmp/tmux-1000/default), reachable by entering the mount ns as uid 1000.
+# Run tmux inside the running container as uid 1000, non-interactively, so the
+# host can query/list/kill sessions. Goes through the root helper (leader-PID +
+# nsenter, dropped to uid 1000) so output is a clean pipe and no broad sudo is used.
 container_tmux() {
-    local leader_pid
-    leader_pid=$(sudo machinectl show "$MACHINE_NAME" -p Leader --value 2>/dev/null)
-    [ -n "$leader_pid" ] && [ "$leader_pid" != "0" ] || return 1
-    sudo nsenter --target "$leader_pid" --mount --setuid 1000 --setgid 1000 \
-        env TMUX_TMPDIR=/tmp HOME="/home/$USER_NAME" /usr/bin/tmux "$@"
+    sudo "$HELPER_PATH" tmux "$@"
 }
 
-# Arrow-key selectable menu, drawn directly on the terminal (/dev/tty) so it is
-# independent of stdout/stderr redirection. Navigate with ↑/↓ (or k/j), Enter
-# selects. Sets the global MENU_CHOICE to the 0-based index of the chosen option.
+# Best-effort session listing for shell completion: `sudo -n` on the NOPASSWD helper
+# never prompts. Prints nothing when the box is down — completion just offers none.
+list_sessions_quiet() {
+    sudo -n "$HELPER_PATH" tmux list-sessions -F '#{session_name}' 2>/dev/null || return 0
+}
+
+# Arrow-key selectable menu drawn on /dev/tty (independent of stdout/stderr
+# redirection). Navigate with up/down (or k/j), Enter selects. Sets MENU_CHOICE.
+#
+# Optional inline input row: set MENU_INPUT_ROW=1 before calling to mark the LAST
+# option as a "type-on-select" field — its text is the prompt label (e.g.
+# "+ new session: "). Set MENU_INPUT_DEFAULT to prefill it. When that row is
+# selected it shows a block cursor and accepts editing (printable keys, Backspace
+# down to empty); ↑/↓ still move off it and back with the text preserved. Enter on
+# it confirms; the buffer lands in MENU_INPUT. Non-input rows behave as before.
+# Set MENU_DELETE=1 before calling to let 'd' on a normal (non-input) row return
+# with MENU_ACTION=delete and MENU_CHOICE=that row, so the caller can delete it and
+# re-open the menu. Cleared each call.
 MENU_CHOICE=0
+MENU_INPUT=""
+MENU_INPUT_DEFAULT=""
+MENU_ACTION=""
+MENU_CANCELLED=0
 choose_menu() {
     local prompt="$1"; shift
     local options=("$@")
+    local input_row="${MENU_INPUT_ROW:-0}"
+    local buf="${MENU_INPUT_DEFAULT:-}" delete_on="${MENU_DELETE:-0}"
+    local cancel_on="${MENU_CANCEL:-0}"
+    MENU_INPUT_ROW=0; MENU_INPUT=""; MENU_INPUT_DEFAULT=""; MENU_DELETE=0; MENU_ACTION=""
+    MENU_CANCEL=0; MENU_CANCELLED=0
+    # Optional navigable quit row (set MENU_CANCEL=1). Skipped when the last row is an
+    # inline input field, which must stay last; 'q' and Ctrl-C cancel there too.
+    local quit_idx=-1
+    if [ "$cancel_on" = 1 ] && [ "$input_row" != 1 ]; then
+        options+=("✗ quit"); quit_idx=$(( ${#options[@]} - 1 ))
+    fi
     local selected=0 key count=${#options[@]} first=1 i
+    local last=$(( ${#options[@]} - 1 ))
+    # 'q' or the quit row cancels (sets MENU_CANCELLED). Ctrl-C is handled globally
+    # (see _on_interrupt) — it restores the cursor and exits cleanly.
+    local cancelled=0
 
-    printf '\e[?25l' > /dev/tty                  # hide cursor
+    printf '\e[?25l' > /dev/tty                  # hide cursor (block cursor is drawn)
     echo "$prompt" > /dev/tty
     while true; do
         [ -z "$first" ] && printf '\e[%dA' "$count" > /dev/tty
         first=
         for i in "${!options[@]}"; do
-            if [ "$i" -eq "$selected" ]; then
+            if [ "$input_row" = 1 ] && [ "$i" -eq "$last" ]; then
+                # Input row: label + live buffer, with a reverse-video block cursor
+                # when it's the selected row so it reads as an editable field.
+                if [ "$i" -eq "$selected" ]; then
+                    printf '\e[K  \e[36m❯ %s%s\e[0m\e[7m \e[0m\n' "${options[$i]}" "$buf" > /dev/tty
+                else
+                    printf '\e[K    %s%s\n' "${options[$i]}" "$buf" > /dev/tty
+                fi
+            elif [ "$i" -eq "$selected" ]; then
                 printf '\e[K  \e[36m❯ %s\e[0m\n' "${options[$i]}" > /dev/tty
             else
                 printf '\e[K    %s\n' "${options[$i]}" > /dev/tty
             fi
         done
+        IFS= read -rsn1 key < /dev/tty || true
+        if [ "$key" = $'\e' ]; then
+            read -rsn2 key < /dev/tty || true
+            case "$key" in
+                '[A'|'OA') selected=$(( (selected - 1 + count) % count )) ;;
+                '[B'|'OB') selected=$(( (selected + 1) % count )) ;;
+            esac
+            continue
+        fi
+        # Editing the input row: printable keys append, Backspace deletes (to
+        # empty), Enter confirms. ↑/↓ were handled above, so you can leave & return.
+        if [ "$input_row" = 1 ] && [ "$selected" -eq "$last" ]; then
+            case "$key" in
+                ''|$'\n'|$'\r') MENU_INPUT="$buf"; MENU_CHOICE=$last
+                                printf '\e[?25h' > /dev/tty; return 0 ;;
+                $'\177'|$'\b')  buf="${buf%?}" ;;
+                *)              buf="$buf$key" ;;
+            esac
+            continue
+        fi
+        case "$key" in
+            k) selected=$(( (selected - 1 + count) % count )) ;;
+            j) selected=$(( (selected + 1) % count )) ;;
+            q|Q) [ "$cancel_on" = 1 ] && { cancelled=1; break; } ;;
+            d|D) if [ "$delete_on" = 1 ]; then
+                     MENU_CHOICE=$selected; MENU_ACTION=delete
+                     printf '\e[?25h' > /dev/tty; return 0
+                 fi ;;
+            ''|$'\n'|$'\r')
+                [ "$quit_idx" -ge 0 ] && [ "$selected" -eq "$quit_idx" ] && cancelled=1
+                break ;;
+        esac
+    done
+    printf '\e[?25h' > /dev/tty                   # show cursor
+    if [ "$cancelled" = 1 ]; then MENU_CANCELLED=1; MENU_CHOICE=-1; return 0; fi
+    MENU_CHOICE=$selected
+    return 0
+}
+
+# Multi-select checklist on /dev/tty. ↑/↓ (or j/k) move, Space toggles, 'a' checks
+# all, Enter confirms, 'q' cancels. Fills MULTI_CHOICES with the checked options
+# (empty on cancel or if nothing checked). $1 = prompt, rest = options.
+# Set MULTI_PRECHECK=1 to start every option checked (e.g. a "keep which?" list).
+MULTI_CHOICES=()
+choose_multi() {
+    local prompt="$1"; shift
+    local options=("$@")
+    local selected=0 key count=${#options[@]} first=1 i box
+    local pre="${MULTI_PRECHECK:-0}"; MULTI_PRECHECK=0
+    local checked=()
+    for i in "${!options[@]}"; do checked[$i]=$pre; done
+    MULTI_CHOICES=()
+
+    printf '\e[?25l' > /dev/tty
+    echo "$prompt" > /dev/tty
+    printf '  \e[2mSpace toggle · a all · Enter confirm · q cancel\e[0m\n' > /dev/tty
+    while true; do
+        [ -z "$first" ] && printf '\e[%dA' "$count" > /dev/tty
+        first=
+        for i in "${!options[@]}"; do
+            box="[ ]"; [ "${checked[$i]}" = 1 ] && box="[x]"
+            if [ "$i" -eq "$selected" ]; then
+                printf '\e[K  \e[36m❯ %s %s\e[0m\n' "$box" "${options[$i]}" > /dev/tty
+            else
+                printf '\e[K    %s %s\n' "$box" "${options[$i]}" > /dev/tty
+            fi
+        done
+        IFS= read -rsn1 key < /dev/tty
+        if [ "$key" = $'\e' ]; then
+            read -rsn2 key < /dev/tty
+            case "$key" in
+                '[A'|'OA') selected=$(( (selected - 1 + count) % count )) ;;
+                '[B'|'OB') selected=$(( (selected + 1) % count )) ;;
+            esac
+            continue
+        fi
+        case "$key" in
+            ' ') checked[$selected]=$(( 1 - checked[selected] )) ;;
+            k)   selected=$(( (selected - 1 + count) % count )) ;;
+            j)   selected=$(( (selected + 1) % count )) ;;
+            a|A) for i in "${!options[@]}"; do checked[$i]=1; done ;;
+            ''|$'\n'|$'\r')
+                for i in "${!options[@]}"; do
+                    [ "${checked[$i]}" = 1 ] && MULTI_CHOICES+=("${options[$i]}")
+                done
+                break ;;
+            q|Q) MULTI_CHOICES=(); break ;;
+        esac
+    done
+    printf '\e[?25h' > /dev/tty
+}
+
+# Read one validated line from /dev/tty into FIELD. $1 = label, $2 = anchored
+# regex the input must match (default: any non-empty), $3 = error hint. Empty
+# input cancels (returns 1). Re-prompts until valid or cancelled.
+FIELD=""
+prompt_field() {
+    local label="$1" re="${2:-.+}" err="${3:-invalid input}"
+    FIELD=""
+    while true; do
+        printf '%s' "$label" > /dev/tty
+        IFS= read -r FIELD < /dev/tty || return 1
+        [ -z "$FIELD" ] && return 1
+        [[ "$FIELD" =~ ^($re)$ ]] && return 0
+        printf '  \e[31m%s\e[0m\n' "$err" > /dev/tty
+    done
+}
+
+# Generic live "manager" screen (item 7). Arrow/j/k move, 'a' add, 'd' delete the
+# highlighted row, 'q'/Enter quit. Args:
+#   $1 title   $2 load_fn   $3 add_fn   $4 del_fn   [$5 del_verb (default "delete")]
+# load_fn fills the parallel arrays M_IDS (delete handles) and M_ROWS (display).
+# add_fn/del_fn are run in a subshell (`( ) || true`) so a log_error's exit ends
+# only that action, not the whole manager. del_verb relabels the delete action in
+# the hint and the confirmation (e.g. "detach" for shares — nothing is deleted).
+#
+# The screen is NEVER wiped (no \e[2J): the manager prints inline and scrolls like
+# 'waterbox start', preserving whatever was on the terminal before. Navigation
+# redraws the list in place (cursor up over the previous block); an add/delete
+# action prints its wizard below (scrolling), then the list is redrawn fresh.
+M_IDS=(); M_ROWS=(); M_SEL=0
+task_manager() {
+    local title="$1" load_fn="$2" add_fn="$3" del_fn="$4" del_verb="${5:-delete}"
+    local key n i first=1 drawn=0
+    M_SEL=0
+    printf '\e[?25l' > /dev/tty                    # hide cursor while navigating
+    while true; do
+        M_IDS=(); M_ROWS=()
+        "$load_fn"
+        n=${#M_ROWS[@]}
+        [ "$M_SEL" -ge "$n" ] && M_SEL=$(( n > 0 ? n - 1 : 0 ))
+
+        # Redraw in place over the previous block (unless drawing fresh).
+        [ "$first" = 0 ] && printf '\e[%dA' "$drawn" > /dev/tty
+        first=0; drawn=0
+        printf '\r\e[K\e[36m%s\e[0m\n' "$title" > /dev/tty; drawn=$((drawn + 1))
+        printf '\r\e[K  \e[2m↑/↓ move · a add · d %s · q quit\e[0m\n' "$del_verb" > /dev/tty; drawn=$((drawn + 1))
+        printf '\r\e[K\n' > /dev/tty; drawn=$((drawn + 1))
+        if [ "$n" -eq 0 ]; then
+            printf '\r\e[K    \e[2m(none yet — press a to add)\e[0m\n' > /dev/tty; drawn=$((drawn + 1))
+        else
+            for i in "${!M_ROWS[@]}"; do
+                if [ "$i" -eq "$M_SEL" ]; then
+                    printf '\r\e[K  \e[36m❯ %s\e[0m\n' "${M_ROWS[$i]}" > /dev/tty
+                else
+                    printf '\r\e[K    %s\n' "${M_ROWS[$i]}" > /dev/tty
+                fi
+                drawn=$((drawn + 1))
+            done
+        fi
+
         IFS= read -rsn1 key < /dev/tty
         case "$key" in
             $'\e')
                 read -rsn2 key < /dev/tty
                 case "$key" in
-                    '[A'|'OA') selected=$(( (selected - 1 + count) % count )) ;;
-                    '[B'|'OB') selected=$(( (selected + 1) % count )) ;;
+                    '[A'|'OA') [ "$n" -gt 0 ] && M_SEL=$(( (M_SEL - 1 + n) % n )) ;;
+                    '[B'|'OB') [ "$n" -gt 0 ] && M_SEL=$(( (M_SEL + 1) % n )) ;;
                 esac ;;
-            k) selected=$(( (selected - 1 + count) % count )) ;;
-            j) selected=$(( (selected + 1) % count )) ;;
-            '') break ;;
+            k) [ "$n" -gt 0 ] && M_SEL=$(( (M_SEL - 1 + n) % n )) ;;
+            j) [ "$n" -gt 0 ] && M_SEL=$(( (M_SEL + 1) % n )) ;;
+            a|A)
+                printf '\e[?25h\n' > /dev/tty
+                ( "$add_fn" ) || true
+                printf '\n\e[2mPress any key to continue…\e[0m' > /dev/tty
+                read -rsn1 _ < /dev/tty
+                printf '\e[?25l\n' > /dev/tty
+                first=1 ;;                          # redraw fresh below the wizard
+            d|D)
+                if [ "$n" -gt 0 ]; then
+                    printf '\e[?25h\n%s "\e[36m%s\e[0m"? [y/N] ' "${del_verb^}" "${M_ROWS[$M_SEL]}" > /dev/tty
+                    local ans=""; IFS= read -r ans < /dev/tty || true
+                    if [[ "$ans" == [Yy]* ]]; then
+                        ( "$del_fn" "${M_IDS[$M_SEL]}" ) || true
+                        printf '\n\e[2mPress any key to continue…\e[0m' > /dev/tty
+                        read -rsn1 _ < /dev/tty
+                    fi
+                    printf '\e[?25l\n' > /dev/tty
+                    first=1
+                fi ;;
+            q|Q|''|$'\n'|$'\r') break ;;
         esac
     done
-    printf '\e[?25h' > /dev/tty                   # show cursor
-    MENU_CHOICE=$selected
+    printf '\e[?25h' > /dev/tty                     # restore cursor; leave list in place
+}
+
+# --- Sessions & their scheduled commands (req: session lifecycle) --------------
+# Live tmux session names inside the box (sorted).
+_live_sessions() {
+    container_tmux list-sessions -F '#{session_name}' 2>/dev/null | sort
+}
+
+# Print the schedule-command ids whose target session == $1 (the session is the
+# first token of the timer's "# waterbox: <session> @ <time> <mode>" info line).
+_schedules_for_session() {
+    local want="$1" f b id info
+    for f in "$JAIL_ROOT$TASK_ETC/waterbox-schd-com-"*.timer; do
+        [ -e "$f" ] || continue
+        b=$(basename "$f" .timer); id="${b#waterbox-}"
+        info=$(grep -m1 '^# waterbox:' "$f" 2>/dev/null | sed 's/^# waterbox: //')
+        [ "${info%% @ *}" = "$want" ] && echo "$id"
+    done
+}
+
+# Remove every schedule-command targeting session $1 (req 14).
+_remove_session_schedules() {
+    local sess="$1" id
+    while IFS= read -r id; do
+        [ -n "$id" ] || continue
+        _sched_remove "$id"
+    done < <(_schedules_for_session "$sess")
+}
+
+# Remove ALL schedule-commands (used when every session dies: stop/reset).
+_remove_all_schedules() {
+    local f b id
+    for f in "$JAIL_ROOT$TASK_ETC/waterbox-schd-com-"*.timer; do
+        [ -e "$f" ] || continue
+        b=$(basename "$f" .timer); id="${b#waterbox-}"
+        _sched_remove "$id"
+    done
+}
+
+# List live sessions and the count of scheduled commands each would take down.
+# Returns 1 if there are no live sessions (nothing to warn about).
+_print_session_impact() {
+    local sessions=() s cnt
+    while IFS= read -r s; do [ -n "$s" ] && sessions+=("$s"); done < <(_live_sessions)
+    [ "${#sessions[@]}" -eq 0 ] && return 1
+    for s in "${sessions[@]}"; do
+        cnt=$(_schedules_for_session "$s" | grep -c . || true)   # grep -c prints 0, exits 1
+        [ "${cnt:-0}" -gt 0 ] \
+            && echo "  - $s   ($cnt scheduled command(s) will be removed)" \
+            || echo "  - $s"
+    done
+    return 0
+}
+
+# Confirm (y/N) before an action ends live sessions (req 10). No sessions → yes.
+_confirm_kill_sessions() {
+    local what="${1:-end}" ans
+    _print_session_impact > /dev/tty 2>&1 || return 0
+    printf 'This will %s the live session(s) above and remove their scheduled commands.\nProceed? [y/N] ' "$what" > /dev/tty
+    IFS= read -r ans < /dev/tty || return 1
+    [[ "$ans" == [Yy]* ]]
 }
 
 # Pick a tmux session inside the running container, then exec an attached shell.
-# No sessions yet -> create+attach "$TMUX_SESSION". Otherwise offer an arrow-key
-# menu of existing sessions plus a "new session" entry (auto-numbered box-2, ...).
-# Independent sessions = independent terminals against the same instance.
+# 'd' on an existing row kills that session (after y/N) and cleans up its scheduled
+# commands (req 5/14), then re-opens the picker.
 attach_session() {
-    # Pass ANTHROPIC_API_KEY through to this session only, if set.
-    local env_args=()
-    [ -n "$ANTHROPIC_API_KEY" ] && env_args+=(-E "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
+    # GUI env reaches the shell via the in-box /etc/waterbox/gui-env (sourced by
+    # .zshrc), so nothing to forward here beyond an optional API key.
+    local target sessions=() s name n dn default_name
+    while true; do
+        sessions=()
+        while IFS= read -r s; do
+            [ -n "$s" ] && sessions+=("$s")
+        done < <(_live_sessions)
 
-    local sessions=()
-    while IFS= read -r s; do
-        [ -n "$s" ] && sessions+=("$s")
-    done < <(container_tmux list-sessions -F '#{session_name}' 2>/dev/null | sort)
-
-    # Always show the picker — even with no sessions yet it offers "+ new session"
-    # so the entry point is consistent every time.
-    local target
-    choose_menu "Select a session to attach (↑/↓, Enter):" \
-        "${sessions[@]}" "+ new session"
-    if [ "$MENU_CHOICE" -lt "${#sessions[@]}" ]; then
-        target="${sessions[$MENU_CHOICE]}"
-        log_info "Attaching to '$target'."
-    else
-        # New session, auto-numbered: box, box-2, box-3, ...
-        target="$TMUX_SESSION"
-        local n=2
-        while printf '%s\n' "${sessions[@]}" | grep -Fxq "$target"; do
-            target="$TMUX_SESSION-$n"; n=$((n + 1))
+        # Prefill "+ new session" with the next free auto name (box, box-2, …).
+        default_name="$TMUX_SESSION"; dn=2
+        while printf '%s\n' "${sessions[@]}" | grep -Fxq "$default_name"; do
+            default_name="$TMUX_SESSION-$dn"; dn=$((dn + 1))
         done
-        log_info "Creating new session '$target'."
-    fi
 
-    # new-session -A attaches if the session exists, creates it otherwise.
-    # -c sets the working directory for newly created sessions to the workspace
-    # (ignored when attaching to an existing session, which keeps its own cwd).
-    exec sudo machinectl shell "${env_args[@]}" \
-        "$USER_NAME@$MACHINE_NAME" \
-        /usr/bin/tmux new-session -A -s "$target" -c "$CONTAINER_WORKSPACE"
+        MENU_INPUT_ROW=1
+        MENU_INPUT_DEFAULT="$default_name"
+        MENU_DELETE=1
+        choose_menu "Select a session (↑/↓ · Enter attach · d kill · Ctrl-C quit):" \
+            "${sessions[@]}" "+ new session: "
+
+        # 'd' on an existing session → confirm, kill it + its schedules, re-loop.
+        if [ "$MENU_ACTION" = delete ] && [ "$MENU_CHOICE" -lt "${#sessions[@]}" ]; then
+            local victim="${sessions[$MENU_CHOICE]}" ans
+            printf "Kill session '%s' and its scheduled commands? [y/N] " "$victim" > /dev/tty
+            IFS= read -r ans < /dev/tty || true
+            if [[ "$ans" == [Yy]* ]]; then
+                container_tmux kill-session -t "$victim" 2>/dev/null || true
+                _remove_session_schedules "$victim"
+                log_info "Killed session '$victim'."
+            fi
+            continue
+        fi
+
+        if [ "$MENU_CHOICE" -lt "${#sessions[@]}" ]; then
+            target="${sessions[$MENU_CHOICE]}"
+            log_info "Attaching to '$target'."
+        else
+            # Typed name from the inline input row (tmux forbids '.' and ':').
+            name="$MENU_INPUT"
+            if [ -n "$name" ] && ! [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]]; then
+                log_warn "Invalid name '$name' (use letters, digits, - or _); auto-naming instead."
+                name=""
+            fi
+            target="${name:-$TMUX_SESSION}"; n=2
+            while printf '%s\n' "${sessions[@]}" | grep -Fxq "$target"; do
+                target="${name:-$TMUX_SESSION}-$n"; n=$((n + 1))
+            done
+            log_info "Creating new session '$target'."
+        fi
+        break
+    done
+
+    # The helper 'shell' verb runs `machinectl shell … tmux new-session -A` (attach
+    # if it exists, else create in the workspace). The optional API key is forwarded
+    # as an -E env value inside the helper.
+    exec sudo "$HELPER_PATH" shell "$target" "${ANTHROPIC_API_KEY:-}"
 }
 
 # --- Network setup on host ---
-# Configure ve-waterbox after the container is up. NAT outbound, and DNAT
-# 10.10.0.1 -> 127.0.0.1 so host loopback services are reachable from inside.
-configure_host_network() {
-    # Wait for ve-waterbox to appear (systemd-nspawn creates it once boot starts)
-    local tries=30
-    while [ $tries -gt 0 ] && ! ip link show "$VE_IFACE" >/dev/null 2>&1; do
-        sleep 0.2
-        tries=$((tries - 1))
-    done
-    ip link show "$VE_IFACE" >/dev/null 2>&1 \
-        || log_error "Host-side veth $VE_IFACE never appeared. Check: journalctl -u $MACHINE_NAME"
-
-    sudo ip addr add "$HOST_IP/$NET_CIDR" dev "$VE_IFACE" 2>/dev/null || true
-    sudo ip link set "$VE_IFACE" up
-
-    sudo sysctl -wq net.ipv4.ip_forward=1
-    # Allow packets destined to 127.0.0.1 to arrive via the veth (needed for DNAT below).
-    sudo sysctl -wq "net.ipv4.conf.$VE_IFACE.route_localnet=1"
-
-    # DNAT: container -> host:* gets rewritten to 127.0.0.1:* on the host.
-    sudo iptables -t nat -C PREROUTING -i "$VE_IFACE" -d "$HOST_IP" -j DNAT --to-destination 127.0.0.1 2>/dev/null \
-        || sudo iptables -t nat -A PREROUTING -i "$VE_IFACE" -d "$HOST_IP" -j DNAT --to-destination 127.0.0.1
-
-    # NAT outbound: match by SOURCE, not by output interface. This way the
-    # rule keeps working when the host's default route flips to a VPN tun
-    # (ProtonVPN, wireguard, etc.) — packets just get masqueraded with
-    # whatever the current uplink is, including the VPN.
-    sudo iptables -t nat -C POSTROUTING -s "$HOST_IP/$NET_CIDR" ! -o "$VE_IFACE" -j MASQUERADE 2>/dev/null \
-        || sudo iptables -t nat -A POSTROUTING -s "$HOST_IP/$NET_CIDR" ! -o "$VE_IFACE" -j MASQUERADE
-
-    # FORWARD: INSERT at top so we sit ahead of any VPN killswitch DROP rules
-    # (ProtonVPN, NetworkManager kill switches, ufw, firewalld all insert
-    # their own rules; appending would put ours behind their drops).
-    sudo iptables -C FORWARD -i "$VE_IFACE" -j ACCEPT 2>/dev/null \
-        || sudo iptables -I FORWARD 1 -i "$VE_IFACE" -j ACCEPT
-    sudo iptables -C FORWARD -o "$VE_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null \
-        || sudo iptables -I FORWARD 1 -o "$VE_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-
-    # INPUT: optionally let the container reach any host-local port. After the
-    # PREROUTING DNAT above, traffic to 10.10.0.1 lands on the host as input
-    # to 127.0.0.1 — a restrictive INPUT policy would otherwise drop it.
-    if [ "$ALLOW_CONTAINER_TO_HOST_PORTS" = "true" ]; then
-        sudo iptables -C INPUT -i "$VE_IFACE" -s "$HOST_IP/$NET_CIDR" -j ACCEPT 2>/dev/null \
-            || sudo iptables -I INPUT 1 -i "$VE_IFACE" -s "$HOST_IP/$NET_CIDR" -j ACCEPT
-    fi
+# The veth address/NAT/forwarding rules (DNAT 10.20.30.1 -> 127.0.0.1 so host
+# loopback services are reachable inside; SOURCE-based MASQUERADE that survives a
+# VPN route flip; FORWARD inserted ahead of killswitch DROPs) now live in the root
+# helper's net_up/net_down — the same code path the offline wake uses — so no broad
+# sudo is needed. The 'boot' verb runs net_up after the container is up; 'down'
+# runs net_down. These wrappers just reach the helper for the stop/reset paths.
+teardown_host_network() {
+    _helper_current && sudo -n "$HELPER_PATH" net-down 2>/dev/null || true
 }
 
-teardown_host_network() {
-    sudo iptables -t nat -D PREROUTING -i "$VE_IFACE" -d "$HOST_IP" -j DNAT --to-destination 127.0.0.1 2>/dev/null || true
-    sudo iptables -t nat -D POSTROUTING -s "$HOST_IP/$NET_CIDR" ! -o "$VE_IFACE" -j MASQUERADE 2>/dev/null || true
-    sudo iptables -D FORWARD -i "$VE_IFACE" -j ACCEPT 2>/dev/null || true
-    sudo iptables -D FORWARD -o "$VE_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-    sudo iptables -D INPUT -i "$VE_IFACE" -s "$HOST_IP/$NET_CIDR" -j ACCEPT 2>/dev/null || true
+# Are all required host tools present? Fills MISSING_DEPS with any that aren't.
+MISSING_DEPS=()
+_check_host_deps() {
+    local need=(systemd-nspawn machinectl systemd-run iptables nsenter ip curl tar zstd) c
+    MISSING_DEPS=()
+    for c in "${need[@]}"; do
+        command -v "$c" >/dev/null 2>&1 || MISSING_DEPS+=("$c")
+    done
+    command -v gpg >/dev/null 2>&1 || command -v pacman-key >/dev/null 2>&1 || MISSING_DEPS+=("gpg")
+    [ ${#MISSING_DEPS[@]} -eq 0 ]
+}
+
+# Preflight (mainly for non-Arch hosts, req 6): if a required host tool is missing,
+# detect the package manager, show the install command, and offer to run it — rather
+# than failing cryptically mid-bootstrap.
+require_host_deps() {
+    _check_host_deps && return 0
+    log_warn "Missing required host tools: ${MISSING_DEPS[*]}"
+
+    # The needed COMMANDS come from a small, distro-specific package set (a command
+    # like systemd-nspawn ships in 'systemd-container' on Debian but 'systemd' on
+    # Arch), so offer the whole recommended set for the detected package manager.
+    local cmd=""
+    if command -v apt-get >/dev/null 2>&1; then
+        # ';' not '&&': a failed update (e.g. a broken source in sources.list.d) must
+        # not stop the install, which usually still works from the cached lists.
+        cmd="sudo apt-get update; sudo apt-get install -y systemd-container iptables iproute2 curl tar zstd gnupg"
+    elif command -v pacman >/dev/null 2>&1; then
+        cmd="sudo pacman -S --needed systemd iptables-nft iproute2 util-linux curl tar zstd gnupg"
+    elif command -v dnf >/dev/null 2>&1; then
+        cmd="sudo dnf install -y systemd-container iptables iproute curl tar zstd gnupg2"
+    elif command -v zypper >/dev/null 2>&1; then
+        cmd="sudo zypper install -y systemd-container iptables iproute2 curl tar zstd gpg2"
+    fi
+
+    if [ -z "$cmd" ]; then
+        log_warn "Couldn't detect your package manager. Install these, then retry:"
+        log_info "  Debian/Mint: sudo apt install systemd-container iptables iproute2 curl tar zstd gnupg"
+        log_info "  Arch:        sudo pacman -S --needed systemd iptables-nft iproute2 util-linux curl tar zstd gnupg"
+        log_error "Missing: ${MISSING_DEPS[*]}"
+    fi
+
+    log_info "Install them with:"
+    echo "    $cmd"
+    printf 'Run this now? [y/N] '
+    local ans; IFS= read -r ans < /dev/tty || ans=""
+    [[ "$ans" == [Yy]* ]] || log_error "Install the missing tools, then retry."
+
+    eval "$cmd" || log_error "Install failed. Install the tools manually, then retry."
+    _check_host_deps && { log_success "All host dependencies present."; return 0; }
+    log_error "Still missing: ${MISSING_DEPS[*]}. Install manually, then retry."
 }
 
 # --- Start: boot if needed, attach a shell ---
 start_sandbox() {
+    require_host_deps
     bootstrap_sandbox
+    ensure_host_privs    # immutable helper (narrow sudoers) + completion; no manual 'setup'
 
     if is_running; then
         log_info "Sandbox already running, attaching..."
+        [ "$WATERBOX_GUI" = "1" ] && [ ! -s "$GUI_BINDS_FILE" ] \
+            && log_warn "GUI binds are set at boot — 'waterbox restart --gui' to enable them."
     else
         log_info "Booting sandbox as transient systemd unit '$MACHINE_NAME.service'..."
 
-        local bind_args=()
-        while IFS= read -r line; do
-            [ -n "$line" ] && bind_args+=("$line")
-        done < <(build_bind_args)
+        # Detect the display server + write the GUI bind/env spec files as YOU
+        # (needs your DISPLAY/XAUTHORITY). Clears them when --gui is absent.
+        build_gui_bind_args
 
-        # KillMode=mixed is critical: on stop (incl. host shutdown) systemd then
-        # sends SIGTERM only to the main process (systemd-nspawn), which turns it
-        # into a clean container poweroff. The default control-group mode instead
-        # broadcasts SIGTERM to the container's PID 1, where SIGTERM means
-        # "reexec" not "poweroff" — so the container never stops and the host
-        # hangs for DefaultTimeoutStopSec (90s) before SIGKILL. TimeoutStopSec
-        # bounds the worst case; SuccessExitStatus=133 is nspawn's shutdown code
-        # (so the unit isn't marked failed). Mirrors systemd-nspawn@.service.
-        sudo systemd-run \
-            --unit="$MACHINE_NAME" \
-            --collect \
-            --service-type=notify \
-            --description="Waterbox container ($MACHINE_NAME)" \
-            --property=KillMode=mixed \
-            --property=TimeoutStopSec=30 \
-            --property=SuccessExitStatus=133 \
-            systemd-nspawn \
-                --boot \
-                --quiet \
-                --keep-unit \
-                --notify-ready=yes \
-                --directory="$JAIL_ROOT" \
-                --machine="$MACHINE_NAME" \
-                --network-veth \
-                --resolv-conf=off \
-                --capability=CAP_NET_ADMIN,CAP_NET_RAW \
-                --bind=/dev/net/tun \
-                "${bind_args[@]}"
+        # The root helper does the privileged boot: it validates the shares in
+        # $SHARE_LIST and the GUI spec, binds the GPU when present, launches the
+        # transient nspawn unit (KillMode=mixed so stop → clean poweroff), and
+        # brings up the host network. No broad sudo, so a normal start is
+        # passwordless once the helper is installed.
+        local boot_args=(boot)
+        [ "$WATERBOX_GUI" = "1" ] && boot_args+=(--gui)
+        [ "$WATERBOX_NO_GPU" = "1" ] && boot_args+=(--no-gpu)
+        run_priv "${boot_args[@]}" \
+            || log_error "Sandbox failed to boot. Check: journalctl -u $MACHINE_NAME -e"
 
-        # systemd-run with --service-type=notify only returns after the
-        # container's systemd has finished boot (sd_notify READY=1), so
-        # by here dbus + logind are guaranteed up.
         is_running || log_error "Sandbox failed to boot. Check: journalctl -u $MACHINE_NAME -e"
-
-        configure_host_network
         log_success "Sandbox up. Host reachable inside as '$HOST_ALIAS' ($HOST_IP)."
     fi
 
-    # Each attach lives in a persistent tmux session so re-attaches restore the
-    # same state (cwd, running processes, etc). Multiple named sessions let you
-    # drive several independent terminals against the same running instance.
+    # Guarantee working DNS: the container's boot may leave /etc/resolv.conf pointing
+    # at an unreachable stub (127.0.0.53). Feed the helper the host-derived servers +
+    # public fallback; it only rewrites if the box currently can't resolve. Runs every
+    # start, so a boot-time hijack is corrected before you attach.
+    _container_nameservers | run_priv ensure-dns || true
+
+    # Auto-apply an updated in-box config (from a newer waterbox) when doing so won't
+    # disrupt anyone: with no live session, the fresh tmux server we're about to open
+    # loads the new config, so no restart is needed. With live sessions we only hint,
+    # since reloading .tmux.conf into a running server needs it to restart.
+    if ! _config_current; then
+        if [ -z "$(_live_sessions)" ]; then
+            log_info "Applying updated in-box config for this waterbox version..."
+            # Subshell so a cancelled sudo just skips the refresh (set -e safe) and
+            # we still attach with the existing config rather than aborting.
+            ( refresh_config ) || log_warn "Couldn't refresh in-box config now; continuing with the existing one."
+        else
+            log_warn "In-box config is out of date; run 'waterbox restart' (with no live sessions) to apply it."
+        fi
+    fi
+
     attach_session
 }
 
 restart_sandbox() {
     stop_sandbox
+    [ "$WB_CANCELLED" = 1 ] && { log_info "Restart cancelled."; return 0; }
     start_sandbox
 }
 
 # --- Stop ---
+# Sets WB_CANCELLED=1 (and skips the poweroff) if the user declines the prompt that
+# warns which live sessions + scheduled commands the stop would take down (req 10).
+WB_CANCELLED=0
 stop_sandbox() {
+    WB_CANCELLED=0
     if is_running; then
+        if ! _confirm_kill_sessions "stop"; then
+            log_info "Stop cancelled."; WB_CANCELLED=1; return 0
+        fi
+        _remove_all_schedules            # every session dies → drop their schedules (req 14)
         log_info "Powering off sandbox..."
-        sudo machinectl poweroff "$MACHINE_NAME" || true
-        # Wait for it to actually stop so we don't tear down the network
-        # before nspawn releases the veth.
-        local tries=40
-        while [ $tries -gt 0 ] && is_running; do
-            sleep 0.25
-            tries=$((tries - 1))
-        done
+        run_priv down || true            # poweroff (waits) + net_down, in the helper
     else
         log_info "Sandbox not running."
+        teardown_host_network            # clear any stray rules
     fi
-    teardown_host_network
     log_success "Sandbox stopped."
 }
 
@@ -509,7 +1445,7 @@ stop_sandbox() {
 status_sandbox() {
     if is_running; then
         log_success "Sandbox is running."
-        sudo machinectl status "$MACHINE_NAME" --no-pager 2>/dev/null | head -n 12 || true
+        run_priv status 2>/dev/null || true
     else
         log_info "Sandbox is stopped."
     fi
@@ -518,25 +1454,662 @@ status_sandbox() {
 # --- Reset ---
 reset_sandbox() {
     log_info "About to wipe the waterbox environment."
+    if is_running && _print_session_impact > /dev/tty 2>&1; then
+        log_warn "The live session(s) above will be ended."
+    fi
+
+    # Choose what survives the wipe (req 15). Pre-checked = keep by default. Host
+    # setup (helper + completion) is always re-applied — it holds no custom data.
+    local keep_home=0 keep_wake=0 keep_shares=0 c
+    MULTI_PRECHECK=1
+    choose_multi "Reset — keep which of these? (Space toggle · Enter confirm)" \
+        "Home directory (Claude accounts, chats, workspace)" \
+        "wake-claude schedules" \
+        "Shared directories (the 'share' list)"
+    for c in "${MULTI_CHOICES[@]}"; do
+        case "$c" in
+            "Home directory"*)     keep_home=1 ;;
+            "wake-claude"*)        keep_wake=1 ;;
+            "Shared directories"*) keep_shares=1 ;;
+        esac
+    done
+
     read -p "Delete $JAIL_ROOT and rebuild from scratch? [y/N]: " -r confirmation
     if [[ ! "$confirmation" =~ ^[Yy]$ ]]; then
         log_info "Reset aborted."
         return 0
     fi
     if is_running; then
-        sudo machinectl poweroff "$MACHINE_NAME" || true
-        sleep 2
+        # Helper is still installed here (removed later if not kept) → passwordless.
+        if _helper_current; then run_priv down || true
+        else sudo machinectl poweroff "$MACHINE_NAME" || true; sleep 2; fi
     fi
     teardown_host_network
+
+    # Stash the WHOLE user home (uid-1000 owned) if keeping it: accounts, chats,
+    # workspace files, ~/.local tools, shell history — everything. The managed
+    # config (dotfiles, claude-env switcher, waterbox-fire) is re-applied AFTER the
+    # restore, so those still get refreshed to the current version.
+    local kept=""
+    if [ "$keep_home" = 1 ] && [ -d "$JAIL_ROOT/home/$USER_NAME" ]; then
+        kept=$(mktemp -d)
+        sudo cp -a "$JAIL_ROOT/home/$USER_NAME" "$kept/home" \
+            && log_info "Preserving the home directory." \
+            || { sudo rm -rf "$kept"; kept=""; log_warn "Could not stash the home directory; it will be rebuilt fresh."; }
+    fi
+
     sudo rm -rf "$JAIL_ROOT"
     bootstrap_sandbox
+
+    # Restore the stashed home over the freshly-seeded one, then re-apply the
+    # managed config on top so tweaks (prompt, tmux bar, switcher) still land.
+    if [ -n "$kept" ] && [ -d "$kept/home" ]; then
+        sudo rm -rf "$JAIL_ROOT/home/$USER_NAME"
+        sudo cp -a "$kept/home" "$JAIL_ROOT/home/$USER_NAME"
+        sudo chown -R 1000:1000 "$JAIL_ROOT/home/$USER_NAME"
+        sudo rm -rf "$kept"
+        configure_dotfiles
+        write_claude_env_zsh
+        write_task_helper
+        log_success "Restored the home directory (managed config refreshed)."
+    fi
+
+    if [ "$keep_wake" != 1 ]; then
+        _remove_all_hostwakes
+        log_info "Removed wake-claude schedules."
+    fi
+
+    if [ "$keep_shares" != 1 ]; then
+        : > "$SHARE_LIST"
+        log_info "Cleared the shared-directory list."
+    else
+        log_info "Kept the shared-directory list."
+    fi
+
+    ensure_host_privs        # host setup holds no custom data; always re-apply
+    log_success "Rebuilt. Run 'waterbox' to boot and attach."
 }
 
-# --- Shares ---
+# Remove every host wake timer (req 15: when not keeping wake-claude schedules).
+_remove_all_hostwakes() {
+    local f n
+    for f in "$HOSTWAKE_GLOB"*.timer; do
+        [ -e "$f" ] || continue
+        n=$(basename "$f" .timer); n="${n##*-}"
+        case "$n" in ''|*[!0-9]*) continue ;; esac
+        _helper_current && run_priv remove-host-wake "$n" >/dev/null 2>&1 || true
+    done
+}
+
+# --- In-box config version -----------------------------------------------------
+# Marker (rootfs, world-readable) tying the baked in-box config (dotfiles, tmux bar,
+# claude-env switcher, waterbox-fire) to the exact waterbox script that wrote it — a
+# checksum of this script. Lets 'start' notice a box built by an OLDER waterbox and
+# auto-refresh it, so you never have to remember 'refresh-config' after an upgrade.
+CONFIG_VERSION_FILE="$JAIL_ROOT/etc/waterbox/config-version"
+_config_marker()  { cksum < "$SELF_PATH" 2>/dev/null | cut -d' ' -f1; }
+_config_current() {
+    [ -f "$JAIL_ROOT/.waterbox-ready" ] \
+        && [ "$(cat "$CONFIG_VERSION_FILE" 2>/dev/null)" = "$(_config_marker)" ]
+}
+_write_config_version() {
+    sudo mkdir -p "$JAIL_ROOT/etc/waterbox"
+    _config_marker | sudo tee "$CONFIG_VERSION_FILE" >/dev/null
+}
+
+# --- Refresh in-box config (no wipe) ------------------------------------------
+# Re-apply the config baked at bootstrap (dotfiles, prompt, claude-env switcher,
+# welcome banner, the waterbox-fire helper) to an existing rootfs WITHOUT wiping
+# it — so tweaks to these reach the box without losing Claude logins/history or
+# profiles. Only rewrites managed files; profile dirs are never touched.
+refresh_config() {
+    [ -f "$JAIL_ROOT/.waterbox-ready" ] \
+        || log_error "No built sandbox to refresh. Run 'waterbox start' first."
+    log_info "Re-applying in-box config to $JAIL_ROOT ..."
+    configure_dotfiles
+    write_claude_env_zsh
+    write_task_helper
+    _write_config_version
+    log_success "Config refreshed. Start a NEW session to pick up the prompt, menu, and welcome changes."
+    is_running && log_info "Already-open shells keep their old config until you open a fresh session." || true
+}
+
+# Enable `waterbox` Tab-completion in the invoking user's ~/.zshrc. The snippet is
+# guarded: it runs completion via 'waterbox' on $PATH, else this script's recorded
+# absolute path, else does nothing — so an uninstalled or off-$PATH waterbox never
+# spews "command not found" at shell start. Idempotent + self-healing (rewrites the
+# marked block if SELF_PATH changed); strips any older unguarded lines too.
+enable_completion() {
+    local rc="$HOME/.zshrc" cache="$CONFIG_DIR/completion.zsh"
+    [ -f "$rc" ] || : > "$rc"
+    # Cache the generated completion to a file, so every new shell just SOURCES it
+    # instead of spawning the whole waterbox script (which made zsh startup slow).
+    # Refresh the cache whenever this script is newer than it.
+    if [ ! -f "$cache" ] || [ "$SELF_PATH" -nt "$cache" ]; then
+        emit_completion zsh > "$cache" 2>/dev/null || : > "$cache"
+    fi
+    # Ensure ~/.zshrc sources the cache (guarded, self-healing — strips any older
+    # block or unguarded lines). If waterbox later isn't on $PATH, Tab-completion of
+    # live sessions just goes quiet; nothing errors at shell start.
+    if ! grep -Fq "$cache" "$rc" 2>/dev/null; then
+        sed -i '/# >>> waterbox completion >>>/,/# <<< waterbox completion <<</d; /waterbox completion zsh/d; /# waterbox shell completion/d' "$rc" 2>/dev/null || true
+        {
+            echo ""
+            echo "# >>> waterbox completion >>>"
+            echo "# Managed by waterbox: source the cached completion (fast; no subprocess)."
+            echo "[[ -r \"$cache\" ]] && source \"$cache\""
+            echo "# <<< waterbox completion <<<"
+        } >> "$rc"
+        log_success "Enabled 'waterbox' Tab-completion in $rc (open a new shell to use it)."
+    fi
+}
+
+# --- Host privilege setup (auto-run by start/reset; no manual 'setup') ---------
+# Every RUNTIME privileged op now routes through the immutable helper below, so
+# there is NO broad credential cache anymore — a compromised uid-1000 can invoke
+# the helper's fixed, charset-validated verbs but cannot run arbitrary sudo. The
+# only interactive-sudo moments left are bootstrap and reset (you're present).
+
+# Write + install the immutable root helper and its narrow NOPASSWD sudoers rule.
+# The helper's privileged logic lives at a root-owned path uid-1000 can't modify,
+# so a compromised uid-1000 can invoke its fixed verbs but not change what runs as
+# root — and every arg is charset-validated so nothing can inject a systemd unit.
+install_helper() {
+    log_info "Installing the waterbox root helper (needs your password once)..."
+    sudo install -d -m 0755 -o root -g root "$HELPER_DIR"
+    local tmp; tmp=$(mktemp)
+    {
+        cat <<EOF
+#!/usr/bin/env bash
+# waterbox root helper — root-owned, immutable to uid 1000. Generated by
+# waterbox v$WATERBOX_VERSION. Do not edit. Runs privileged RUNTIME ops (fixed
+# verbs) so sudo can be NOPASSWD for this file only.
+set -e
+WB_HELPER_VERSION="$WATERBOX_VERSION"
+MACHINE_NAME="$MACHINE_NAME"
+USER_NAME="$USER_NAME"
+HOST_IP="$HOST_IP"
+CONTAINER_IP="$CONTAINER_IP"
+NET_CIDR="$NET_CIDR"
+VE_IFACE="$VE_IFACE"
+ALLOW_CONTAINER_TO_HOST_PORTS="$ALLOW_CONTAINER_TO_HOST_PORTS"
+CONTAINER_WORKSPACE="$CONTAINER_WORKSPACE"
+EOF
+        cat <<'HELPER'
+HW_ETC="/etc/systemd/system"
+TASK_ETC="/etc/systemd/system"      # inside the rootfs ($JAIL_ROOT$TASK_ETC)
+TASK_MSG_DIR="/etc/waterbox"        # inside the rootfs (schedule-command messages)
+
+# Pull a trailing "--user <uid>" out of the args (a host root timer has no
+# SUDO_UID, so it passes the target uid explicitly). Everything else is positional.
+wb_uid=""
+_args=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --user) wb_uid="$2"; shift 2 || exit 2 ;;
+        *) _args+=("$1"); shift ;;
+    esac
+done
+set -- "${_args[@]}"
+verb="${1:-}"; shift || true
+
+# SECURITY: when invoked via sudo by a user, ALWAYS act as that user — a supplied
+# --user is ignored. Only the host root timers (run as root, no SUDO_UID) may set
+# the target uid. This stops a compromised uid-1000 from passing "--user 0" (or any
+# other uid) to make the helper read/write another user's home as root.
+[ -n "${SUDO_UID:-}" ] && wb_uid="$SUDO_UID"
+case "$wb_uid" in ''|*[!0-9]*) echo "helper: no valid target user"; exit 2 ;; esac
+wb_home="$(getent passwd "$wb_uid" | cut -d: -f6)"
+[ -n "$wb_home" ] && [ -d "$wb_home" ] || { echo "helper: no home for uid $wb_uid"; exit 2; }
+JAIL_ROOT="$wb_home/.waterbox/root"
+WB_CFG="$wb_home/.waterbox"
+
+# Charset-limited AND never "." / ".." (so a name can't traverse out of its dir).
+_valid_profile() { case "$1" in ''|.|..|*[!A-Za-z0-9._-]*) return 1 ;; *) return 0 ;; esac; }
+_valid_id()      { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+_valid_time()    { [[ "$1" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; }
+_valid_session() { case "$1" in ''|.|..|*[!A-Za-z0-9._-]*) return 1 ;; *) return 0 ;; esac; }
+_valid_schedid() { case "$1" in schd-com-*) _valid_id "${1#schd-com-}" ;; *) return 1 ;; esac; }
+
+running() { machinectl show "$MACHINE_NAME" --property=State 2>/dev/null | grep -q "State=running"; }
+
+net_up() {
+    local tries=30
+    while [ $tries -gt 0 ] && ! ip link show "$VE_IFACE" >/dev/null 2>&1; do
+        sleep 0.2; tries=$((tries - 1))
+    done
+    ip link show "$VE_IFACE" >/dev/null 2>&1 || return 1
+    ip addr add "$HOST_IP/$NET_CIDR" dev "$VE_IFACE" 2>/dev/null || true
+    ip link set "$VE_IFACE" up
+    sysctl -wq net.ipv4.ip_forward=1
+    sysctl -wq "net.ipv4.conf.$VE_IFACE.route_localnet=1" 2>/dev/null || true
+    iptables -t nat -C PREROUTING -i "$VE_IFACE" -d "$HOST_IP" -j DNAT --to-destination 127.0.0.1 2>/dev/null \
+        || iptables -t nat -A PREROUTING -i "$VE_IFACE" -d "$HOST_IP" -j DNAT --to-destination 127.0.0.1
+    iptables -t nat -C POSTROUTING -s "$HOST_IP/$NET_CIDR" ! -o "$VE_IFACE" -j MASQUERADE 2>/dev/null \
+        || iptables -t nat -A POSTROUTING -s "$HOST_IP/$NET_CIDR" ! -o "$VE_IFACE" -j MASQUERADE
+    iptables -C FORWARD -i "$VE_IFACE" -j ACCEPT 2>/dev/null \
+        || iptables -I FORWARD 1 -i "$VE_IFACE" -j ACCEPT
+    iptables -C FORWARD -o "$VE_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null \
+        || iptables -I FORWARD 1 -o "$VE_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    if [ "$ALLOW_CONTAINER_TO_HOST_PORTS" = "true" ]; then
+        iptables -C INPUT -i "$VE_IFACE" -s "$HOST_IP/$NET_CIDR" -j ACCEPT 2>/dev/null \
+            || iptables -I INPUT 1 -i "$VE_IFACE" -s "$HOST_IP/$NET_CIDR" -j ACCEPT
+    fi
+}
+net_down() {
+    iptables -t nat -D PREROUTING -i "$VE_IFACE" -d "$HOST_IP" -j DNAT --to-destination 127.0.0.1 2>/dev/null || true
+    iptables -t nat -D POSTROUTING -s "$HOST_IP/$NET_CIDR" ! -o "$VE_IFACE" -j MASQUERADE 2>/dev/null || true
+    iptables -D FORWARD -i "$VE_IFACE" -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -o "$VE_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+    iptables -D INPUT -i "$VE_IFACE" -s "$HOST_IP/$NET_CIDR" -j ACCEPT 2>/dev/null || true
+}
+
+# Minimal boot for an unattended wake: NO shares, NO GUI — just the base container
+# + network, so a quota primer can reach Anthropic even while you're offline.
+boot_min() {
+    running && return 0
+    [ -f "$JAIL_ROOT/.waterbox-ready" ] || { echo "helper: rootfs not built at $JAIL_ROOT"; exit 3; }
+    systemd-run --unit="$MACHINE_NAME" --collect --service-type=notify \
+        --description="Waterbox container ($MACHINE_NAME)" \
+        --property=KillMode=mixed --property=TimeoutStopSec=30 --property=SuccessExitStatus=133 \
+        systemd-nspawn --boot --quiet --keep-unit --notify-ready=yes \
+            --directory="$JAIL_ROOT" --machine="$MACHINE_NAME" --network-veth \
+            --resolv-conf=off --capability=CAP_NET_ADMIN,CAP_NET_RAW --bind=/dev/net/tun \
+        >/dev/null 2>&1
+    running || { echo "helper: boot failed"; exit 3; }
+    net_up || true
+    sleep 3   # let networkd bring host0 up inside before we hit the network
+}
+power_off() {
+    running && machinectl poweroff "$MACHINE_NAME" >/dev/null 2>&1 || true
+    local t=40; while [ $t -gt 0 ] && running; do sleep 0.25; t=$((t - 1)); done
+    net_down
+}
+
+# --- Full interactive boot (shares + GUI + GPU), all validated helper-side ------
+# A share is safe to bind only if the user already controls that host path — else a
+# sandboxed root (container root == host root here) could rewrite host-root files
+# and escape. So: allow paths inside the user's home (minus their secret dirs), or
+# user-owned dirs on removable/user mounts; reject everything else (system dirs,
+# other users' homes). This re-checks what `share add` enforces, in case $SHARE_LIST
+# was hand-edited. Skipped shares are logged, not fatal.
+_share_allowed() {
+    local rp="$1"
+    case "$rp" in
+        "$wb_home"|"$wb_home/.ssh"|"$wb_home/.ssh/"*|"$wb_home/.gnupg"|"$wb_home/.gnupg/"*|"$wb_home/.config"|"$WB_CFG"|"$WB_CFG/"*) return 1 ;;
+        "$wb_home/"*) return 0 ;;
+    esac
+    case "$rp" in
+        /mnt/*|/media/*|/run/media/*)
+            [ "$(stat -c %u "$rp" 2>/dev/null)" = "$wb_uid" ] && return 0 || return 1 ;;
+    esac
+    return 1
+}
+add_share_binds() {
+    local list="$WB_CFG/shared_paths" p rp base
+    [ -f "$list" ] || return 0
+    while IFS= read -r p || [ -n "$p" ]; do
+        [ -n "$p" ] || continue
+        [ -d "$p" ] || continue                     # gone on host: nspawn would refuse to boot
+        rp=$(realpath "$p" 2>/dev/null) || continue
+        _share_allowed "$rp" || { echo "helper: refusing to share unsafe path: $rp" >&2; continue; }
+        base=$(basename "$rp")
+        case "$base" in ''|.|..|*/*) continue ;; esac
+        mkdir -p "$JAIL_ROOT$CONTAINER_WORKSPACE/$base"
+        chown 1000:1000 "$JAIL_ROOT$CONTAINER_WORKSPACE/$base"
+        BINDS+=("--bind=$rp:$CONTAINER_WORKSPACE/$base")
+    done < "$list"
+}
+# GUI binds: only the display sockets + our own xauth file, to fixed in-container
+# targets. Sockets must actually be sockets; the xauth must be exactly our file.
+add_gui_binds() {
+    local spec="$WB_CFG/gui_binds" line src dst
+    [ -f "$spec" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        [ -n "$line" ] || continue
+        case "$line" in *:*) src="${line%%:*}"; dst="${line#*:}" ;; *) src="$line"; dst="$line" ;; esac
+        case "$dst" in
+            /tmp/.X11-unix/X[0-9]|/tmp/.X11-unix/X[0-9][0-9]|/tmp/.waterbox-wayland)
+                [ -S "$src" ] || continue ;;
+            /tmp/.waterbox-xauth)
+                { [ "$src" = "$WB_CFG/xauth" ] && [ -f "$src" ]; } || continue ;;
+            *) continue ;;
+        esac
+        BINDS+=("--bind=$src:$dst")
+    done < "$spec"
+}
+# Copy the user's export-VAR gui-env into the rootfs (sourced by the login shell).
+write_gui_env() {
+    mkdir -p "$JAIL_ROOT/etc/waterbox"
+    if [ -s "$WB_CFG/gui_env" ]; then
+        install -m 0644 "$WB_CFG/gui_env" "$JAIL_ROOT/etc/waterbox/gui-env"
+    else
+        rm -f "$JAIL_ROOT/etc/waterbox/gui-env"
+    fi
+}
+boot_full() {
+    local gui="$1" nogpu="$2"
+    running && { net_up || true; return 0; }
+    [ -f "$JAIL_ROOT/.waterbox-ready" ] || { echo "helper: rootfs not built at $JAIL_ROOT"; exit 3; }
+    BINDS=()
+    add_share_binds
+    if [ "$gui" = 1 ]; then add_gui_binds; write_gui_env; else rm -f "$JAIL_ROOT/etc/waterbox/gui-env"; fi
+    local gpu=() props=()
+    if [ "$nogpu" != 1 ] && [ -d /dev/dri ]; then
+        gpu+=(--bind=/dev/dri); props+=(--property=DeviceAllow="char-drm rw")
+    fi
+    # KillMode=mixed: on stop, SIGTERM reaches nspawn (clean container poweroff),
+    # not the container PID 1 (where SIGTERM means reexec, hanging the host).
+    systemd-run --unit="$MACHINE_NAME" --collect --service-type=notify \
+        --description="Waterbox container ($MACHINE_NAME)" \
+        --property=KillMode=mixed --property=TimeoutStopSec=30 --property=SuccessExitStatus=133 \
+        "${props[@]}" \
+        systemd-nspawn --boot --quiet --keep-unit --notify-ready=yes \
+            --directory="$JAIL_ROOT" --machine="$MACHINE_NAME" --network-veth \
+            --resolv-conf=off --capability=CAP_NET_ADMIN,CAP_NET_RAW --bind=/dev/net/tun \
+            "${BINDS[@]}" "${gpu[@]}"
+    running || { echo "helper: boot failed"; exit 3; }
+    net_up || true
+}
+
+# Run tmux inside the running container as uid 1000 (leader-PID + nsenter). The
+# args run at the container's uid-1000 level — the same as an attached shell — so
+# this grants the host user nothing beyond what `attach` already does.
+run_tmux() {
+    local leader
+    leader=$(machinectl show "$MACHINE_NAME" -p Leader --value 2>/dev/null)
+    [ -n "$leader" ] && [ "$leader" != 0 ] || return 1
+    nsenter --target "$leader" --mount --setuid 1000 --setgid 1000 \
+        env TMUX_TMPDIR=/tmp HOME="/home/$USER_NAME" /usr/bin/tmux "$@"
+}
+
+# schedule-command timers live in the container's OWN systemd (run as the water
+# user), so a sandboxed agent can't ride one to escape. The helper only writes the
+# root-owned unit files + reloads; it FIXES User= and the ExecStart shape, so the
+# caller can't smuggle a different command or user in.
+_sched_install() {
+    local id="$1" sess="$2" time="$3" mode="$4" base="waterbox-$1"
+    local hh=${time%:*} mm=${time#*:} cal ts msg="$TASK_MSG_DIR/${1}.msg"
+    if [ "$mode" = daily ]; then
+        cal="*-*-* ${hh}:${mm}:00"
+    else
+        ts=$(date -d "today ${time}" +%s) || return 1
+        [ "$ts" -le "$(date +%s)" ] && ts=$(date -d "tomorrow ${time}" +%s)
+        cal=$(date -d "@$ts" '+%Y-%m-%d %H:%M:00')
+    fi
+    printf '%s\n' \
+        "[Unit]" "Description=Waterbox scheduled command (-> $sess @ $time $mode)" "" \
+        "[Service]" "Type=oneshot" "User=$USER_NAME" \
+        "Environment=HOME=/home/$USER_NAME" \
+        "Environment=PATH=/usr/local/bin:/usr/bin:/home/$USER_NAME/.local/bin" \
+        "Environment=TMUX_TMPDIR=/tmp" \
+        "ExecStart=/usr/local/bin/waterbox-fire send $sess $msg" \
+        > "$JAIL_ROOT$TASK_ETC/$base.service"
+    printf '%s\n' \
+        "[Unit]" "Description=Waterbox scheduled command (-> $sess @ $time $mode)" \
+        "# waterbox: $sess @ $time $mode" "" \
+        "[Timer]" "OnCalendar=$cal" "AccuracySec=30sec" "" \
+        "[Install]" "WantedBy=timers.target" \
+        > "$JAIL_ROOT$TASK_ETC/$base.timer"
+    mkdir -p "$JAIL_ROOT$TASK_ETC/timers.target.wants"
+    ln -sf "../$base.timer" "$JAIL_ROOT$TASK_ETC/timers.target.wants/$base.timer"
+    if running; then
+        systemctl -M "$MACHINE_NAME" daemon-reload 2>/dev/null || true
+        systemctl -M "$MACHINE_NAME" start "$base.timer" 2>/dev/null || true
+    fi
+}
+_sched_remove() {
+    local id="$1" base="waterbox-$1"
+    if running; then
+        systemctl -M "$MACHINE_NAME" stop "$base.timer" 2>/dev/null || true
+        systemctl -M "$MACHINE_NAME" disable "$base.timer" 2>/dev/null || true
+    fi
+    rm -f "$JAIL_ROOT$TASK_ETC/$base.timer" "$JAIL_ROOT$TASK_ETC/$base.service" \
+          "$JAIL_ROOT$TASK_ETC/timers.target.wants/$base.timer" \
+          "$JAIL_ROOT$TASK_MSG_DIR/${id}.msg"
+    running && systemctl -M "$MACHINE_NAME" daemon-reload 2>/dev/null || true
+}
+
+# Compute an OnCalendar from HH:MM + once|daily (helper-side so the caller never
+# hands us a free-form calendar string that could smuggle unit directives).
+_oncalendar() {
+    local time="$1" mode="$2" hh mm ts
+    hh=${time%:*}; mm=${time#*:}
+    if [ "$mode" = daily ]; then
+        echo "*-*-* ${hh}:${mm}:00"
+    else
+        ts=$(date -d "today ${time}" +%s) || return 1
+        [ "$ts" -le "$(date +%s)" ] && ts=$(date -d "tomorrow ${time}" +%s)
+        date -d "@$ts" '+%Y-%m-%d %H:%M:00'
+    fi
+}
+
+# Next free host-wake id (max existing +1).
+_next_hostwake_id() {
+    local f n max=0
+    for f in "$HW_ETC"/waterbox-hostwake-*.timer; do
+        [ -e "$f" ] || continue
+        n=$(basename "$f" .timer); n="${n##*-}"
+        case "$n" in ''|*[!0-9]*) continue ;; esac
+        [ "$n" -gt "$max" ] && max="$n"
+    done
+    echo $((max + 1))
+}
+
+# Write + enable a host wake timer. <id> <profile> <OnCalendar> <label>. Callers
+# pass only validated pieces; OnCalendar is computed here or a concrete datetime.
+_write_host_wake() {
+    local id="$1" prof="$2" cal="$3" label="$4" base="waterbox-hostwake-$1"
+    printf '%s\n' \
+        "[Unit]" "Description=Waterbox quota wake ($label)" "" \
+        "[Service]" "Type=oneshot" \
+        "ExecStart=$0 wake $prof --user $wb_uid" \
+        > "$HW_ETC/$base.service"
+    printf '%s\n' \
+        "[Unit]" "Description=Waterbox quota wake ($label)" \
+        "# waterbox: $label" "" \
+        "[Timer]" "OnCalendar=$cal" "AccuracySec=30sec" "" \
+        "[Install]" "WantedBy=timers.target" \
+        > "$HW_ETC/$base.timer"
+    systemctl daemon-reload
+    systemctl enable --now "$base.timer" >/dev/null 2>&1 || true
+}
+
+# req 11: if the wake's output says the quota is capped ("… resets 9:10am
+# (Asia/Bangkok)"), schedule a ONE-SHOT retry at that reset time + 10 minutes.
+# Parses the time and its timezone, converts to an absolute host-local datetime.
+_reschedule_on_limit() {
+    local prof="$1" out="$2" line after t tz e now target cal id
+    printf '%s' "$out" | grep -qiE 'resets ' || return 0
+    line=$(printf '%s' "$out" | grep -iE 'resets ' | head -1)
+    after=$(printf '%s' "$line" | sed -n 's/.*[Rr]esets[[:space:]]*//p')
+    t=$(printf '%s' "$after" | grep -oiE '^[0-9]{1,2}(:[0-9]{2})?[[:space:]]*(am|pm)?' | head -1)
+    [ -n "$t" ] || return 0
+    tz=$(printf '%s' "$line" | grep -oE '\([A-Za-z]+/[A-Za-z_]+\)' | head -1 | tr -d '()')
+    e=$(TZ="$tz" date -d "$t" +%s 2>/dev/null) || return 0
+    [ -n "$e" ] || return 0
+    now=$(date +%s)
+    [ "$e" -le "$now" ] && e=$(TZ="$tz" date -d "tomorrow $t" +%s 2>/dev/null)
+    [ -n "$e" ] || return 0
+    target=$((e + 600))
+    cal=$(date -d "@$target" '+%Y-%m-%d %H:%M:00' 2>/dev/null) || return 0
+    id=$(_next_hostwake_id)
+    _write_host_wake "$id" "$prof" "$cal" "$prof (auto-retry after quota reset)"
+    logger -t waterbox "wake: $prof quota-capped; retry scheduled $cal" 2>/dev/null || true
+}
+
+case "$verb" in
+    up)    boot_min ;;
+    down)  power_off ;;
+    state) running && echo running || echo stopped ;;
+    net-down) net_down ;;
+    boot)
+        gui=0; nogpu=0
+        for a in "$@"; do case "$a" in --gui) gui=1 ;; --no-gpu) nogpu=1 ;; esac; done
+        boot_full "$gui" "$nogpu"
+        ;;
+    status) machinectl status "$MACHINE_NAME" --no-pager 2>/dev/null | head -n 12 || true ;;
+    ensure-dns)
+        # Guarantee the box can resolve names. Some hosts (or the container's own
+        # systemd-resolved) leave /etc/resolv.conf pointing at an unreachable stub
+        # (127.0.0.53). Read the desired resolv.conf on stdin (validated), test the
+        # box, and only rewrite if it currently can't resolve — so a working host
+        # split-DNS setup is left untouched. The rewrite removes any symlink first,
+        # so a container resolver can't keep hijacking the file.
+        running || exit 0
+        _rtmp=$(mktemp)
+        while IFS= read -r line; do
+            case "$line" in
+                "nameserver "*) ip="${line#nameserver }"
+                    case "$ip" in ''|*[!0-9a-fA-F:.]*) continue ;; esac
+                    echo "nameserver $ip" >> "$_rtmp" ;;
+                "options "*) opt="${line#options }"
+                    case "$opt" in *[!a-z0-9:\ ]*) continue ;; esac
+                    echo "options $opt" >> "$_rtmp" ;;
+            esac
+        done
+        if systemd-run -M "$MACHINE_NAME" -q --wait --pipe getent ahostsv4 example.com >/dev/null 2>&1; then
+            rm -f "$_rtmp"; exit 0
+        fi
+        [ -s "$_rtmp" ] || { rm -f "$_rtmp"; exit 0; }
+        rm -f "$JAIL_ROOT/etc/resolv.conf"
+        install -m 0644 "$_rtmp" "$JAIL_ROOT/etc/resolv.conf"; rm -f "$_rtmp"
+        systemd-run -M "$MACHINE_NAME" -q --wait --pipe getent ahostsv4 example.com >/dev/null 2>&1 \
+            && echo "helper: repaired container DNS" || echo "helper: DNS still failing after resolv.conf rewrite"
+        ;;
+    tmux)  run_tmux "$@" ;;
+    shell)
+        sess="${1:-}"; key="${2:-}"
+        _valid_session "$sess" || { echo "helper: bad session"; exit 2; }
+        env_args=()
+        [ -n "$key" ] && env_args=(-E "ANTHROPIC_API_KEY=$key")
+        exec machinectl shell "${env_args[@]}" "$USER_NAME@$MACHINE_NAME" \
+            /usr/bin/tmux new-session -A -s "$sess" -c "$CONTAINER_WORKSPACE"
+        ;;
+    sched-install)
+        id="$1"; sess="$2"; time="$3"; mode="$4"
+        _valid_schedid "$id"   || { echo "helper: bad id"; exit 2; }
+        _valid_session "$sess" || { echo "helper: bad session"; exit 2; }
+        _valid_time "$time"    || { echo "helper: bad time"; exit 2; }
+        [ "$mode" = once ] || [ "$mode" = daily ] || { echo "helper: bad mode"; exit 2; }
+        _sched_install "$id" "$sess" "$time" "$mode"
+        ;;
+    sched-msg)
+        id="$1"; _valid_schedid "$id" || { echo "helper: bad id"; exit 2; }
+        mkdir -p "$JAIL_ROOT$TASK_MSG_DIR"
+        cat > "$JAIL_ROOT$TASK_MSG_DIR/${id}.msg"      # command text on stdin (data only)
+        ;;
+    sched-remove)
+        id="$1"; _valid_schedid "$id" || { echo "helper: bad id"; exit 2; }
+        _sched_remove "$id"
+        ;;
+    unshare)
+        name="$1"
+        case "$name" in ''|.|..|*/*) echo "helper: bad name"; exit 2 ;; esac
+        target="$CONTAINER_WORKSPACE/$name"
+        if running; then
+            leader=$(machinectl show "$MACHINE_NAME" -p Leader --value 2>/dev/null)
+            [ -n "$leader" ] && [ "$leader" != 0 ] \
+                && nsenter --target "$leader" --mount umount -l "$target" 2>/dev/null || true
+        fi
+        rmdir "$JAIL_ROOT$target" 2>/dev/null || true
+        ;;
+    wake)
+        prof="${1:-}"
+        _valid_profile "$prof" || { echo "helper: bad profile"; exit 2; }
+        [ -d "$JAIL_ROOT/home/$USER_NAME/.claude-env/$prof" ] || exit 0   # no such profile: no-op
+        started=0
+        running || { boot_min; started=1; }
+        out=$(systemd-run -M "$MACHINE_NAME" --quiet --wait --pipe \
+            -p User="$USER_NAME" \
+            -p Environment=HOME="/home/$USER_NAME" \
+            -p Environment=PATH="/usr/local/bin:/usr/bin:/home/$USER_NAME/.local/bin" \
+            -p Environment=TMUX_TMPDIR=/tmp \
+            /usr/local/bin/waterbox-fire wake "$prof" 2>/dev/null || true)
+        [ "$started" = 1 ] && power_off
+        _reschedule_on_limit "$prof" "$out"
+        ;;
+    install-host-wake)
+        # <id> <profile> <HH:MM> <once|daily>
+        id="$1"; prof="$2"; time="$3"; mode="$4"
+        _valid_id "$id"       || { echo "helper: bad id"; exit 2; }
+        _valid_profile "$prof"|| { echo "helper: bad profile"; exit 2; }
+        _valid_time "$time"   || { echo "helper: bad time"; exit 2; }
+        [ "$mode" = once ] || [ "$mode" = daily ] || { echo "helper: bad mode"; exit 2; }
+        cal="$(_oncalendar "$time" "$mode")" || { echo "helper: bad time"; exit 2; }
+        _write_host_wake "$id" "$prof" "$cal" "$prof @ $time $mode"
+        ;;
+    remove-host-wake)
+        id="$1"; _valid_id "$id" || { echo "helper: bad id"; exit 2; }
+        base="waterbox-hostwake-$id"
+        systemctl disable --now "$base.timer" >/dev/null 2>&1 || true
+        rm -f "$HW_ETC/$base.timer" "$HW_ETC/$base.service"
+        systemctl daemon-reload
+        ;;
+    *) echo "helper: unknown verb '$verb'"; exit 2 ;;
+esac
+HELPER
+    } > "$tmp"
+    sudo install -m 0755 -o root -g root "$tmp" "$HELPER_PATH"
+    rm -f "$tmp"
+
+    local sd; sd=$(mktemp)
+    printf '%s\n' \
+        "# waterbox: allow only the immutable helper, passwordless. No other command" \
+        "# is passwordless, and the helper takes fixed, charset-validated verbs." \
+        "$RUN_USER ALL=(root) NOPASSWD: $HELPER_PATH" > "$sd"
+    if ! sudo visudo -cf "$sd" >/dev/null; then rm -f "$sd"; log_error "Helper sudoers failed validation."; fi
+    sudo install -m 0440 -o root -g root "$sd" "$HELPER_SUDOERS"
+    rm -f "$sd"
+    # Remove the old broad credential cache from pre-1.3 installs: with every runtime
+    # op behind the helper, no general passwordless/never-expiring sudo is needed.
+    sudo rm -f /etc/sudoers.d/waterbox 2>/dev/null || true
+    log_success "Root helper installed at $HELPER_PATH (passwordless via $HELPER_SUDOERS)."
+}
+
+# True unless an up-to-date helper is already installed (version marker matches).
+_helper_current() {
+    [ -x "$HELPER_PATH" ] && grep -q "^WB_HELPER_VERSION=\"$WATERBOX_VERSION\"\$" "$HELPER_PATH" 2>/dev/null
+}
+ensure_helper() { _helper_current || install_helper; }
+run_priv() { sudo "$HELPER_PATH" "$@"; }
+
+# Idempotently ensure the host-side privileges start/reset rely on: the immutable
+# helper (+ its narrow sudoers) and shell completion. No broad sudo cache anymore.
+ensure_host_privs() {
+    ensure_helper
+    enable_completion
+}
+
+# --- Shares (req 7 safety: refuse paths a sandboxed root could use to escape) --
+# Same policy the helper enforces at boot (see _share_allowed there): allow paths
+# inside your home (minus secret dirs) or user-owned dirs on removable/user mounts;
+# reject everything else. `share add` uses this too, so what you can add is exactly
+# what will actually mount — there's no --force override, because the helper (which
+# does the privileged boot) would refuse an unsafe path regardless.
+_host_share_allowed() {
+    local rp="$1" home_real; home_real=$(realpath "$HOME" 2>/dev/null || echo "$HOME")
+    case "$rp" in
+        "$home_real"|"$home_real/.ssh"|"$home_real/.ssh/"*|"$home_real/.gnupg"|"$home_real/.gnupg/"*|"$home_real/.config"|"$CONFIG_DIR"|"$CONFIG_DIR/"*) return 1 ;;
+        "$home_real/"*) return 0 ;;
+    esac
+    case "$rp" in
+        /mnt/*|/media/*|/run/media/*)
+            [ "$(stat -c %u "$rp" 2>/dev/null)" = "$(id -u)" ] && return 0 || return 1 ;;
+    esac
+    return 1
+}
 manage_share() {
     local action="$1"
     local target_path="$2"
-    [ -z "$target_path" ] && log_error "Missing path. Usage: waterbox share [add|del] <path>"
+    [ -z "$target_path" ] && log_error "Missing path. Usage: waterbox share [add <path> | detach <path> | list]"
+
+    # Expand a leading ~ or ~/… to $HOME (the value often comes from the TUI, where
+    # the shell never got to do tilde expansion).
+    case "$target_path" in
+        '~')   target_path="$HOME" ;;
+        '~/'*) target_path="$HOME/${target_path#\~/}" ;;
+    esac
 
     local absolute_path
     absolute_path=$(realpath "$target_path" 2>/dev/null || echo "$target_path")
@@ -547,6 +2120,16 @@ manage_share() {
     case "$action" in
         add)
             [ -d "$absolute_path" ] || log_error "Directory does not exist on host: $absolute_path"
+
+            # SECURITY: the container runs without a user namespace, so container
+            # root == host root, and the inside user can become root at will. The
+            # only way that root reaches outside the rootfs is a bind-mounted share.
+            # So refuse anything a sandboxed root could abuse to touch host-root-owned
+            # files (e.g. /etc/shadow) and escape. The helper re-checks this at boot.
+            if ! _host_share_allowed "$absolute_path"; then
+                log_error "Refusing to share '$absolute_path': share a directory inside your home (a project subdir), or a folder you own under /mnt, /media or /run/media. A sandboxed root could abuse anything else to escape."
+            fi
+
             if grep -Fxq "$absolute_path" "$SHARE_LIST"; then
                 log_info "'$absolute_path' is already shared."
                 return 0
@@ -558,27 +2141,19 @@ manage_share() {
                 log_success "Added '$absolute_path' (will mount on next start)."
             fi
             ;;
-        del)
+        del|detach)
             if ! grep -Fxq "$absolute_path" "$SHARE_LIST"; then
                 log_error "Path '$absolute_path' is not currently shared."
             fi
-            grep -vFx "$absolute_path" "$SHARE_LIST" > "${SHARE_LIST}.tmp" \
-                && mv "${SHARE_LIST}.tmp" "$SHARE_LIST"
+            # grep -v exits 1 when it removes the *last* line (zero output), so
+            # don't gate the mv on it — otherwise detaching the only share no-ops.
+            grep -vFx "$absolute_path" "$SHARE_LIST" > "${SHARE_LIST}.tmp" || true
+            mv "${SHARE_LIST}.tmp" "$SHARE_LIST"
 
-            if is_running; then
-                # Live-unmount in the container's mount namespace. Lazy umount
-                # so it succeeds even if something inside has the dir open.
-                local leader_pid
-                leader_pid=$(sudo machinectl show "$MACHINE_NAME" -p Leader --value 2>/dev/null)
-                if [ -n "$leader_pid" ] && [ "$leader_pid" != "0" ]; then
-                    sudo nsenter --target "$leader_pid" --mount \
-                        umount -l "$mount_target" 2>/dev/null || true
-                fi
-            fi
-            # Clean up the (now-empty) mount point in the rootfs.
-            [ -d "$JAIL_ROOT$mount_target" ] \
-                && sudo rmdir "$JAIL_ROOT$mount_target" 2>/dev/null || true
-            log_success "Removed '$absolute_path'."
+            # Live lazy-unmount in the container's mount namespace + drop the empty
+            # mountpoint, all inside the helper (no broad sudo).
+            _helper_current && run_priv unshare "$folder_name" 2>/dev/null || true
+            log_success "Detached '$absolute_path' (unmounted; no files deleted)."
             ;;
     esac
 }
@@ -595,20 +2170,471 @@ list_shares() {
     fi
 }
 
-# --- Argument routing ---
-case "$1" in
+# --- Scheduled tasks: wake-claude (quota primer) + schedule-command -----------
+# Both are systemd timers *inside the container's own systemd*, run as the water
+# user — so they need NO host sudo/password when they fire (the container's PID 1
+# runs them). Keeping them in-container, not a host root timer executing this
+# mutable script, means a sandboxed agent can never ride one to escape.
+TASK_ETC="/etc/systemd/system"     # inside the rootfs
+TASK_MSG_DIR="/etc/waterbox"       # inside the rootfs (schedule-command messages)
+
+# The in-container helper. `wake <profile>` sends a tiny Haiku 'hi' to start the
+# account's 5-hour window then deletes the throwaway transcript; `send <session>
+# <msgfile>` types the message + Enter into an existing tmux session.
+write_task_helper() {
+    sudo tee "$JAIL_ROOT/usr/local/bin/waterbox-fire" >/dev/null <<'FIRE'
+#!/bin/sh
+kind="$1"; shift
+case "$kind" in
+    wake)
+        prof="${1:?profile}"
+        export CLAUDE_CONFIG_DIR="$HOME/.claude-env/$prof"
+        [ -d "$CLAUDE_CONFIG_DIR" ] || exit 0
+        d="/tmp/waterbox-fire-$$"
+        mkdir -p "$d" && cd "$d" || exit 0
+        out=$(claude -p "hi" --model haiku 2>&1 || true)
+        cd /
+        # claude names a project dir after its cwd with '/' -> '-'; drop it so the
+        # wake leaves no chat history (and no tmux session) behind.
+        rm -rf "$d" "$CLAUDE_CONFIG_DIR/projects/-tmp-waterbox-fire-$$" 2>/dev/null || true
+        # Surface a quota-limit line (if any) on stdout so the host helper can
+        # schedule a retry (req 11). Normal 'hi' replies are ignored/discarded.
+        printf '%s\n' "$out" | grep -iE 'session limit|resets ' | head -1 || true
+        ;;
+    send)
+        sess="$1"; msgfile="$2"
+        [ -n "$sess" ] && [ -f "$msgfile" ] || exit 0
+        export TMUX_TMPDIR=/tmp
+        tmux has-session -t "$sess" 2>/dev/null || exit 0
+        tmux send-keys -t "$sess" -l -- "$(cat "$msgfile")"
+        sleep 0.3
+        tmux send-keys -t "$sess" Enter
+        ;;
+    cleanup-session)
+        # Remove schedule-commands that targeted a now-closed session (req 14).
+        # Fired from the tmux 'session-closed' hook; needs root for the units.
+        name="$1"
+        [ -n "$name" ] || exit 0
+        removed=0
+        for f in /etc/systemd/system/waterbox-schd-com-*.timer; do
+            [ -e "$f" ] || continue
+            info=$(grep -m1 '^# waterbox:' "$f" 2>/dev/null | sed 's/^# waterbox: //')
+            [ "${info%% @ *}" = "$name" ] || continue
+            base=$(basename "$f" .timer); id=${base#waterbox-}
+            sudo systemctl disable --now "$base.timer" >/dev/null 2>&1 || true
+            sudo rm -f "/etc/systemd/system/$base.timer" \
+                       "/etc/systemd/system/$base.service" \
+                       "/etc/waterbox/${id}.msg" 2>/dev/null || true
+            removed=1
+        done
+        [ "$removed" = 1 ] && sudo systemctl daemon-reload >/dev/null 2>&1 || true
+        ;;
+esac
+FIRE
+    sudo chmod 0755 "$JAIL_ROOT/usr/local/bin/waterbox-fire"
+}
+
+# Next free integer suffix for tasks whose unit base starts with <glob-prefix>
+# (e.g. "waterbox-schd-com-"). Ids are simple sequential handles for 'del' — the
+# 'list' output carries the human detail (who, time, mode, command).
+_next_task_id() {
+    local f n max=0
+    for f in "$JAIL_ROOT$TASK_ETC/$1"*.timer; do
+        [ -e "$f" ] || continue
+        n=$(basename "$f" .timer); n="${n##*-}"
+        case "$n" in ''|*[!0-9]*) continue ;; esac
+        [ "$n" -gt "$max" ] && max="$n"
+    done
+    echo $((max + 1))
+}
+
+# schedule-command timers are written/removed by the root helper (it fixes User=
+# and the ExecStart shape). These wrappers take the bare id (e.g. "schd-com-3").
+_sched_remove() {
+    _helper_current && run_priv sched-remove "$1" >/dev/null 2>&1 || true
+}
+
+# Scan timers whose unit name starts with <glob-prefix> into parallel arrays
+# TL_IDS (delete handles) and TL_ROWS ("<who @ time mode>[   ->  cmd][   [left]]").
+# One-shots whose time has already elapsed (systemd-analyze => "never") are
+# garbage-collected here and not returned. $1 = glob prefix   $2 = 1 if a per-id
+# message file ($TASK_MSG_DIR/<id>.msg) holds the command to show and clean up.
+TL_IDS=(); TL_ROWS=()
+_timer_collect() {
+    local prefix="$1" hasmsg="$2" f b id info expr next left cmd msg
+    TL_IDS=(); TL_ROWS=()
+    for f in "$JAIL_ROOT$TASK_ETC/${prefix}"*.timer; do
+        [ -e "$f" ] || continue
+        b=$(basename "$f" .timer); id="${b#waterbox-}"
+        info=$(grep -m1 '^# waterbox:' "$f" 2>/dev/null | sed 's/^# waterbox: //')
+        expr=$(grep -m1 '^OnCalendar=' "$f" 2>/dev/null | sed 's/^OnCalendar=//')
+        msg="$JAIL_ROOT$TASK_MSG_DIR/${id}.msg"
+        left=""
+        if command -v systemd-analyze >/dev/null 2>&1 && [ -n "$expr" ]; then
+            next=$(systemd-analyze calendar "$expr" 2>/dev/null || true)
+            if printf '%s' "$next" | grep -q 'Next elapse: *never'; then
+                _sched_remove "$id"    # elapsed one-shot: garbage-collect
+                continue
+            fi
+            left=$(printf '%s' "$next" | sed -n 's/.*From now: *//p' | head -n1)
+        fi
+        cmd=""
+        [ "$hasmsg" = 1 ] && [ -f "$msg" ] && cmd=$(cat "$msg")
+        TL_IDS+=("$id")
+        TL_ROWS+=("${info}${cmd:+   ->  $cmd}${left:+   [$left]}")
+    done
+}
+
+# Print the collected timers as a bulleted "  - <id>   <detail>" list.
+_timer_list() {
+    _timer_collect "$1" "$2"
+    local i
+    if [ "${#TL_IDS[@]}" -eq 0 ]; then
+        echo "  (none)"
+    else
+        for i in "${!TL_IDS[@]}"; do
+            echo "  - ${TL_IDS[$i]}   ${TL_ROWS[$i]}"
+        done
+    fi
+    is_running || echo "  Note: tasks fire only while the box is running."
+}
+
+# `wake-claude` — start a profile's fresh 5-hour quota window (default daily).
+# Backed by HOST root systemd timers (installed via the helper) that call
+# `waterbox-helper wake <profile>`, so a wake fires even while the box is stopped
+# and you're offline — the helper boots the box, primes, and powers it back off.
+HOSTWAKE_GLOB="/etc/systemd/system/waterbox-hostwake-"
+
+# Next free integer id across the host wake timers (readable without sudo; 0644).
+_hostwake_next_id() {
+    local f n max=0
+    for f in "$HOSTWAKE_GLOB"*.timer; do
+        [ -e "$f" ] || continue
+        n=$(basename "$f" .timer); n="${n##*-}"
+        case "$n" in ''|*[!0-9]*) continue ;; esac
+        [ "$n" -gt "$max" ] && max="$n"
+    done
+    echo $((max + 1))
+}
+
+# Fill HW_IDS ("wake-N") + HW_ROWS ("<profile @ time mode>[  [time-left]]") from the
+# host wake timers. Garbage-collects elapsed one-shots (needs the helper present).
+HW_IDS=(); HW_ROWS=()
+_hostwake_collect() {
+    local f n info expr next left
+    HW_IDS=(); HW_ROWS=()
+    for f in "$HOSTWAKE_GLOB"*.timer; do
+        [ -e "$f" ] || continue
+        n=$(basename "$f" .timer); n="${n##*-}"
+        case "$n" in ''|*[!0-9]*) continue ;; esac
+        info=$(grep -m1 '^# waterbox:' "$f" 2>/dev/null | sed 's/^# waterbox: //')
+        expr=$(grep -m1 '^OnCalendar=' "$f" 2>/dev/null | sed 's/^OnCalendar=//')
+        left=""
+        if command -v systemd-analyze >/dev/null 2>&1 && [ -n "$expr" ]; then
+            next=$(systemd-analyze calendar "$expr" 2>/dev/null || true)
+            if printf '%s' "$next" | grep -q 'Next elapse: *never'; then
+                _helper_current && run_priv remove-host-wake "$n" >/dev/null 2>&1 || true
+                continue
+            fi
+            left=$(printf '%s' "$next" | sed -n 's/.*From now: *//p' | head -n1)
+        fi
+        HW_IDS+=("wake-$n")
+        HW_ROWS+=("${info}${left:+   [$left]}")
+    done
+}
+
+manage_wake_claude() {
+    local action="$1"; shift || true
+    case "$action" in
+        add)
+            local profile="$1" time="$2" mode="${3:-daily}"
+            [ -n "$profile" ] && [ -n "$time" ] \
+                || log_error "Usage: waterbox wake-claude <profile> <HH:MM> [once|daily]"
+            [[ "$profile" =~ ^[A-Za-z0-9._-]+$ ]] || log_error "Invalid profile name: '$profile'."
+            [[ "$time" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] \
+                || log_error "Time must be HH:MM (24-hour), got '$time'."
+            [ "$mode" = once ] || [ "$mode" = daily ] \
+                || log_error "Mode must be 'once' or 'daily', got '$mode'."
+            [ -d "$JAIL_ROOT/home/$USER_NAME/.claude-env/$profile" ] \
+                || log_error "No such Claude profile: '$profile'. Create it with 'claude-env' inside the box."
+            ensure_helper
+            local n; n=$(_hostwake_next_id)
+            run_priv install-host-wake "$n" "$profile" "$time" "$mode"
+            log_success "wake-claude 'wake-$n' set: $mode at $time for '$profile' — fires even while the box is stopped and you're offline."
+            ;;
+        del|rm)
+            local id="$1" n
+            [ -n "$id" ] || log_error "Usage: waterbox wake-claude del <id>  (see 'wake-claude list')."
+            [[ "$id" == wake-* ]] || log_error "Not a wake id: '$id' (see 'wake-claude list')."
+            n="${id#wake-}"
+            [[ "$n" =~ ^[0-9]+$ ]] && [ -f "${HOSTWAKE_GLOB}${n}.timer" ] \
+                || log_error "No such wake: '$id'."
+            ensure_helper
+            run_priv remove-host-wake "$n"
+            log_success "Removed wake-claude '$id'."
+            ;;
+        list|"")
+            log_info "Scheduled quota wakes (wake-claude):"
+            _hostwake_collect
+            if [ "${#HW_IDS[@]}" -eq 0 ]; then
+                echo "  (none)"
+            else
+                local i
+                for i in "${!HW_IDS[@]}"; do echo "  - ${HW_IDS[$i]}   ${HW_ROWS[$i]}"; done
+            fi
+            ;;
+        *) log_error "Usage: waterbox wake-claude <profile> <HH:MM> [once|daily] | list | del <id>" ;;
+    esac
+}
+
+# `schedule-command` — type a command + Enter into an existing session (default once).
+manage_schedule() {
+    local action="$1"; shift || true
+    case "$action" in
+        add)
+            local session="$1" time="$2" mode command
+            if [ "$3" = once ] || [ "$3" = daily ]; then mode="$3"; command="$4"
+            else mode="once"; command="$3"; fi
+            [ -n "$session" ] && [ -n "$time" ] && [ -n "$command" ] \
+                || log_error "Usage: waterbox schedule-command <session> <HH:MM> [once|daily] \"<command>\""
+            [[ "$session" =~ ^[A-Za-z0-9._-]+$ ]] || log_error "Invalid session name: '$session'."
+            [[ "$time" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] \
+                || log_error "Time must be HH:MM (24-hour), got '$time'."
+            [ "$mode" = once ] || [ "$mode" = daily ] \
+                || log_error "Mode must be 'once' or 'daily', got '$mode'."
+            is_running || log_error "The box must be running to schedule into a live session ('waterbox start' first)."
+            container_tmux has-session -t "$session" 2>/dev/null \
+                || log_error "No live session '$session'. Start it and check 'waterbox status'."
+            local id
+            id="schd-com-$(_next_task_id waterbox-schd-com-)"
+            # The helper writes the message file + the (User-fixed, ExecStart-shaped)
+            # timer units into the rootfs and starts them.
+            printf '%s' "$command" | run_priv sched-msg "$id"
+            run_priv sched-install "$id" "$session" "$time" "$mode"
+            log_success "schedule-command '$id' set: '$command' $mode at $time into session '$session'."
+            ;;
+        del|rm)
+            local id="$1"
+            [ -n "$id" ] || log_error "Usage: waterbox schedule-command del <id>  (see 'schedule-command list')."
+            [[ "$id" == schd-com-* ]] || log_error "Not a schedule-command id: '$id' (see 'schedule-command list')."
+            [ -f "$JAIL_ROOT$TASK_ETC/waterbox-${id}.timer" ] || log_error "No such scheduled command: '$id'."
+            _sched_remove "$id"
+            log_success "Removed schedule-command '$id'."
+            ;;
+        list|"")
+            log_info "Scheduled commands (schedule-command):"
+            _timer_list "waterbox-schd-com-" 1
+            ;;
+        *) log_error "Usage: waterbox schedule-command <session> <HH:MM> [once|daily] \"<cmd>\" | list | del <id>" ;;
+    esac
+}
+
+# --- TUI managers (item 7): live add/delete screens over the CLI verbs ---------
+# `wake-claude` / `schedule-command` / `share` with no args open a task_manager
+# screen; the classic CLI forms below are the "advanced" path (see <cmd> --help).
+
+# Claude profiles, read straight from the host-visible rootfs (no sudo).
+_list_profiles() {
+    local d
+    for d in "$JAIL_ROOT/home/$USER_NAME/.claude-env"/*/; do
+        [ -d "$d" ] || continue
+        basename "$d"
+    done
+}
+
+# Shared wizard step: typed HH:MM (validated) + once/daily menu.
+# Sets AW_TIME / AW_MODE in the caller's scope; returns 1 on cancel.
+_wizard_when() {
+    prompt_field "Time (HH:MM): " '([01][0-9]|2[0-3]):[0-5][0-9]' \
+        "use 24-hour HH:MM, e.g. 07:00" || return 1
+    AW_TIME="$FIELD"
+    MENU_CANCEL=1
+    choose_menu "When:" once daily
+    [ "$MENU_CANCELLED" = 1 ] && return 1
+    [ "$MENU_CHOICE" -eq 0 ] && AW_MODE=once || AW_MODE=daily
+    return 0
+}
+
+wake_load() {
+    _hostwake_collect
+    local i
+    for i in "${!HW_IDS[@]}"; do
+        M_IDS+=("${HW_IDS[$i]}"); M_ROWS+=("${HW_IDS[$i]}   ${HW_ROWS[$i]}")
+    done
+}
+wake_add() {
+    local profiles=() p profile AW_TIME AW_MODE
+    while IFS= read -r p; do [ -n "$p" ] && profiles+=("$p"); done < <(_list_profiles)
+    [ "${#profiles[@]}" -gt 0 ] \
+        || { log_warn "No Claude profiles yet — create one with 'claude-env' inside the box."; return 0; }
+    MENU_CANCEL=1
+    choose_menu "Profile to wake:" "${profiles[@]}"
+    [ "$MENU_CANCELLED" = 1 ] && { log_info "Cancelled."; return 0; }
+    profile="${profiles[$MENU_CHOICE]}"   # capture before _wizard_when reuses MENU_CHOICE
+    _wizard_when || { log_info "Cancelled."; return 0; }
+    manage_wake_claude add "$profile" "$AW_TIME" "$AW_MODE"
+}
+wake_del() { manage_wake_claude del "$1"; }
+wake_manager() { task_manager "Quota wakes (wake-claude)" wake_load wake_add wake_del; }
+
+sched_load() {
+    _timer_collect "waterbox-schd-com-" 1
+    local i
+    for i in "${!TL_IDS[@]}"; do
+        M_IDS+=("${TL_IDS[$i]}"); M_ROWS+=("${TL_IDS[$i]}   ${TL_ROWS[$i]}")
+    done
+}
+sched_add() {
+    is_running || { log_warn "The box must be running to schedule into a live session."; return 0; }
+    local sessions=() s session AW_TIME AW_MODE command
+    while IFS= read -r s; do [ -n "$s" ] && sessions+=("$s"); done \
+        < <(container_tmux list-sessions -F '#{session_name}' 2>/dev/null | sort)
+    [ "${#sessions[@]}" -gt 0 ] \
+        || { log_warn "No live sessions — start one first ('waterbox' → new session)."; return 0; }
+    MENU_CANCEL=1
+    choose_menu "Target session:" "${sessions[@]}"
+    [ "$MENU_CANCELLED" = 1 ] && { log_info "Cancelled."; return 0; }
+    session="${sessions[$MENU_CHOICE]}"
+    _wizard_when || { log_info "Cancelled."; return 0; }
+    prompt_field "Command to send: " || { log_info "Cancelled."; return 0; }
+    command="$FIELD"
+    manage_schedule add "$session" "$AW_TIME" "$AW_MODE" "$command"
+}
+sched_del() { manage_schedule del "$1"; }
+schedule_manager() { task_manager "Scheduled commands (schedule-command)" sched_load sched_add sched_del; }
+
+share_load() {
+    local line
+    [ -s "$SHARE_LIST" ] || return 0
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        M_IDS+=("$line")
+        M_ROWS+=("$line  →  $CONTAINER_WORKSPACE/$(basename "$line")")
+    done < "$SHARE_LIST"
+}
+share_add() {
+    prompt_field "Host path to share: " || { log_info "Cancelled."; return 0; }
+    manage_share add "$FIELD"
+}
+share_del() { manage_share del "$1"; }
+# "detach" (not "delete"): removing a share only unmounts it — no files are deleted.
+share_manager() { task_manager "Shared folders (share)" share_load share_add share_del detach; }
+
+# --- Shell completion ---------------------------------------------------------
+# Print a zsh completion script to stdout. Enable it with:
+#   eval "$(waterbox completion zsh)"     (add that line to ~/.zshrc)
+# Completes subcommands, share/history actions, profiles and del-ids (from the
+# host-readable rootfs, no sudo), and — best-effort — live session names via the
+# hidden `waterbox _sessions` (empty unless the box is up and sudo is cached).
+emit_completion() {
+    local shell="${1:-zsh}"
+    [ "$shell" = zsh ] || log_error "Only 'zsh' completion is supported (got '$shell')."
+    cat <<'COMPLETION'
+#compdef waterbox
+# waterbox zsh completion — enable with: eval "$(waterbox completion zsh)"
+_waterbox() {
+    local root="$HOME/.waterbox/root"
+    local -a cmds items
+    cmds=(start stop restart status reset share
+          wake-claude schedule-command version help)
+
+    if (( CURRENT == 2 )); then
+        _describe -t commands 'waterbox command' cmds
+        return
+    fi
+
+    case "${words[2]}" in
+        share)
+            if (( CURRENT == 3 )); then items=(add detach list); compadd -a items
+            else _files -/; fi ;;
+        wake-claude)
+            if (( CURRENT == 3 )); then
+                items=(list del "$root"/home/water/.claude-env/*(N/:t)); compadd -a items
+            elif [[ "${words[3]}" == (del|rm) ]]; then
+                items=(/etc/systemd/system/waterbox-hostwake-*.timer(N:t:r))
+                items=(wake-${items#waterbox-hostwake-}); compadd -a items
+            fi ;;
+        schedule-command)
+            if (( CURRENT == 3 )); then
+                items=(list del ${(f)"$(command waterbox _sessions 2>/dev/null)"})
+                compadd -a items
+            elif [[ "${words[3]}" == (del|rm) ]]; then
+                items=("$root"/etc/systemd/system/waterbox-schd-com-*.timer(N:t:r))
+                items=(${items#waterbox-}); compadd -a items
+            elif (( CURRENT == 5 )); then
+                items=(once daily); compadd -a items
+            fi ;;
+        completion)
+            (( CURRENT == 3 )) && { items=(zsh); compadd -a items; } ;;
+    esac
+}
+compdef _waterbox waterbox
+COMPLETION
+}
+
+# --- Argument parsing ---------------------------------------------------------
+# Pull out the global flags anywhere on the command line; the rest is positional.
+POSITIONAL=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --gui)    WATERBOX_GUI=1; shift ;;
+        --no-gui) WATERBOX_GUI=0; shift ;;
+        --no-gpu) WATERBOX_NO_GPU=1; shift ;;
+        *)        POSITIONAL+=("$1"); shift ;;
+    esac
+done
+set -- "${POSITIONAL[@]}"
+
+# Resolve GUI=auto now that flags are parsed: on only when a Wayland socket is live.
+if [ "$WATERBOX_GUI" = auto ]; then
+    _wl="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/${WAYLAND_DISPLAY:-}"
+    if [ -n "${WAYLAND_DISPLAY:-}" ] && [ -S "$_wl" ]; then
+        WATERBOX_GUI=1
+    else
+        WATERBOX_GUI=0
+    fi
+fi
+
+case "${1:-start}" in
     start|"") start_sandbox ;;
-    stop)    stop_sandbox ;;
-    restart) restart_sandbox ;;
-    status)  status_sandbox ;;
-    reset)   reset_sandbox ;;
+    stop)     stop_sandbox ;;
+    restart)  restart_sandbox ;;
+    status)   status_sandbox ;;
+    reset)    reset_sandbox ;;
+    setup)    ensure_host_privs ;;         # normally automatic on start/reset
+    refresh-config) refresh_config ;;      # internal; not shown in help
+    completion)     emit_completion "$2" ;; # internal; installed automatically
+    _helper)        run_priv "${@:2}" ;;   # hidden: manual helper passthrough (debug)
+    _sessions)      list_sessions_quiet ;;   # hidden: used by shell completion
     share)
         case "$2" in
-            add|del) manage_share "$2" "$3" ;;
-            list)    list_shares ;;
-            *)       log_error "Usage: waterbox share [add|del|list] [path]" ;;
+            "")           share_manager ;;
+            add)          manage_share add "$3" ;;
+            del|detach)   manage_share detach "$3" ;;
+            list)         list_shares ;;
+            -h|--help)    help_share ;;
+            *)            log_error "Usage: waterbox share [add|detach|list] [path]  (bare 'share' opens the manager; 'share --help' for details)" ;;
         esac
         ;;
+    wake-claude)
+        case "$2" in
+            "")        wake_manager ;;
+            list)      manage_wake_claude list ;;
+            del|rm)    manage_wake_claude del "$3" ;;
+            -h|--help) help_wake ;;
+            *)         manage_wake_claude add "${@:2}" ;;
+        esac
+        ;;
+    schedule-command)
+        case "$2" in
+            "")        schedule_manager ;;
+            list)      manage_schedule list ;;
+            del|rm)    manage_schedule del "$3" ;;
+            -h|--help) help_schedule ;;
+            *)         manage_schedule add "${@:2}" ;;
+        esac
+        ;;
+    version|--version|-v) echo "waterbox v$WATERBOX_VERSION" ;;
     help|--help|-h) show_help ;;
     *) log_error "Unknown command '$1'. See 'waterbox --help'." ;;
 esac
