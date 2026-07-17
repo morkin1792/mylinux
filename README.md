@@ -1,6 +1,6 @@
-# mylinux
-
-## personal linux desktop config
+# ⭐️🐧 mylinux
+ 
+## ⚙️ mylinux configs
 
 - [Arch Linux](arch.md)
 - [KDE settings](kde.md)
@@ -11,6 +11,6 @@
 - [.vimrc](vimrc)
 - [.nanorc](nanorc)
 
-## small tools
-- [Waterbox: simple sandbox for running CLI agents](waterbox)
-- [pvpn: ProtonVPN CLI wrapper to make it decent](pvpn)
+## 🛠️ mylinux tools
+- 💦 [Waterbox: script for sandboxing CLI agents, specially claude-code](waterbox)
+- 🛡️ [pvpn: ProtonVPN CLI wrapper to make it a bit decent](pvpn)
