@@ -264,6 +264,18 @@ _container_nameservers() {
     echo "options timeout:2 attempts:2"   # fall through to the fallback quickly
 }
 
+# Every build-time nspawn run gets the same explicit socket-address-family allowlist
+# the booted box uses (see boot_min/boot_full). systemd-nspawn will soon default to
+# permitting only AF_INET/AF_INET6/AF_UNIX and warns until you set this; that default
+# would break more than the runtime box — even here, glibc getaddrinfo() opens an
+# AF_NETLINK route socket (AI_ADDRCONFIG) to pick a source address, so pacman/git
+# downloads need it. AF_PACKET matches the box's CAP_NET_RAW.
+_nspawn_build() {
+    sudo systemd-nspawn -q \
+        --restrict-address-families="AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET" \
+        -D "$JAIL_ROOT" "$@"
+}
+
 # --- Bootstrap (runs once) ----------------------------------------------------
 bootstrap_sandbox() {
     # A sentinel written only at the very end marks a *complete* build. Testing
@@ -303,7 +315,7 @@ bootstrap_sandbox() {
     sudo sed -i 's/^CheckSpace/#CheckSpace/' "$JAIL_ROOT/etc/pacman.conf"
 
     log_info "Initializing pacman keyring inside the rootfs..."
-    sudo systemd-nspawn -q -D "$JAIL_ROOT" bash -c \
+    _nspawn_build bash -c \
         'pacman-key --init && pacman-key --populate archlinux'
 
     log_info "Installing base packages inside the rootfs..."
@@ -314,18 +326,18 @@ bootstrap_sandbox() {
     # failure, disable pacman's sandbox in the rootfs and retry. It then stays disabled
     # so the files DB, yay, and in-box pacman all keep working on that same kernel;
     # Landlock-capable hosts never hit this and keep the sandbox.
-    if ! sudo systemd-nspawn -q -D "$JAIL_ROOT" \
+    if ! _nspawn_build \
             pacman -Syu --noconfirm --needed "${PKGS[@]}"; then
         log_warn "pacman couldn't use its download sandbox (kernel Landlock unavailable) — disabling it and retrying."
         sudo sed -i '/^\[options\]/a DisableSandbox' "$JAIL_ROOT/etc/pacman.conf"
-        sudo systemd-nspawn -q -D "$JAIL_ROOT" \
+        _nspawn_build \
             pacman -Syu --noconfirm --needed "${PKGS[@]}"
     fi
 
     # Download the files database too, so `pacman -F` / `pkgfile` work and there's no
     # "database file for 'core' does not exist (use '-Fy')" warning later.
     log_info "Syncing the pacman files database (pacman -Fy)..."
-    sudo systemd-nspawn -q -D "$JAIL_ROOT" pacman -Fy --noconfirm || true
+    _nspawn_build pacman -Fy --noconfirm || true
 
     echo "$INSIDE_HOSTNAME" | sudo tee "$JAIL_ROOT/etc/hostname" > /dev/null
 
@@ -342,11 +354,11 @@ EOF
 
     # Locale
     echo "en_US.UTF-8 UTF-8" | sudo tee "$JAIL_ROOT/etc/locale.gen" > /dev/null
-    sudo systemd-nspawn -q -D "$JAIL_ROOT" locale-gen
+    _nspawn_build locale-gen
     echo "LANG=en_US.UTF-8" | sudo tee "$JAIL_ROOT/etc/locale.conf" > /dev/null
 
     # User (uid 1000 == host user, so bind-mounted shares keep correct ownership)
-    sudo systemd-nspawn -q -D "$JAIL_ROOT" \
+    _nspawn_build \
         useradd -m -s /usr/bin/zsh -u 1000 "$USER_NAME" 2>/dev/null || true
     echo "$USER_NAME ALL=(ALL) NOPASSWD: ALL" \
         | sudo tee "$JAIL_ROOT/etc/sudoers.d/10-$USER_NAME" > /dev/null
@@ -354,7 +366,7 @@ EOF
 
     # GPU access for the user (best-effort: groups may not match host gids, in
     # which case GUI apps fall back to software rendering — fine for occasional use).
-    sudo systemd-nspawn -q -D "$JAIL_ROOT" bash -c '
+    _nspawn_build bash -c '
         getent group render >/dev/null || groupadd -r render
         getent group video  >/dev/null || groupadd -r video
         usermod -aG video,render '"$USER_NAME"'' 2>/dev/null || true
@@ -379,15 +391,15 @@ EOF
     # tmpfs-shadow /tmp, which would hide the GUI X11 socket under /tmp/.X11-unix).
     # Separate calls so one failing doesn't skip the others; also disable resolved
     # outright. (start still re-asserts a working resolv.conf via 'ensure-dns'.)
-    sudo systemd-nspawn -q -D "$JAIL_ROOT" \
+    _nspawn_build \
         systemctl enable systemd-networkd dbus systemd-logind >/dev/null 2>&1 || true
-    sudo systemd-nspawn -q -D "$JAIL_ROOT" systemctl disable systemd-resolved >/dev/null 2>&1 || true
-    sudo systemd-nspawn -q -D "$JAIL_ROOT" systemctl mask systemd-resolved >/dev/null 2>&1 || true
-    sudo systemd-nspawn -q -D "$JAIL_ROOT" systemctl mask tmp.mount >/dev/null 2>&1 || true
+    _nspawn_build systemctl disable systemd-resolved >/dev/null 2>&1 || true
+    _nspawn_build systemctl mask systemd-resolved >/dev/null 2>&1 || true
+    _nspawn_build systemctl mask tmp.mount >/dev/null 2>&1 || true
 
     # AUR + extras (yay, claude-code, oh-my-posh). No veth here => host network.
     log_info "Installing yay + claude-code + extras inside the rootfs..."
-    sudo systemd-nspawn -q -D "$JAIL_ROOT" --user "$USER_NAME" bash -c "
+    _nspawn_build --uid="$USER_NAME" bash -c "
         cd /tmp &&
         git clone https://aur.archlinux.org/yay.git &&
         cd yay &&
@@ -846,26 +858,104 @@ claude-env() {
 
 # claude-desktop (AUR) is a SEPARATE Electron app with its own login store; it does
 # not read the CLI's CLAUDE_CONFIG_DIR, so it can't inherit a claude-env login. This
-# wrapper does two things:
+# wrapper does three things:
 #   1) points its user-data-dir at a PER-PROFILE folder (kept under the active
 #      claude-env profile), so its login is scoped to and switches with the profile
 #      — you log in once per profile and it sticks (best-effort: only if the app
 #      honours --user-data-dir; if not, it uses its default and this is a no-op).
-#   2) launches it FULLY DETACHED (new session, no controlling tty), so closing the
+#   2) gives it a working OS keyring so the sign-in PERSISTS across restarts. The app
+#      stores its token via Electron safeStorage, which needs a Secret Service; with
+#      none, isEncryptionAvailable() is false and it warns "sign-in won't be saved".
+#      We start a private gnome-keyring on a throwaway D-Bus session and point the app
+#      at it with --password-store=gnome-libsecret. The keyring lives UNDER the profile
+#      (XDG_DATA_HOME), so the desktop login is per-profile AND survives restarts, and
+#      travels with the ~/.claude-env backup just like the CLI credentials do. The
+#      keyring password is generated once per profile and kept beside it — the box (and
+#      its backup) is the security boundary, same as the CLI's stored credentials.
+#      gnome-keyring is NOT baked into the box: its gcr dependency drags in the whole
+#      GTK stack, none of which we use (our --login recipe never prompts) — dead weight
+#      on a claude-code-only box. So we install it lazily, on first launch here. (When
+#      claude-desktop itself is installed most of that stack is already present, so the
+#      extra cost is small — hence no scary size in the prompt.)
+#   3) launches it FULLY DETACHED (new session, no controlling tty), so closing the
 #      window frees your shell — the raw binary stays attached and hangs the terminal.
-if [[ -x /usr/bin/claude-desktop ]]; then
-    claude-desktop() {
-        emulate -L zsh
-        local dd
-        if [[ -n "$CLAUDE_ENV_PROFILE" && -d "$CLAUDE_ENV_HOME/$CLAUDE_ENV_PROFILE" ]]; then
-            dd="$CLAUDE_ENV_HOME/$CLAUDE_ENV_PROFILE/desktop"; mkdir -p "$dd"
-        else
-            dd="$HOME/.config/Claude"   # no active profile: the app's default location
+# Defined even when the app isn't installed, and the binary is checked at RUN time:
+# that way installing it makes the wrapper work immediately in already-open shells
+# (a definition-time check would need a new session), and without it you get an
+# install hint instead of "command not found".
+claude-desktop() {
+    emulate -L zsh
+    local dd xdg pwfile ans
+    if [[ ! -x /usr/bin/claude-desktop ]]; then
+        print "claude-desktop is not installed. Install it first, then run this again:"
+        print -P "    %F{cyan}yay -S claude-desktop%f"
+        return 1
+    fi
+    if [[ -n "$CLAUDE_ENV_PROFILE" && -d "$CLAUDE_ENV_HOME/$CLAUDE_ENV_PROFILE" ]]; then
+        dd="$CLAUDE_ENV_HOME/$CLAUDE_ENV_PROFILE/desktop"
+        xdg="$CLAUDE_ENV_HOME/$CLAUDE_ENV_PROFILE/desktop-xdg"   # holds keyrings/
+    else
+        dd="$HOME/.config/Claude"   # no active profile: the app's default location
+        xdg="$HOME/.local/share"
+    fi
+    mkdir -p "$dd" "$xdg"
+
+    # No Secret Service => the sign-in can't persist. gnome-keyring isn't preinstalled
+    # (it pulls the GTK stack we don't use), so offer to install it here — once. Decline
+    # and it still launches, just without persistence (the old behaviour). The in-box
+    # user has passwordless sudo, so the install is non-interactive.
+    if [[ ! -x /usr/bin/gnome-keyring-daemon ]]; then
+        print    "claude-desktop keeps you signed in via an OS keyring (gnome-keyring),"
+        print    "which isn't installed yet (a one-time install)."
+        print -n "Install it now so your sign-in persists across restarts? [Y/n] "
+        read -r ans
+        if [[ "$ans" == [Nn]* ]]; then
+            print -P "%F{yellow}Skipping — the sign-in won't persist. Re-run claude-desktop to install later.%f"
+            setsid -f /usr/bin/claude-desktop --user-data-dir="$dd" "$@" </dev/null >/dev/null 2>&1
+            print "claude-desktop launched detached (profile: ${CLAUDE_ENV_PROFILE:-none})."
+            return 0
         fi
-        setsid -f /usr/bin/claude-desktop --user-data-dir="$dd" "$@" </dev/null >/dev/null 2>&1
-        print "claude-desktop launched detached (profile: ${CLAUDE_ENV_PROFILE:-none}). Shell is free; close the window to quit."
-    }
-fi
+        print "Installing gnome-keyring + libsecret..."
+        # -Sy up front: a long-lived box's sync db may be stale, and without a refresh
+        # pacman can't find/resolve the package (acceptable partial-sync in a sandbox).
+        if ! sudo pacman -Sy --needed --noconfirm gnome-keyring libsecret; then
+            print -P "%F{yellow}Install failed (network/mirrors?). Launching without persistence.%f"
+            setsid -f /usr/bin/claude-desktop --user-data-dir="$dd" "$@" </dev/null >/dev/null 2>&1
+            print "claude-desktop launched detached (profile: ${CLAUDE_ENV_PROFILE:-none})."
+            return 0
+        fi
+    fi
+
+    # One stable per-profile keyring password, generated once and kept beside the
+    # keyring (mode 600). It must be identical on every launch or the existing
+    # keyring won't unlock (verified: wrong password => token unreadable).
+    pwfile="$xdg/keyring-pw"
+    if [[ ! -s "$pwfile" ]]; then
+        ( umask 077; head -c 24 /dev/urandom | base64 | tr -d '\n' > "$pwfile" )
+    fi
+
+    # gnome-keyring's --login creates+unlocks the login keyring from a password on
+    # stdin (empty-password --unlock instead pops a GUI prompt and fails headless),
+    # all inside a private dbus-run-session so we don't depend on a user bus.
+    # Run the daemon in the FOREGROUND (backgrounded) rather than --daemonize: that
+    # keeps it as OUR child so the EXIT trap kills it when the app quits. A
+    # --daemonize'd daemon instead orphans to init and lingers after every launch,
+    # piling up stray daemons (each with a control socket in the shared
+    # XDG_RUNTIME_DIR). The Secret Service is D-Bus-activated on demand, so we don't
+    # need --start; the secret-tool warm-up just blocks until it's up so the app never
+    # races ahead of the keyring. (printf, not a here-string: the password must carry
+    # NO trailing newline, or it won't match keyrings created by earlier launches.)
+    setsid -f env XDG_DATA_HOME="$xdg" dbus-run-session -- bash -c '
+        pw="$(cat "$2")"
+        printf "%s" "$pw" | gnome-keyring-daemon --foreground --components=secrets --login >/dev/null 2>&1 &
+        gkd=$!
+        trap "kill $gkd 2>/dev/null" EXIT INT TERM
+        secret-tool lookup _waterbox_warmup 1 >/dev/null 2>&1 || true
+        /usr/bin/claude-desktop --password-store=gnome-libsecret \
+             --user-data-dir="$1" "${@:3}"
+    ' claude-desktop "$dd" "$pwfile" "$@" </dev/null >/dev/null 2>&1
+    print "claude-desktop launched detached (profile: ${CLAUDE_ENV_PROFILE:-none}). Shell is free; close the window to quit."
+}
 
 # The active profile is shown in the tmux status bar (colored per profile), so no
 # in-prompt indicator is needed. Strip any indicator a previous version left in
@@ -1811,6 +1901,7 @@ boot_min() {
         systemd-nspawn --boot --quiet --keep-unit --notify-ready=yes \
             --directory="$JAIL_ROOT" --machine="$MACHINE_NAME" --network-veth \
             --resolv-conf=off --capability=CAP_NET_ADMIN,CAP_NET_RAW --bind=/dev/net/tun \
+            --restrict-address-families="AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET" \
         >/dev/null 2>&1
     running || { echo "helper: boot failed"; exit 3; }
     net_up || true
@@ -1903,6 +1994,7 @@ boot_full() {
         systemd-nspawn --boot --quiet --keep-unit --notify-ready=yes \
             --directory="$JAIL_ROOT" --machine="$MACHINE_NAME" --network-veth \
             --resolv-conf=off --capability=CAP_NET_ADMIN,CAP_NET_RAW --bind=/dev/net/tun \
+            --restrict-address-families="AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET" \
             "${BINDS[@]}" "${gpu[@]}"
     running || { echo "helper: boot failed"; exit 3; }
     net_up || true
