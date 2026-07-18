@@ -440,7 +440,8 @@ autoload -Uz compinit && compinit -u
 # Small orientation banner, printed once per tmux session.
 waterbox_welcome() {
     print -P "%F{cyan}── waterbox ─────────────────────────────────────────%f"
-    print    "  claude-env          switch / create a Claude account (active one colours the status bar)"
+    print    "  claude-env          Claude account menu (active one colours the status bar) · 'help' for subcommands"
+    print    "  claude-env usage    plan usage (/usage) of every account"
     print    "  claude-env default  set the account new sessions start on (Tab-completes names)"
     print    "  claude              run Claude Code in the active account"
     print    "  Ctrl-b d            detach (session keeps running) — re-attach with 'waterbox' on the host"
@@ -486,11 +487,13 @@ set -g status-right-length 20
 set -g status-left  ' #{?@ce_name,#[bold]#{@ce_name}#[nobold] · ,}#S '
 set -g status-right '%H:%M '
 
-# New windows/splits start in the current pane's directory, not $HOME. So if you
-# cd to /tmp and hit Ctrl-b c, the new window opens in /tmp too.
-bind c new-window      -c "#{pane_current_path}"
-bind % split-window -h -c "#{pane_current_path}"
-bind '"' split-window -v -c "#{pane_current_path}"
+# New windows/splits are an extension of the pane you're in: same directory AND
+# same claude-env profile (the pane's @ce_name goes into the new shell's env;
+# .zshrc re-selects it there). Wrapped in run-shell because tmux format-expands
+# run-shell's argument but not new-window's -e.
+bind c   run-shell 'tmux new-window      -c "#{pane_current_path}" -e "CLAUDE_ENV_PROFILE=#{@ce_name}"'
+bind %   run-shell 'tmux split-window -h -c "#{pane_current_path}" -e "CLAUDE_ENV_PROFILE=#{@ce_name}"'
+bind '"' run-shell 'tmux split-window -v -c "#{pane_current_path}" -e "CLAUDE_ENV_PROFILE=#{@ce_name}"'
 EOF
     sudo chown 1000:1000 "$JAIL_ROOT/home/$USER_NAME/.tmux.conf"
 
@@ -550,6 +553,8 @@ write_claude_env_zsh() {
     sudo mkdir -p "$JAIL_ROOT/home/$USER_NAME/.config"
     sudo tee "$JAIL_ROOT/home/$USER_NAME/.config/claude-env.zsh" > /dev/null <<'CLAUDEENV'
 # claude-env — switch the Claude Code account/profile for this shell.
+# Subcommands: load / add / default / usage / delete / help (see _claude_env_help);
+# with no arguments it opens the interactive menu.
 # Profiles live in ~/.claude-env/<name>. Selecting one points CLAUDE_CONFIG_DIR
 # at it, so `claude` opens in that account; the active profile shows in the prompt.
 # Each profile keeps its OWN login/credentials, but chat history (projects/todos)
@@ -630,7 +635,7 @@ _claude_env_menu() {   # args = options; sets REPLY to the chosen option, or:
     # with the text preserved, printable keys append, Backspace deletes to empty.
     local opts=("$@") sel=1 n=$# key i buf="" first=1
     local input_row=${MENU_INPUT_ROW:-0}; MENU_INPUT_ROW=0; MENU_NAME=""
-    print -u2 -- "Select a Claude profile (↑/↓, Enter · d delete):"
+    print -u2 -- "Select a Claude profile (↑/↓, Enter · d delete · s status):"
     print -nu2 -- $'\e[?25l'
     while true; do
         (( first )) || print -nu2 -- $'\e['"$n"'A'
@@ -670,6 +675,10 @@ _claude_env_menu() {   # args = options; sets REPLY to the chosen option, or:
         if [[ "$key" == d ]]; then
             print -nu2 -- $'\e[?25h'; MENU_NAME="${opts[sel]}"; REPLY='(delete)'; return 0
         fi
+        # 's' anywhere → status/usage report (handled by the caller).
+        if [[ "$key" == s ]]; then
+            print -nu2 -- $'\e[?25h'; REPLY='(status)'; return 0
+        fi
         if [[ -z "$key" || "$key" == $'\n' || "$key" == $'\r' ]]; then
             print -nu2 -- $'\e[?25h'; REPLY="${opts[sel]}"; return 0
         fi
@@ -688,75 +697,151 @@ _claude_env_delete_hint() {
     print -P "    %F{cyan}claude-env delete $p%f"
 }
 
-claude-env() {
-    emulate -L zsh
-    mkdir -p "$CLAUDE_ENV_HOME"
-    local sub="$1" ans name dir target d
-    local profiles=()
+_claude_env_help() {
+    print "claude-env — manage Claude Code accounts (profiles) on this box"
+    print ""
+    print "usage:"
+    print "  claude-env                 interactive profile menu (d delete · s status)"
+    print "  claude-env load <name>     switch this shell to profile <name>"
+    print "  claude-env add <name>      create profile <name> and switch to it"
+    print "  claude-env default [name]  show or set the profile new sessions start on"
+    print "  claude-env usage           show plan usage (/usage) for every profile"
+    print "  claude-env delete <name>   delete a profile's login (shared chats are kept)"
+    print "  claude-env help            this help"
+}
 
-    if [[ "$sub" == default ]]; then
-        if [[ -n "$2" ]]; then _claude_env_set_default "$2"; return $?; fi
-        print "Default Claude profile: '$(_claude_env_resolve_default)'."
-        print "Change it with: claude-env default <name>   (Tab-completes profile names)"
-        return 0
+_claude_env_load() {   # $1 = name of an EXISTING profile
+    local name="$1"
+    [[ -z "$name" ]] && { print "usage: claude-env load <profile>"; return 1; }
+    if [[ ! -d "$CLAUDE_ENV_HOME/$name" ]]; then
+        print "No such profile: '$name'.  Create it with: claude-env add $name"; return 1
     fi
+    _claude_env_select "$name"
+    print "Active Claude profile: $name  (run 'claude')"
+}
 
-    if [[ "$sub" == delete || "$sub" == rm ]]; then
-        target="$2"
-        [[ -z "$target" ]] && { print "usage: claude-env delete <profile>"; return 1; }
-        [[ -d "$CLAUDE_ENV_HOME/$target" ]] || { print "No such profile: $target"; return 1; }
-        print -n "Delete account '$target' (its login only — shared chats are kept)? [y/N] "; read -r ans
-        if [[ "$ans" == [Yy]* ]]; then
-            rm -rf "${CLAUDE_ENV_HOME:?}/$target"
-            # If it was the configured default, forget it so the default re-resolves.
-            [[ "$(<"$CLAUDE_ENV_DEFAULT_FILE" 2>/dev/null)" == "$target" ]] && rm -f "$CLAUDE_ENV_DEFAULT_FILE"
-            print "Deleted account '$target' (chat history kept in the shared store)."
-            # If it was the active one, switch to another rather than leaving none.
-            if [[ "$CLAUDE_ENV_PROFILE" == "$target" ]]; then
-                local nx="$(_claude_env_resolve_default)"
-                if [[ -n "$nx" ]]; then
-                    _claude_env_select "$nx"; print "Switched to '$nx'."
-                else
-                    unset CLAUDE_ENV_PROFILE CLAUDE_CONFIG_DIR; _claude_env_tmux_status ""
-                fi
-            fi
-        else
-            print "Aborted."
-        fi
-        return 0
-    fi
-
-    name="$sub"
-    if [[ -z "$name" ]]; then
-        for d in "$CLAUDE_ENV_HOME"/*(N/); do profiles+=("${d:t}"); done
-        if (( ${#profiles} == 0 )); then
-            print -n "No profiles yet. Name for a new profile: "; read -r name
-            [[ -z "$name" ]] && { print "No name given."; return 1; }
-        else
-            MENU_INPUT_ROW=1
-            _claude_env_menu "${profiles[@]}" "+ new profile: "
-            case "$REPLY" in
-                '(delete)') _claude_env_delete_hint "$MENU_NAME"; return 0 ;;
-                '(new)')    name="$MENU_NAME"
-                            [[ -z "$name" ]] && { print "No name given."; return 1; } ;;
-                *)          name="$REPLY" ;;
-            esac
-        fi
-    fi
-
+_claude_env_create() {   # $1 = profile name; created if missing, then selected
+    local name="$1" dir
     if [[ -z "$name" || "$name" == */* || "$name" == .* ]]; then
         print "Invalid profile name: '$name'"; return 1
     fi
-
     dir="$CLAUDE_ENV_HOME/$name"
-    if [[ ! -d "$dir" ]]; then
-        print -n "Profile '$name' doesn't exist. Create it? [Y/n] "; read -r ans
-        [[ "$ans" == [Nn]* ]] && { print "Ok, leaving things as they are."; return 0; }
+    if [[ -d "$dir" ]]; then
+        print "Profile '$name' already exists — switching to it."
+    else
         mkdir -p "$dir"; _claude_env_seed "$dir"
         print "Created profile '$name'."
     fi
     _claude_env_select "$name"
     print "Active Claude profile: $name  (run 'claude')"
+}
+
+# Plan usage per profile: runs `claude --print /usage` once per profile (each has
+# its own login) and keeps just the session + weekly lines. Slow by nature — one
+# claude launch per profile — hence the progress note.
+_claude_env_usage() {
+    local p out line day week pad
+    local -a profiles
+    for p in "$CLAUDE_ENV_HOME"/*(N/); do profiles+=("${p:t}"); done
+    (( ${#profiles} )) || { print "No profiles yet."; return 0; }
+    print "Plan usage per profile (runs claude once per profile — takes a moment):"
+    print ""
+    for p in "${profiles[@]}"; do
+        print -nu2 -- "  checking ${p}…"
+        out="$(CLAUDE_CONFIG_DIR="$CLAUDE_ENV_HOME/$p" command timeout 20 \
+                 claude --model haiku --no-session-persistence --print "/usage" 2>/dev/null)"
+        print -nu2 -- $'\r\e[K'
+        day="" week=""
+        while IFS= read -r line; do
+            case "$line" in
+                'Current session: '*)           day="${line#"Current session: "}" ;;
+                # NB: quoted pattern — the () would otherwise be glob grouping.
+                'Current week (all models): '*) week="${line#"Current week (all models): "}" ;;
+            esac
+        done <<< "$out"
+        if [[ -n "$day" || -n "$week" ]]; then
+            printf -v pad '%*s' $(( ${#p} + 2 )) ''
+            print -r -- "${p}: current -> ${day:-unavailable}"
+            print -r -- "${pad}week    -> ${week:-unavailable}"
+        else
+            print -r -- "${p}: no usage data (not logged in on this profile?)"
+        fi
+        print ""
+    done
+}
+
+claude-env() {
+    emulate -L zsh   # LOCAL_TRAPS: the Ctrl-C trap below dies with this function
+    # Ctrl-C ends claude-env gracefully: restore the cursor the menu may have
+    # hidden, move to a fresh line, and exit 0 — no error status on the prompt.
+    # `return` in a trap only exits the INNERMOST running function (e.g. the
+    # menu), so _ce_int flags the interrupt for the checks after nested calls.
+    local _ce_int=0
+    trap 'print -nu2 "\e[?25h"; print; _ce_int=1; return 0' INT
+    mkdir -p "$CLAUDE_ENV_HOME"
+    local sub="$1" ans name target d
+    local profiles=()
+
+    case "$sub" in
+        help|--help|-h) _claude_env_help; return 0 ;;
+        usage|status)   _claude_env_usage; return 0 ;;
+        load)           _claude_env_load "$2"; return $? ;;
+        add)
+            [[ -z "$2" ]] && { print "usage: claude-env add <profile>"; return 1; }
+            _claude_env_create "$2"; return $? ;;
+        default)
+            if [[ -n "$2" ]]; then _claude_env_set_default "$2"; return $?; fi
+            print "Default Claude profile: '$(_claude_env_resolve_default)'."
+            print "Change it with: claude-env default <name>   (Tab-completes profile names)"
+            return 0 ;;
+        delete|rm)
+            target="$2"
+            [[ -z "$target" ]] && { print "usage: claude-env delete <profile>"; return 1; }
+            [[ -d "$CLAUDE_ENV_HOME/$target" ]] || { print "No such profile: $target"; return 1; }
+            print -n "Delete account '$target' (its login only — shared chats are kept)? [y/N] "; read -r ans
+            if [[ "$ans" == [Yy]* ]]; then
+                rm -rf "${CLAUDE_ENV_HOME:?}/$target"
+                # If it was the configured default, forget it so the default re-resolves.
+                [[ "$(<"$CLAUDE_ENV_DEFAULT_FILE" 2>/dev/null)" == "$target" ]] && rm -f "$CLAUDE_ENV_DEFAULT_FILE"
+                print "Deleted account '$target' (chat history kept in the shared store)."
+                # If it was the active one, switch to another rather than leaving none.
+                if [[ "$CLAUDE_ENV_PROFILE" == "$target" ]]; then
+                    local nx="$(_claude_env_resolve_default)"
+                    if [[ -n "$nx" ]]; then
+                        _claude_env_select "$nx"; print "Switched to '$nx'."
+                    else
+                        unset CLAUDE_ENV_PROFILE CLAUDE_CONFIG_DIR; _claude_env_tmux_status ""
+                    fi
+                fi
+            else
+                print "Aborted."
+            fi
+            return 0 ;;
+        '') ;;   # no arguments → interactive menu below
+        *)
+            print "Unknown command: '$sub'  (bare profile names are no longer accepted)"
+            print ""
+            _claude_env_help
+            return 1 ;;
+    esac
+
+    for d in "$CLAUDE_ENV_HOME"/*(N/); do profiles+=("${d:t}"); done
+    if (( ${#profiles} == 0 )); then
+        print -n "No profiles yet. Name for a new profile: "; read -r name
+        [[ -z "$name" ]] && { print "No name given."; return 1; }
+        _claude_env_create "$name"; return $?
+    fi
+    MENU_INPUT_ROW=1
+    _claude_env_menu "${profiles[@]}" "+ new profile: "
+    (( _ce_int )) && return 0   # menu was Ctrl-C'd; REPLY is meaningless
+    case "$REPLY" in
+        '(delete)') _claude_env_delete_hint "$MENU_NAME"; return 0 ;;
+        '(status)') _claude_env_usage; return 0 ;;
+        '(new)')
+            [[ -z "$MENU_NAME" ]] && { print "No name given."; return 1; }
+            _claude_env_create "$MENU_NAME"; return $? ;;
+        *)          _claude_env_load "$REPLY" ;;
+    esac
 }
 
 # claude-desktop (AUR) is a SEPARATE Electron app with its own login store; it does
@@ -797,22 +882,27 @@ add-zsh-hook precmd _claude_env_prompt_cleanup
 # Tab-completion for claude-env: subcommands + existing profile names.
 _claude_env_complete() {
     local -a subcmds profiles
-    subcmds=(default delete rm)
+    subcmds=(load add default usage delete rm help)
     profiles=("$CLAUDE_ENV_HOME"/*(N/:t))
     if (( CURRENT == 2 )); then
         _describe -t commands 'claude-env command' subcmds
-        _describe -t profiles 'profile' profiles
     elif (( CURRENT == 3 )); then
         case "${words[2]}" in
-            default|delete|rm) _describe -t profiles 'profile' profiles ;;
+            load|default|delete|rm) _describe -t profiles 'profile' profiles ;;
         esac
     fi
 }
 (( $+functions[compdef] )) && compdef _claude_env_complete claude-env 2>/dev/null
 
-# Auto-select a profile for every new shell — the configured default, else a
-# fallback — so a session is never left with no account selected (req: avoid none).
-if [[ -z "$CLAUDE_ENV_PROFILE" ]]; then
+# Auto-select a profile for every new shell. Precedence: a profile inherited via
+# the environment (Ctrl-b c and splits pass the source pane's @ce_name through
+# tmux's -e, so new windows keep the profile of the pane they came from), else
+# the configured default — so a session is never left with no account selected.
+# Re-selecting the inherited name wires CLAUDE_CONFIG_DIR and THIS pane's
+# status-bar colour, which the env var alone doesn't carry.
+if [[ -n "$CLAUDE_ENV_PROFILE" && -d "$CLAUDE_ENV_HOME/$CLAUDE_ENV_PROFILE" ]]; then
+    _claude_env_select "$CLAUDE_ENV_PROFILE"
+else
     _wb_def="$(_claude_env_resolve_default)"
     [[ -n "$_wb_def" ]] && _claude_env_select "$_wb_def"
     unset _wb_def
