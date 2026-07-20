@@ -1494,6 +1494,23 @@ _confirm_kill_sessions() {
     [[ "$ans" == [Yy]* ]]
 }
 
+# The suggested default name for a brand-new session: the basename of the
+# directory the user launched from, sanitized to tmux-legal chars (letters,
+# digits, - and _). Falls back to $TMUX_SESSION ("box") at $HOME or when nothing
+# usable remains. The caller still auto-suffixes a collision (proj, proj-2, …).
+_default_session_base() {
+    local dir="$PWD" base
+    if [ -z "$dir" ] || [ "$dir" = "$HOME" ]; then
+        printf '%s' "$TMUX_SESSION"; return
+    fi
+    base="${dir##*/}"                    # basename of the launch directory
+    base="${base//[^A-Za-z0-9_-]/-}"     # tmux forbids '.', ':', spaces, …
+    while [ "${base#-}" != "$base" ]; do base="${base#-}"; done  # trim leading -
+    while [ "${base%-}" != "$base" ]; do base="${base%-}"; done  # trim trailing -
+    [ -n "$base" ] || base="$TMUX_SESSION"
+    printf '%s' "$base"
+}
+
 # Prompt for a NEW session name (Enter alone accepts the suggested default). Sets
 # NEW_SESSION to a validated, unique name; returns 1 only on read failure (EOF).
 # tmux forbids '.' and ':', so we constrain to letters/digits/-/_ and auto-suffix
@@ -1558,7 +1575,7 @@ _rename_session() {
 attach_session() {
     # GUI env reaches the shell via the in-box /etc/waterbox/gui-env (sourced by
     # .zshrc), so nothing to forward here beyond an optional API key.
-    local want="${1:-}" target sessions=() s dn default_name keep_name="" ki
+    local want="${1:-}" target sessions=() s dn default_name base_name keep_name="" ki
     if [ -n "$want" ]; then
         [[ "$want" =~ ^[A-Za-z0-9._-]+$ ]] \
             || log_error "Invalid session name '$want' (letters, digits, . _ - only)."
@@ -1572,10 +1589,13 @@ attach_session() {
             [ -n "$s" ] && sessions+=("$s")
         done < <(_live_sessions)
 
-        # Next free auto name (box, box-2, …) suggested for a brand-new session.
-        default_name="$TMUX_SESSION"; dn=2
+        # Next free auto name suggested for a brand-new session: the launch
+        # directory's basename (box at $HOME), auto-suffixed on a collision
+        # (proj, proj-2, …).
+        base_name="$(_default_session_base)"
+        default_name="$base_name"; dn=2
         while printf '%s\n' "${sessions[@]}" | grep -Fxq "$default_name"; do
-            default_name="$TMUX_SESSION-$dn"; dn=$((dn + 1))
+            default_name="$base_name-$dn"; dn=$((dn + 1))
         done
 
         # No live sessions: nothing to pick — create the first one directly.
