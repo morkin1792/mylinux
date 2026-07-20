@@ -1764,6 +1764,15 @@ start_sandbox() {
         fi
     fi
 
+    # The in-box fire helper (waterbox-fire) is what actually delivers scheduled
+    # commands + quota wakes. Unlike .tmux.conf it's safe to update live (the next fire
+    # just runs the new copy), so keep it current even when live sessions blocked the
+    # full refresh above — otherwise a stale copy silently fails to deliver.
+    if is_running && ! _fire_current; then
+        log_info "Updating the in-box task helper (waterbox-fire)..."
+        ( write_task_helper ) || log_warn "Couldn't update waterbox-fire now (scheduling may not deliver until 'refresh-config')."
+    fi
+
     attach_session "$want"
 }
 
@@ -2568,8 +2577,9 @@ TASK_MSG_DIR="/etc/waterbox"       # inside the rootfs (schedule-command message
 # account's 5-hour window then deletes the throwaway transcript; `send <session>
 # <msgfile>` types the message + Enter into an existing tmux session.
 write_task_helper() {
-    sudo tee "$JAIL_ROOT/usr/local/bin/waterbox-fire" >/dev/null <<'FIRE'
-#!/bin/sh
+    # A version marker (checked by _fire_current) lets 'start' self-heal a stale copy
+    # without a full refresh; the body is a quoted heredoc, so nothing expands in it.
+    { printf '#!/bin/sh\n# WB_FIRE_VERSION=%s\n' "$WATERBOX_VERSION"; cat <<'FIRE'
 kind="$1"; shift
 case "$kind" in
     wake)
@@ -2595,11 +2605,15 @@ case "$kind" in
         # since-gone 'box' never lands in 'box-2'. grep -Fx is a whole-line exact
         # match that works on every tmux version — send-keys does NOT accept the '='
         # exact-target prefix, so we must not rely on it here.
-        tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -qxF "$sess" || exit 0
+        if ! tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -qxF "$sess"; then
+            logger -t waterbox-fire "send: no live session '$sess' — skipped" 2>/dev/null || true
+            exit 0
+        fi
         msg=$(cat "$msgfile")
         [ -n "$msg" ] && tmux send-keys -t "$sess" -l -- "$msg"   # empty command → just Enter
         sleep 0.3
         tmux send-keys -t "$sess" Enter
+        logger -t waterbox-fire "send: delivered to '$sess' [${msg:-<enter>}]" 2>/dev/null || true
         ;;
     cleanup-session)
         # Remove schedule-commands that targeted a now-closed session (req 14).
@@ -2649,7 +2663,15 @@ case "$kind" in
         ;;
 esac
 FIRE
+    } | sudo tee "$JAIL_ROOT/usr/local/bin/waterbox-fire" >/dev/null
     sudo chmod 0755 "$JAIL_ROOT/usr/local/bin/waterbox-fire"
+}
+
+# True when the installed in-box fire helper matches this waterbox version.
+_fire_current() {
+    [ -x "$JAIL_ROOT/usr/local/bin/waterbox-fire" ] \
+        && grep -q "^# WB_FIRE_VERSION=$WATERBOX_VERSION\$" \
+            "$JAIL_ROOT/usr/local/bin/waterbox-fire" 2>/dev/null
 }
 
 # Next free integer suffix for tasks whose unit base starts with <glob-prefix>
