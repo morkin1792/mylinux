@@ -4,7 +4,7 @@
 
 set -e
 
-WATERBOX_VERSION="1.6"
+WATERBOX_VERSION="1.7"
 
 # Absolute path to this script, recorded so the shell-completion snippet can fall
 # back to it when 'waterbox' isn't on $PATH (e.g. run by ./waterbox, or moved).
@@ -96,52 +96,36 @@ trap _on_interrupt INT
 
 show_help() {
     cat <<EOF
-waterbox v$WATERBOX_VERSION
-Usage: waterbox [command] [arguments] [--gui|--no-gui] [--no-gpu]
+waterbox v$WATERBOX_VERSION — isolated Arch sandbox (systemd-nspawn) for running CLI
+agents like claude-code in bypass mode without exposing your machine.
 
-Namespace-isolated Arch sandbox powered by systemd-nspawn — for running tools
-like claude-code in bypass mode without handing them your whole machine. Bare
-'waterbox' boots the box (if needed) and attaches; several commands with no
-arguments open an interactive TUI (↑/↓ · a add · d delete · q quit).
+Usage: waterbox [command] [args] [--gui|--no-gui] [--no-gpu]
+  Bare 'waterbox' boots the box and attaches.   Ctrl-b d = detach · exit = end session
 
-Running the box:
-  start [--gui]     Boot if needed and attach (the default; 'waterbox' alone).
-                    Each attach is its own persistent tmux session — Ctrl-b d
-                    detaches, 'exit' ends it. Display forwarding is auto-on for
-                    Wayland hosts (off on X11); force with --gui / --no-gui.
-  stop              Power the box off.
-  restart           stop + start (needed after 'share' changes or to toggle --gui).
-  status            Show whether the box is running.
-  reset             Wipe the rootfs and rebuild from scratch.
+Box
+  start [<session>] [--gui]   Boot if needed and attach (the default). A name
+                              opens/creates it; Tab-completes live ones.
+  stop                        Power the box off.
+  restart [--gui]             stop + start (after 'share' changes or --gui).
+  status                      Show if the box is running.
+  reset                       Wipe the rootfs and rebuild.
 
-Sharing folders with the box:
-  share             Manage shared host folders (TUI). CLI: share add/detach/list;
-                    see 'waterbox share --help'.
+Scheduling  (bare command opens a TUI; both fire at a set time)
+  wake-claude                 Open an account's fresh 5-hour quota window —
+                              fires even while the box is stopped, unattended.
+  schedule-command            Send a command to a live session (box must be up).
 
-Scheduling:
-  wake-claude       Manage quota wakes (TUI) — fire a tiny Haiku 'hi' to open an
-                    account's fresh 5-hour window. Runs even while the box is
-                    stopped and you're offline. See 'waterbox wake-claude --help'.
-  schedule-command  Manage scheduled commands (TUI) — type a command + Enter into
-                    a live session at a set time (needs the box running). See
-                    'schedule-command --help'.
+Sharing
+  share                       Mount a host folder inside ~/workspace.
 
-  help              Show this help.
+GUI apps are auto-on for Wayland hosts (off on X11); force with --gui / --no-gui.
+More detail:  waterbox <command> --help
 
-(Host privileges — a root-owned helper reached via a narrow, passwordless sudoers
- rule — are installed automatically on the first 'start'/'reset'; no manual setup.)
-
-Update an existing box after upgrading waterbox:  waterbox refresh-config
-  (also applied automatically on the next 'start' when no session is live.)
-
-Paths:
-  Rootfs:                 $JAIL_ROOT
-  Workspace inside:       $CONTAINER_WORKSPACE
-  Host reachable inside:  $HOST_ALIAS  ($HOST_IP)
-                          \`host:PORT\` is DNAT'd to 127.0.0.1:PORT on the host.
-  Back up your accounts:  $JAIL_ROOT/home/$USER_NAME/.claude-env
-                          (all Claude logins + the shared chat history — copy this
-                          directory somewhere safe to preserve everything.)
+Locations
+  Box files on host:     $JAIL_ROOT
+  Reach host from box:   $HOST_ALIAS or the host's hostname  ($HOST_IP)
+  Back up:               $JAIL_ROOT/home/$USER_NAME/.claude-env
+                         (Claude logins + shared chat history — copy somewhere safe)
 EOF
 }
 
@@ -153,10 +137,12 @@ Usage: waterbox wake-claude [<profile> <HH:MM> [once|daily]]
 
 Fire a tiny Haiku 'hi' at <HH:MM> to open that account's fresh 5-hour quota
 window — no session needed, output discarded, nothing saved to history. Backed by
-a HOST systemd timer, so it fires even while the box is stopped and you're offline
-(the root helper boots the box, primes the account, and powers it back off).
+a HOST systemd timer, so it fires unattended even while the box is powered off (the
+root helper boots the box, primes the account, and powers it back off — the host
+must be on with internet, but you don't need to be there).
 
   (no args)                             Open the live manager (a add · d del · q quit).
+  <profile>                             Pick the profile, then just ask time + when.
   <profile> <HH:MM> [once|daily]        Add a wake directly (default: daily).
   list                                  List wakes with time-to-trigger.
   del <id>                              Remove a wake (id from 'list', e.g. wake-1).
@@ -168,8 +154,10 @@ Usage: waterbox schedule-command [<session> <HH:MM> [once|daily] "<command>"]
 
 At <HH:MM>, type <command> + Enter into an existing tmux session (e.g. fire a
 prompt the moment your quota resets). The session must exist when you add it.
+An empty command ("") just sends Enter — listed as <enter>.
 
   (no args)                                    Open the live manager (a add · d del · q quit).
+  <session>                                    Pick the session, then just ask time, when + command.
   <session> <HH:MM> [once|daily] "<command>"   Add directly (default: once).
   list                                         List scheduled commands with time-to-trigger.
   del <id>                                     Remove one (id from 'list', e.g. schd-com-1).
@@ -276,6 +264,29 @@ _nspawn_build() {
         -D "$JAIL_ROOT" "$@"
 }
 
+# Write waterbox's /etc/hosts entries idempotently (safe to re-run on refresh): the
+# box answers to its own name on 127.0.0.1, and the host machine is reachable from
+# inside BOTH as 'host' and by its real hostname — both via the veth IP. Any prior
+# waterbox lines are stripped first; everything else (localhost, VPN-added entries, …)
+# is preserved. The host hostname is dropped when empty, not a plain hostname, or a
+# clash with our own names (the box name or the 'host' alias).
+configure_hosts() {
+    local hosts="$JAIL_ROOT/etc/hosts" host_hn ip_re tmp
+    host_hn=$(cat /proc/sys/kernel/hostname 2>/dev/null || true)
+    case "$host_hn" in
+        ''|localhost|"$HOST_ALIAS"|"$INSIDE_HOSTNAME"|*[!A-Za-z0-9.-]*) host_hn="" ;;
+    esac
+    ip_re="${HOST_IP//./\\.}"
+    tmp=$(mktemp)
+    [ -f "$hosts" ] && grep -vE "^(127\.0\.0\.1[[:space:]]+${INSIDE_HOSTNAME}[[:space:]]*\$|${ip_re}[[:space:]])" "$hosts" > "$tmp" 2>/dev/null || true
+    {
+        cat "$tmp"
+        printf '127.0.0.1    %s\n' "$INSIDE_HOSTNAME"
+        printf '%s    %s%s\n' "$HOST_IP" "$HOST_ALIAS" "${host_hn:+ $host_hn}"
+    } | sudo tee "$hosts" > /dev/null
+    rm -f "$tmp"
+}
+
 # --- Bootstrap (runs once) ----------------------------------------------------
 bootstrap_sandbox() {
     # A sentinel written only at the very end marks a *complete* build. Testing
@@ -347,10 +358,9 @@ bootstrap_sandbox() {
     sudo rm -f "$JAIL_ROOT/etc/resolv.conf"
     _container_nameservers | sudo tee "$JAIL_ROOT/etc/resolv.conf" > /dev/null
 
-    # /etc/hosts: name the host so it's easy to reach from inside.
-    sudo tee -a "$JAIL_ROOT/etc/hosts" > /dev/null <<EOF
-$HOST_IP    $HOST_ALIAS
-EOF
+    # /etc/hosts: box on loopback + the host reachable as 'host' and by its real
+    # hostname (idempotent, so 'refresh-config' can re-apply it without a rebuild).
+    configure_hosts
 
     # Locale
     echo "en_US.UTF-8 UTF-8" | sudo tee "$JAIL_ROOT/etc/locale.gen" > /dev/null
@@ -459,6 +469,7 @@ waterbox_welcome() {
     print    "  Ctrl-b d            detach (session keeps running) — re-attach with 'waterbox' on the host"
     print    "  exit / Ctrl-d       end this session"
     print    "  Ctrl-b c            new window   ·   Ctrl-b n / p   next / previous window"
+    print    "  Ctrl-b g            join previous window here (split)   ·   Ctrl-b !   break pane into its own window"
     print    "  Ctrl-b <number>     jump to window N (1, 2, …)   ·   more: https://tmuxai.dev/tmux-shortcuts/"
     print -P "%F{cyan}─%f Tip: copy ~/.claude-env off the box to back up every account + the shared chats."
     print -P "%F{cyan}─────────────────────────────────────────────────────%f"
@@ -482,7 +493,15 @@ set -g history-limit 50000
 
 # When a session ends (e.g. you type 'exit'), drop any scheduled commands that
 # targeted it, so they don't linger pointing at a dead session (req 14).
-set-hook -g session-closed 'run-shell "waterbox-fire cleanup-session #{hook_session_name}"'
+set-hook -g session-closed 'run-shell "waterbox-fire cleanup-session #{q:hook_session_name}"'
+
+# Keep scheduled commands attached to their session across a rename — including the
+# native Ctrl-b $, not just waterbox's own 'r' rename. @wb_name records each session's
+# name at creation; on rename, waterbox-fire repoints the schedule-command timers from
+# @wb_name (the old name) to the new one, then updates @wb_name. #{q:…} shell-quotes
+# the name so an odd name can't break the run-shell command.
+set-hook -g session-created 'set -F @wb_name "#{session_name}"'
+set-hook -g session-renamed 'run-shell "waterbox-fire rename-session #{q:session_name}"'
 
 # Tint the WHOLE status bar with the active pane's Claude profile colour, so you
 # can tell which account you're on at a glance. claude-env sets @ce_name/@ce_color
@@ -506,6 +525,18 @@ set -g status-right '%H:%M '
 bind c   run-shell 'tmux new-window      -c "#{pane_current_path}" -e "CLAUDE_ENV_PROFILE=#{@ce_name}"'
 bind %   run-shell 'tmux split-window -h -c "#{pane_current_path}" -e "CLAUDE_ENV_PROFILE=#{@ce_name}"'
 bind '"' run-shell 'tmux split-window -v -c "#{pane_current_path}" -e "CLAUDE_ENV_PROFILE=#{@ce_name}"'
+
+# Ctrl-b g: pull the previously-active window in beside this one (its active pane
+# joins as a right-hand split), so two already-existing windows show side by side.
+# The source window is consumed; Ctrl-b ! breaks a pane back out into its own window.
+bind g join-pane -h -s :!
+
+# Ctrl-b s: session chooser, but each row also carries the pane's claude-env profile
+# ("<session>: <profile> · N windows"), which updates as you move the cursor. The
+# status bar can't follow the chooser cursor (it renders for the attached session),
+# so the profile is surfaced in the list itself. #{session_name} is omitted on
+# purpose — choose-tree already prints it as the row label.
+bind s choose-tree -Zs -F '#{?@ce_name,#{@ce_name} · ,}#{session_windows} window#{?#{==:#{session_windows},1},,s}#{?session_attached, (attached),}'
 EOF
     sudo chown 1000:1000 "$JAIL_ROOT/home/$USER_NAME/.tmux.conf"
 
@@ -639,27 +670,20 @@ _claude_env_select() { # $1 = profile name
     _claude_env_tmux_status "$1"
 }
 
-_claude_env_menu() {   # args = options; sets REPLY to the chosen option, or:
-    #   '(delete)' if 'd' is pressed (MENU_NAME = highlighted profile), or
-    #   '(new)'    if the inline input row (last option, when MENU_INPUT_ROW=1) is
-    #              confirmed (MENU_NAME = the typed name; its text is the label).
-    # The input row shows a block cursor when selected; ↑/↓ move off it and back
-    # with the text preserved, printable keys append, Backspace deletes to empty.
-    local opts=("$@") sel=1 n=$# key i buf="" first=1
-    local input_row=${MENU_INPUT_ROW:-0}; MENU_INPUT_ROW=0; MENU_NAME=""
-    print -u2 -- "Select a Claude profile (↑/↓, Enter · d delete · s status):"
+_claude_env_menu() {   # args = profile options; sets REPLY to the chosen profile, or:
+    #   '(delete)' + MENU_NAME=highlighted profile   when 'd' is pressed
+    #   '(status)'                                    when 's' is pressed
+    #   '(new)'                                       when 'a' is pressed (caller prompts a name)
+    #   '(quit)'                                      when 'q' ends the menu (Ctrl-C also exits, via the trap)
+    local opts=("$@") sel=1 n=$# key i first=1
+    MENU_NAME=""
+    print -u2 -- "Select a Claude profile (↑/↓ move · Enter load · a new · d delete · s status · q quit):"
     print -nu2 -- $'\e[?25l'
     while true; do
         (( first )) || print -nu2 -- $'\e['"$n"'A'
         first=0
         for (( i = 1; i <= n; i++ )); do
-            if (( input_row )) && (( i == n )); then
-                if (( i == sel )); then
-                    print -nu2 -- $'\r\e[K  \e[36m> '"${opts[i]}${buf}"$'\e[0m\e[7m \e[0m\n'
-                else
-                    print -nu2 -- $'\r\e[K    '"${opts[i]}${buf}"$'\n'
-                fi
-            elif (( i == sel )); then
+            if (( i == sel )); then
                 print -nu2 -- $'\r\e[K  \e[36m> '"${opts[i]}"$'\e[0m\n'
             else
                 print -nu2 -- $'\r\e[K    '"${opts[i]}"$'\n'
@@ -674,23 +698,12 @@ _claude_env_menu() {   # args = options; sets REPLY to the chosen option, or:
             esac
             continue
         fi
-        # Editing the inline input row (type-on-select).
-        if (( input_row )) && (( sel == n )); then
-            case "$key" in
-                ''|$'\n'|$'\r') print -nu2 -- $'\e[?25h'; MENU_NAME="$buf"; REPLY='(new)'; return 0 ;;
-                $'\177'|$'\b')  buf="${buf%?}" ;;
-                *)              buf="$buf$key" ;;
-            esac
-            continue
-        fi
-        # 'd' on a highlighted profile → delete flow (handled by the caller).
-        if [[ "$key" == d ]]; then
-            print -nu2 -- $'\e[?25h'; MENU_NAME="${opts[sel]}"; REPLY='(delete)'; return 0
-        fi
-        # 's' anywhere → status/usage report (handled by the caller).
-        if [[ "$key" == s ]]; then
-            print -nu2 -- $'\e[?25h'; REPLY='(status)'; return 0
-        fi
+        case "$key" in
+            d) print -nu2 -- $'\e[?25h'; MENU_NAME="${opts[sel]}"; REPLY='(delete)'; return 0 ;;
+            s) print -nu2 -- $'\e[?25h'; REPLY='(status)'; return 0 ;;
+            a) print -nu2 -- $'\e[?25h'; REPLY='(new)';    return 0 ;;
+            q) print -nu2 -- $'\e[?25h'; REPLY='(quit)';   return 0 ;;
+        esac
         if [[ -z "$key" || "$key" == $'\n' || "$key" == $'\r' ]]; then
             print -nu2 -- $'\e[?25h'; REPLY="${opts[sel]}"; return 0
         fi
@@ -713,7 +726,7 @@ _claude_env_help() {
     print "claude-env — manage Claude Code accounts (profiles) on this box"
     print ""
     print "usage:"
-    print "  claude-env                 interactive profile menu (d delete · s status)"
+    print "  claude-env                 interactive profile menu (a new · d delete · s status · q quit)"
     print "  claude-env load <name>     switch this shell to profile <name>"
     print "  claude-env add <name>      create profile <name> and switch to it"
     print "  claude-env default [name]  show or set the profile new sessions start on"
@@ -839,19 +852,20 @@ claude-env() {
 
     for d in "$CLAUDE_ENV_HOME"/*(N/); do profiles+=("${d:t}"); done
     if (( ${#profiles} == 0 )); then
-        print -n "No profiles yet. Name for a new profile: "; read -r name
+        name=""; vared -p "No profiles yet. Name for a new profile: " name   # vared = ZLE line editing (arrows)
         [[ -z "$name" ]] && { print "No name given."; return 1; }
         _claude_env_create "$name"; return $?
     fi
-    MENU_INPUT_ROW=1
-    _claude_env_menu "${profiles[@]}" "+ new profile: "
+    _claude_env_menu "${profiles[@]}"
     (( _ce_int )) && return 0   # menu was Ctrl-C'd; REPLY is meaningless
     case "$REPLY" in
+        '(quit)')   return 0 ;;
         '(delete)') _claude_env_delete_hint "$MENU_NAME"; return 0 ;;
         '(status)') _claude_env_usage; return 0 ;;
         '(new)')
-            [[ -z "$MENU_NAME" ]] && { print "No name given."; return 1; }
-            _claude_env_create "$MENU_NAME"; return $? ;;
+            name=""; vared -p "Name for the new profile: " name   # vared = ZLE line editing (arrows)
+            [[ -z "$name" ]] && { print "No name given."; return 0; }
+            _claude_env_create "$name"; return $? ;;
         *)          _claude_env_load "$REPLY" ;;
     esac
 }
@@ -1114,6 +1128,16 @@ list_sessions_quiet() {
     sudo -n "$HELPER_PATH" tmux list-sessions -F '#{session_name}' 2>/dev/null || return 0
 }
 
+# Swallow any buffered keystrokes on /dev/tty (e.g. auto-repeat from a held arrow
+# key) so leftover bytes don't leak to the shell as "^[[A" once a menu returns and
+# the terminal is back in cooked/echo mode. Reads in chunks with a tiny timeout;
+# stops as soon as the buffer is empty (one short timeout at the end).
+_drain_tty() {
+    local _junk
+    while IFS= read -rsn64 -t 0.01 _junk < /dev/tty 2>/dev/null; do :; done
+    return 0
+}
+
 # Arrow-key selectable menu drawn on /dev/tty (independent of stdout/stderr
 # redirection). Navigate with up/down (or k/j), Enter selects. Sets MENU_CHOICE.
 #
@@ -1125,7 +1149,9 @@ list_sessions_quiet() {
 # it confirms; the buffer lands in MENU_INPUT. Non-input rows behave as before.
 # Set MENU_DELETE=1 before calling to let 'd' on a normal (non-input) row return
 # with MENU_ACTION=delete and MENU_CHOICE=that row, so the caller can delete it and
-# re-open the menu. Cleared each call.
+# re-open the menu. MENU_ADD=1 ('a' → MENU_ACTION=add), MENU_RENAME=1 ('r' →
+# MENU_ACTION=rename, MENU_CHOICE=row) and MENU_QUIT=1 ('q' cancels) work the same
+# way. All cleared each call.
 MENU_CHOICE=0
 MENU_INPUT=""
 MENU_INPUT_DEFAULT=""
@@ -1136,9 +1162,10 @@ choose_menu() {
     local options=("$@")
     local input_row="${MENU_INPUT_ROW:-0}"
     local buf="${MENU_INPUT_DEFAULT:-}" delete_on="${MENU_DELETE:-0}"
-    local cancel_on="${MENU_CANCEL:-0}"
+    local cancel_on="${MENU_CANCEL:-0}" add_on="${MENU_ADD:-0}" quit_on="${MENU_QUIT:-0}"
+    local rename_on="${MENU_RENAME:-0}" start_sel="${MENU_SELECT:-0}"
     MENU_INPUT_ROW=0; MENU_INPUT=""; MENU_INPUT_DEFAULT=""; MENU_DELETE=0; MENU_ACTION=""
-    MENU_CANCEL=0; MENU_CANCELLED=0
+    MENU_CANCEL=0; MENU_CANCELLED=0; MENU_ADD=0; MENU_QUIT=0; MENU_RENAME=0; MENU_SELECT=0
     # Optional navigable quit row (set MENU_CANCEL=1). Skipped when the last row is an
     # inline input field, which must stay last; 'q' and Ctrl-C cancel there too.
     local quit_idx=-1
@@ -1147,37 +1174,48 @@ choose_menu() {
     fi
     local selected=0 key count=${#options[@]} first=1 i
     local last=$(( ${#options[@]} - 1 ))
+    # Start highlighted on a caller-requested row (MENU_SELECT), clamped in range.
+    [ "$start_sel" -gt 0 ] 2>/dev/null && [ "$start_sel" -lt "$count" ] && selected=$start_sel
     # 'q' or the quit row cancels (sets MENU_CANCELLED). Ctrl-C is handled globally
     # (see _on_interrupt) — it restores the cursor and exits cleanly.
     local cancelled=0
 
     printf '\e[?25l' > /dev/tty                  # hide cursor (block cursor is drawn)
     echo "$prompt" > /dev/tty
+    # redraw=0 coalesces held-key auto-repeat: after a move we skip the redraw when
+    # more input is already queued, so the buffer drains at read speed (no lag).
+    local redraw=1
     while true; do
-        [ -z "$first" ] && printf '\e[%dA' "$count" > /dev/tty
-        first=
-        for i in "${!options[@]}"; do
-            if [ "$input_row" = 1 ] && [ "$i" -eq "$last" ]; then
-                # Input row: label + live buffer, with a reverse-video block cursor
-                # when it's the selected row so it reads as an editable field.
-                if [ "$i" -eq "$selected" ]; then
-                    printf '\e[K  \e[36m❯ %s%s\e[0m\e[7m \e[0m\n' "${options[$i]}" "$buf" > /dev/tty
+        if [ "$redraw" = 1 ]; then
+            [ -z "$first" ] && printf '\e[%dA' "$count" > /dev/tty
+            first=
+            for i in "${!options[@]}"; do
+                if [ "$input_row" = 1 ] && [ "$i" -eq "$last" ]; then
+                    # Input row: label + live buffer, with a reverse-video block cursor
+                    # when it's the selected row so it reads as an editable field.
+                    if [ "$i" -eq "$selected" ]; then
+                        printf '\e[K  \e[36m❯ %s%s\e[0m\e[7m \e[0m\n' "${options[$i]}" "$buf" > /dev/tty
+                    else
+                        printf '\e[K    %s%s\n' "${options[$i]}" "$buf" > /dev/tty
+                    fi
+                elif [ "$i" -eq "$selected" ]; then
+                    printf '\e[K  \e[36m❯ %s\e[0m\n' "${options[$i]}" > /dev/tty
                 else
-                    printf '\e[K    %s%s\n' "${options[$i]}" "$buf" > /dev/tty
+                    printf '\e[K    %s\n' "${options[$i]}" > /dev/tty
                 fi
-            elif [ "$i" -eq "$selected" ]; then
-                printf '\e[K  \e[36m❯ %s\e[0m\n' "${options[$i]}" > /dev/tty
-            else
-                printf '\e[K    %s\n' "${options[$i]}" > /dev/tty
-            fi
-        done
+            done
+        fi
+        redraw=1
         IFS= read -rsn1 key < /dev/tty || true
         if [ "$key" = $'\e' ]; then
-            read -rsn2 key < /dev/tty || true
+            # Short timeout: a lone ESC returns instead of blocking; a real arrow's
+            # "[A"/"[B" bytes are already queued, so this reads them immediately.
+            read -rsn2 -t 0.05 key < /dev/tty || key=""
             case "$key" in
                 '[A'|'OA') selected=$(( (selected - 1 + count) % count )) ;;
                 '[B'|'OB') selected=$(( (selected + 1) % count )) ;;
             esac
+            read -t 0 < /dev/tty 2>/dev/null && redraw=0     # more queued → coalesce
             continue
         fi
         # Editing the input row: printable keys append, Backspace deletes (to
@@ -1185,25 +1223,36 @@ choose_menu() {
         if [ "$input_row" = 1 ] && [ "$selected" -eq "$last" ]; then
             case "$key" in
                 ''|$'\n'|$'\r') MENU_INPUT="$buf"; MENU_CHOICE=$last
-                                printf '\e[?25h' > /dev/tty; return 0 ;;
+                                _drain_tty; printf '\e[?25h' > /dev/tty; return 0 ;;
                 $'\177'|$'\b')  buf="${buf%?}" ;;
                 *)              buf="$buf$key" ;;
             esac
             continue
         fi
         case "$key" in
-            k) selected=$(( (selected - 1 + count) % count )) ;;
-            j) selected=$(( (selected + 1) % count )) ;;
-            q|Q) [ "$cancel_on" = 1 ] && { cancelled=1; break; } ;;
+            k) selected=$(( (selected - 1 + count) % count ))
+               read -t 0 < /dev/tty 2>/dev/null && redraw=0 ;;
+            j) selected=$(( (selected + 1) % count ))
+               read -t 0 < /dev/tty 2>/dev/null && redraw=0 ;;
+            q|Q) { [ "$cancel_on" = 1 ] || [ "$quit_on" = 1 ]; } && { cancelled=1; break; } ;;
+            a|A) if [ "$add_on" = 1 ]; then
+                     MENU_CHOICE=-1; MENU_ACTION=add
+                     _drain_tty; printf '\e[?25h' > /dev/tty; return 0
+                 fi ;;
+            r|R) if [ "$rename_on" = 1 ]; then
+                     MENU_CHOICE=$selected; MENU_ACTION=rename
+                     _drain_tty; printf '\e[?25h' > /dev/tty; return 0
+                 fi ;;
             d|D) if [ "$delete_on" = 1 ]; then
                      MENU_CHOICE=$selected; MENU_ACTION=delete
-                     printf '\e[?25h' > /dev/tty; return 0
+                     _drain_tty; printf '\e[?25h' > /dev/tty; return 0
                  fi ;;
             ''|$'\n'|$'\r')
                 [ "$quit_idx" -ge 0 ] && [ "$selected" -eq "$quit_idx" ] && cancelled=1
                 break ;;
         esac
     done
+    _drain_tty
     printf '\e[?25h' > /dev/tty                   # show cursor
     if [ "$cancelled" = 1 ]; then MENU_CANCELLED=1; MENU_CHOICE=-1; return 0; fi
     MENU_CHOICE=$selected
@@ -1227,30 +1276,37 @@ choose_multi() {
     printf '\e[?25l' > /dev/tty
     echo "$prompt" > /dev/tty
     printf '  \e[2mSpace toggle · a all · Enter confirm · q cancel\e[0m\n' > /dev/tty
+    local redraw=1
     while true; do
-        [ -z "$first" ] && printf '\e[%dA' "$count" > /dev/tty
-        first=
-        for i in "${!options[@]}"; do
-            box="[ ]"; [ "${checked[$i]}" = 1 ] && box="[x]"
-            if [ "$i" -eq "$selected" ]; then
-                printf '\e[K  \e[36m❯ %s %s\e[0m\n' "$box" "${options[$i]}" > /dev/tty
-            else
-                printf '\e[K    %s %s\n' "$box" "${options[$i]}" > /dev/tty
-            fi
-        done
+        if [ "$redraw" = 1 ]; then
+            [ -z "$first" ] && printf '\e[%dA' "$count" > /dev/tty
+            first=
+            for i in "${!options[@]}"; do
+                box="[ ]"; [ "${checked[$i]}" = 1 ] && box="[x]"
+                if [ "$i" -eq "$selected" ]; then
+                    printf '\e[K  \e[36m❯ %s %s\e[0m\n' "$box" "${options[$i]}" > /dev/tty
+                else
+                    printf '\e[K    %s %s\n' "$box" "${options[$i]}" > /dev/tty
+                fi
+            done
+        fi
+        redraw=1
         IFS= read -rsn1 key < /dev/tty
         if [ "$key" = $'\e' ]; then
-            read -rsn2 key < /dev/tty
+            read -rsn2 -t 0.05 key < /dev/tty || key=""
             case "$key" in
                 '[A'|'OA') selected=$(( (selected - 1 + count) % count )) ;;
                 '[B'|'OB') selected=$(( (selected + 1) % count )) ;;
             esac
+            read -t 0 < /dev/tty 2>/dev/null && redraw=0     # coalesce held-key repeat
             continue
         fi
         case "$key" in
             ' ') checked[$selected]=$(( 1 - checked[selected] )) ;;
-            k)   selected=$(( (selected - 1 + count) % count )) ;;
-            j)   selected=$(( (selected + 1) % count )) ;;
+            k)   selected=$(( (selected - 1 + count) % count ))
+                 read -t 0 < /dev/tty 2>/dev/null && redraw=0 ;;
+            j)   selected=$(( (selected + 1) % count ))
+                 read -t 0 < /dev/tty 2>/dev/null && redraw=0 ;;
             a|A) for i in "${!options[@]}"; do checked[$i]=1; done ;;
             ''|$'\n'|$'\r')
                 for i in "${!options[@]}"; do
@@ -1260,6 +1316,7 @@ choose_multi() {
             q|Q) MULTI_CHOICES=(); break ;;
         esac
     done
+    _drain_tty
     printf '\e[?25h' > /dev/tty
 }
 
@@ -1268,12 +1325,16 @@ choose_multi() {
 # input cancels (returns 1). Re-prompts until valid or cancelled.
 FIELD=""
 prompt_field() {
-    local label="$1" re="${2:-.+}" err="${3:-invalid input}"
+    local label="$1" re="${2:-.+}" err="${3:-invalid input}" allow_empty="${4:-0}"
     FIELD=""
     while true; do
-        printf '%s' "$label" > /dev/tty
-        IFS= read -r FIELD < /dev/tty || return 1
-        [ -z "$FIELD" ] && return 1
+        # read -e → readline editing (←/→ to move within the line, etc.); the label
+        # is readline's prompt so its cursor math stays correct, and 2>/dev/tty keeps
+        # the prompt+echo on the terminal even if the script's stderr is redirected.
+        IFS= read -rep "$label" FIELD < /dev/tty 2>/dev/tty || return 1
+        # Empty input cancels — unless allow_empty=1, where it's an accepted value
+        # (e.g. an enter-only scheduled command); cancel there is Ctrl-C / EOF.
+        [ -z "$FIELD" ] && { [ "$allow_empty" = 1 ] && return 0 || return 1; }
         [[ "$FIELD" =~ ^($re)$ ]] && return 0
         printf '  \e[31m%s\e[0m\n' "$err" > /dev/tty
     done
@@ -1293,50 +1354,66 @@ prompt_field() {
 # action prints its wizard below (scrolling), then the list is redrawn fresh.
 M_IDS=(); M_ROWS=(); M_SEL=0
 task_manager() {
-    local title="$1" load_fn="$2" add_fn="$3" del_fn="$4" del_verb="${5:-delete}"
-    local key n i first=1 drawn=0
+    local title="$1" load_fn="$2" add_fn="$3" del_fn="$4" del_verb="${5:-delete}" live="${6:-0}"
+    local key n i first=1 drawn=0 rc redraw=1
     M_SEL=0
     printf '\e[?25l' > /dev/tty                    # hide cursor while navigating
     while true; do
-        M_IDS=(); M_ROWS=()
-        "$load_fn"
-        n=${#M_ROWS[@]}
-        [ "$M_SEL" -ge "$n" ] && M_SEL=$(( n > 0 ? n - 1 : 0 ))
+        # redraw=0 coalesces held-key auto-repeat (see choose_menu): skip the reload
+        # + redraw while more input is queued, so navigation stays snappy under a
+        # held arrow instead of lagging behind a backlog of keystrokes.
+        if [ "$redraw" = 1 ]; then
+            M_IDS=(); M_ROWS=()
+            "$load_fn"
+            n=${#M_ROWS[@]}
+            [ "$M_SEL" -ge "$n" ] && M_SEL=$(( n > 0 ? n - 1 : 0 ))
 
-        # Redraw in place over the previous block (unless drawing fresh).
-        [ "$first" = 0 ] && printf '\e[%dA' "$drawn" > /dev/tty
-        first=0; drawn=0
-        printf '\r\e[K\e[36m%s\e[0m\n' "$title" > /dev/tty; drawn=$((drawn + 1))
-        printf '\r\e[K  \e[2m↑/↓ move · a add · d %s · q quit\e[0m\n' "$del_verb" > /dev/tty; drawn=$((drawn + 1))
-        printf '\r\e[K\n' > /dev/tty; drawn=$((drawn + 1))
-        if [ "$n" -eq 0 ]; then
-            printf '\r\e[K    \e[2m(none yet — press a to add)\e[0m\n' > /dev/tty; drawn=$((drawn + 1))
-        else
-            for i in "${!M_ROWS[@]}"; do
-                if [ "$i" -eq "$M_SEL" ]; then
-                    printf '\r\e[K  \e[36m❯ %s\e[0m\n' "${M_ROWS[$i]}" > /dev/tty
-                else
-                    printf '\r\e[K    %s\n' "${M_ROWS[$i]}" > /dev/tty
-                fi
-                drawn=$((drawn + 1))
-            done
+            # Redraw in place over the previous block (unless drawing fresh).
+            [ "$first" = 0 ] && printf '\e[%dA' "$drawn" > /dev/tty
+            first=0; drawn=0
+            printf '\r\e[K\e[36m%s\e[0m\n' "$title" > /dev/tty; drawn=$((drawn + 1))
+            printf '\r\e[K  \e[2m↑/↓ move · a add · d %s · q quit\e[0m\n' "$del_verb" > /dev/tty; drawn=$((drawn + 1))
+            printf '\r\e[K\n' > /dev/tty; drawn=$((drawn + 1))
+            if [ "$n" -eq 0 ]; then
+                printf '\r\e[K    \e[2m(none yet — press a to add)\e[0m\n' > /dev/tty; drawn=$((drawn + 1))
+            else
+                for i in "${!M_ROWS[@]}"; do
+                    if [ "$i" -eq "$M_SEL" ]; then
+                        printf '\r\e[K  \e[36m❯ %s\e[0m\n' "${M_ROWS[$i]}" > /dev/tty
+                    else
+                        printf '\r\e[K    %s\n' "${M_ROWS[$i]}" > /dev/tty
+                    fi
+                    drawn=$((drawn + 1))
+                done
+            fi
+            printf '\e[J' > /dev/tty        # drop any stale rows below (e.g. a live shrink)
         fi
+        redraw=1
 
-        IFS= read -rsn1 key < /dev/tty
+        # Live screens (wake-claude / schedule-command) refresh the "time left" every
+        # second: a 1s read timeout re-runs the loop (redraw in place) vs blocking.
+        rc=0
+        if [ "$live" = 1 ]; then
+            IFS= read -rsn1 -t 1 key < /dev/tty || rc=$?
+            [ "$rc" -gt 128 ] && continue    # timed out → tick the countdown
+        else
+            IFS= read -rsn1 key < /dev/tty
+        fi
         case "$key" in
             $'\e')
-                read -rsn2 key < /dev/tty
+                read -rsn2 -t 0.05 key < /dev/tty || key=""
                 case "$key" in
                     '[A'|'OA') [ "$n" -gt 0 ] && M_SEL=$(( (M_SEL - 1 + n) % n )) ;;
                     '[B'|'OB') [ "$n" -gt 0 ] && M_SEL=$(( (M_SEL + 1) % n )) ;;
-                esac ;;
-            k) [ "$n" -gt 0 ] && M_SEL=$(( (M_SEL - 1 + n) % n )) ;;
-            j) [ "$n" -gt 0 ] && M_SEL=$(( (M_SEL + 1) % n )) ;;
+                esac
+                read -t 0 < /dev/tty 2>/dev/null && redraw=0 ;;
+            k) [ "$n" -gt 0 ] && M_SEL=$(( (M_SEL - 1 + n) % n ))
+               read -t 0 < /dev/tty 2>/dev/null && redraw=0 ;;
+            j) [ "$n" -gt 0 ] && M_SEL=$(( (M_SEL + 1) % n ))
+               read -t 0 < /dev/tty 2>/dev/null && redraw=0 ;;
             a|A)
                 printf '\e[?25h\n' > /dev/tty
                 ( "$add_fn" ) || true
-                printf '\n\e[2mPress any key to continue…\e[0m' > /dev/tty
-                read -rsn1 _ < /dev/tty
                 printf '\e[?25l\n' > /dev/tty
                 first=1 ;;                          # redraw fresh below the wizard
             d|D)
@@ -1345,8 +1422,6 @@ task_manager() {
                     local ans=""; IFS= read -r ans < /dev/tty || true
                     if [[ "$ans" == [Yy]* ]]; then
                         ( "$del_fn" "${M_IDS[$M_SEL]}" ) || true
-                        printf '\n\e[2mPress any key to continue…\e[0m' > /dev/tty
-                        read -rsn1 _ < /dev/tty
                     fi
                     printf '\e[?25l\n' > /dev/tty
                     first=1
@@ -1354,6 +1429,7 @@ task_manager() {
             q|Q|''|$'\n'|$'\r') break ;;
         esac
     done
+    _drain_tty
     printf '\e[?25h' > /dev/tty                     # restore cursor; leave list in place
 }
 
@@ -1418,60 +1494,149 @@ _confirm_kill_sessions() {
     [[ "$ans" == [Yy]* ]]
 }
 
+# Prompt for a NEW session name (Enter alone accepts the suggested default). Sets
+# NEW_SESSION to a validated, unique name; returns 1 only on read failure (EOF).
+# tmux forbids '.' and ':', so we constrain to letters/digits/-/_ and auto-suffix
+# a collision (box, box-2, …). $1 = the suggested default name.
+NEW_SESSION=""
+_prompt_new_session() {
+    local default_name="$1" name base k
+    NEW_SESSION=""
+    # read -e → readline line editing (←/→ to edit, etc.); prompt kept plain so
+    # readline's cursor math stays correct; 2>/dev/tty keeps it on the terminal.
+    IFS= read -rep "New session name [$default_name]: " name < /dev/tty 2>/dev/tty || return 1
+    name="${name:-$default_name}"
+    if ! [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]]; then
+        log_warn "Invalid name '$name' (letters, digits, - or _); using '$default_name'."
+        name="$default_name"
+    fi
+    # '=' forces an EXACT match — a bare '-t box' would prefix-match 'box-2' and
+    # wrongly report a collision.
+    base="$name"; k=2
+    while container_tmux has-session -t "=$name" 2>/dev/null; do
+        name="$base-$k"; k=$((k + 1))
+    done
+    NEW_SESSION="$name"
+    return 0
+}
+
+# Rename a live tmux session and repoint any schedule-command timers targeting it
+# (their unit files are root-owned in the rootfs, so the helper does the repoint).
+# $1 = current name. Prompts for the new one; no-op on empty/unchanged/invalid/dup.
+# Sets KEEP_SESSION to the name the caller should keep highlighted afterwards (the
+# new name on success, the old one on any no-op) so the picker doesn't jump away.
+KEEP_SESSION=""
+_rename_session() {
+    local old="$1" new
+    KEEP_SESSION="$old"
+    # -i pre-fills the field with the current name so you EDIT it instead of retyping
+    # (readline's Ctrl-w / Ctrl-u clear a word / the whole line); Enter unchanged = no-op.
+    IFS= read -rep "New name for '$old': " -i "$old" new < /dev/tty 2>/dev/tty || return 0
+    new="${new:-$old}"
+    [ "$new" = "$old" ] && { log_info "Name unchanged."; return 0; }
+    if ! [[ "$new" =~ ^[A-Za-z0-9_-]+$ ]]; then
+        log_warn "Invalid name '$new' (letters, digits, - or _ only)."; return 0
+    fi
+    # '=' forces an exact match so 'usa-trip' isn't reported as taken just because
+    # 'usa-trip0' exists (a bare target prefix-matches).
+    if container_tmux has-session -t "=$new" 2>/dev/null; then
+        log_warn "A session named '$new' already exists."; return 0
+    fi
+    container_tmux rename-session -t "=$old" "$new" 2>/dev/null \
+        || { log_warn "Rename failed (is '$old' still live?)."; return 0; }
+    _helper_current && run_priv sched-rename "$old" "$new" >/dev/null 2>&1 || true
+    KEEP_SESSION="$new"
+    log_info "Renamed session '$old' → '$new' (its scheduled commands were repointed)."
+}
+
 # Pick a tmux session inside the running container, then exec an attached shell.
-# 'd' on an existing row kills that session (after y/N) and cleans up its scheduled
-# commands (req 5/14), then re-opens the picker.
+# 'a' creates a new session (name prompt), 'd' kills the highlighted one (after y/N)
+# and cleans up its scheduled commands (req 5/14), 'q'/Ctrl-C quits. With no live
+# sessions yet, we skip the picker and go straight to creating one.
+# $1 (optional): a target session name (`waterbox start <name>`) — attach it if live,
+# else create it, with no picker at all.
 attach_session() {
     # GUI env reaches the shell via the in-box /etc/waterbox/gui-env (sourced by
     # .zshrc), so nothing to forward here beyond an optional API key.
-    local target sessions=() s name n dn default_name
+    local want="${1:-}" target sessions=() s dn default_name keep_name="" ki
+    if [ -n "$want" ]; then
+        [[ "$want" =~ ^[A-Za-z0-9._-]+$ ]] \
+            || log_error "Invalid session name '$want' (letters, digits, . _ - only)."
+        if _live_sessions | grep -qxF "$want"; then log_info "Attaching to '$want'."
+        else log_info "Creating new session '$want'."; fi
+        exec sudo "$HELPER_PATH" shell "$want" "${ANTHROPIC_API_KEY:-}"
+    fi
     while true; do
         sessions=()
         while IFS= read -r s; do
             [ -n "$s" ] && sessions+=("$s")
         done < <(_live_sessions)
 
-        # Prefill "+ new session" with the next free auto name (box, box-2, …).
+        # Next free auto name (box, box-2, …) suggested for a brand-new session.
         default_name="$TMUX_SESSION"; dn=2
         while printf '%s\n' "${sessions[@]}" | grep -Fxq "$default_name"; do
             default_name="$TMUX_SESSION-$dn"; dn=$((dn + 1))
         done
 
-        MENU_INPUT_ROW=1
-        MENU_INPUT_DEFAULT="$default_name"
-        MENU_DELETE=1
-        choose_menu "Select a session (↑/↓ · Enter attach · d kill · Ctrl-C quit):" \
-            "${sessions[@]}" "+ new session: "
+        # No live sessions: nothing to pick — create the first one directly.
+        if [ "${#sessions[@]}" -eq 0 ]; then
+            _prompt_new_session "$default_name" || return 0
+            target="$NEW_SESSION"; log_info "Creating new session '$target'."
+            break
+        fi
 
-        # 'd' on an existing session → confirm, kill it + its schedules, re-loop.
-        if [ "$MENU_ACTION" = delete ] && [ "$MENU_CHOICE" -lt "${#sessions[@]}" ]; then
-            local victim="${sessions[$MENU_CHOICE]}" ans
+        # Re-open on the row we were just acting on (after a rename/kill), not row 0.
+        MENU_SELECT=0
+        if [ -n "$keep_name" ]; then
+            for ki in "${!sessions[@]}"; do
+                [ "${sessions[$ki]}" = "$keep_name" ] && { MENU_SELECT=$ki; break; }
+            done
+            keep_name=""
+        fi
+
+        MENU_DELETE=1; MENU_ADD=1; MENU_QUIT=1; MENU_RENAME=1
+        choose_menu "Select a session (↑/↓ move · Enter attach · a new · r rename · d kill · q quit):" \
+            "${sessions[@]}"
+
+        [ "$MENU_CANCELLED" = 1 ] && return 0        # 'q'/Ctrl-C → leave the box running
+
+        # 'a' → name + create a new session.
+        if [ "$MENU_ACTION" = add ]; then
+            _prompt_new_session "$default_name" || continue
+            target="$NEW_SESSION"; log_info "Creating new session '$target'."
+            break
+        fi
+
+        # 'r' on a session → rename it (and repoint its scheduled commands), re-loop
+        # with the highlight kept on that session (new name on success, old on no-op).
+        if [ "$MENU_ACTION" = rename ]; then
+            _rename_session "${sessions[$MENU_CHOICE]}"
+            keep_name="$KEEP_SESSION"
+            continue
+        fi
+
+        # 'd' on a session → confirm, kill it + its schedules, re-loop. Keep the
+        # highlight on a neighbour when it dies, or on the session itself if kept.
+        if [ "$MENU_ACTION" = delete ]; then
+            local victim="${sessions[$MENU_CHOICE]}" ans neighbor="" ci=$MENU_CHOICE
+            if [ $((ci + 1)) -lt "${#sessions[@]}" ]; then neighbor="${sessions[$((ci + 1))]}"
+            elif [ $((ci - 1)) -ge 0 ]; then neighbor="${sessions[$((ci - 1))]}"; fi
             printf "Kill session '%s' and its scheduled commands? [y/N] " "$victim" > /dev/tty
             IFS= read -r ans < /dev/tty || true
             if [[ "$ans" == [Yy]* ]]; then
-                container_tmux kill-session -t "$victim" 2>/dev/null || true
+                container_tmux kill-session -t "=$victim" 2>/dev/null || true
                 _remove_session_schedules "$victim"
                 log_info "Killed session '$victim'."
+                keep_name="$neighbor"
+            else
+                keep_name="$victim"
             fi
             continue
         fi
 
-        if [ "$MENU_CHOICE" -lt "${#sessions[@]}" ]; then
-            target="${sessions[$MENU_CHOICE]}"
-            log_info "Attaching to '$target'."
-        else
-            # Typed name from the inline input row (tmux forbids '.' and ':').
-            name="$MENU_INPUT"
-            if [ -n "$name" ] && ! [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]]; then
-                log_warn "Invalid name '$name' (use letters, digits, - or _); auto-naming instead."
-                name=""
-            fi
-            target="${name:-$TMUX_SESSION}"; n=2
-            while printf '%s\n' "${sessions[@]}" | grep -Fxq "$target"; do
-                target="${name:-$TMUX_SESSION}-$n"; n=$((n + 1))
-            done
-            log_info "Creating new session '$target'."
-        fi
+        # Enter on an existing session → attach.
+        target="${sessions[$MENU_CHOICE]}"
+        log_info "Attaching to '$target'."
         break
     done
 
@@ -1485,7 +1650,7 @@ attach_session() {
 # The veth address/NAT/forwarding rules (DNAT 10.20.30.1 -> 127.0.0.1 so host
 # loopback services are reachable inside; SOURCE-based MASQUERADE that survives a
 # VPN route flip; FORWARD inserted ahead of killswitch DROPs) now live in the root
-# helper's net_up/net_down — the same code path the offline wake uses — so no broad
+# helper's net_up/net_down — the same code path the unattended wake uses — so no broad
 # sudo is needed. The 'boot' verb runs net_up after the container is up; 'down'
 # runs net_down. These wrappers just reach the helper for the stop/reset paths.
 teardown_host_network() {
@@ -1547,6 +1712,7 @@ require_host_deps() {
 
 # --- Start: boot if needed, attach a shell ---
 start_sandbox() {
+    local want="${1:-}"        # optional target session (`waterbox start <name>`)
     require_host_deps
     bootstrap_sandbox
     ensure_host_privs    # immutable helper (narrow sudoers) + completion; no manual 'setup'
@@ -1598,7 +1764,7 @@ start_sandbox() {
         fi
     fi
 
-    attach_session
+    attach_session "$want"
 }
 
 restart_sandbox() {
@@ -1753,11 +1919,23 @@ refresh_config() {
         || log_error "No built sandbox to refresh. Run 'waterbox start' first."
     log_info "Re-applying in-box config to $JAIL_ROOT ..."
     configure_dotfiles
+    configure_hosts          # box→127.0.0.1 + host reachable by 'host' and its hostname
     write_claude_env_zsh
     write_task_helper
     _write_config_version
-    log_success "Config refreshed. Start a NEW session to pick up the prompt, menu, and welcome changes."
-    is_running && log_info "Already-open shells keep their old config until you open a fresh session." || true
+    # tmux settings (key bindings, hooks, status bar) are server-global and only read
+    # at server start — so push the refreshed config into the already-running server
+    # now (no restart needed for e.g. Ctrl-b g), and seed @wb_name on existing sessions
+    # so renaming one repoints its scheduled commands too.
+    if is_running; then
+        local _s
+        container_tmux source-file "/home/$USER_NAME/.tmux.conf" >/dev/null 2>&1 || true
+        while IFS= read -r _s; do
+            [ -n "$_s" ] && container_tmux set-option -t "$_s" @wb_name "$_s" >/dev/null 2>&1 || true
+        done < <(container_tmux list-sessions -F '#{session_name}' 2>/dev/null || true)
+    fi
+    log_success "Config refreshed. tmux keys/hooks are live now; open a NEW session for the prompt, menu & welcome."
+    is_running && log_info "Already-open shells keep their old prompt/welcome until you open a fresh session." || true
 }
 
 # Enable `waterbox` Tab-completion in the invoking user's ~/.zshrc. The snippet is
@@ -1853,7 +2031,7 @@ WB_CFG="$wb_home/.waterbox"
 # Charset-limited AND never "." / ".." (so a name can't traverse out of its dir).
 _valid_profile() { case "$1" in ''|.|..|*[!A-Za-z0-9._-]*) return 1 ;; *) return 0 ;; esac; }
 _valid_id()      { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
-_valid_time()    { [[ "$1" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; }
+_valid_time()    { [[ "$1" =~ ^([01]?[0-9]|2[0-3]):[0-5][0-9]$ ]]; }
 _valid_session() { case "$1" in ''|.|..|*[!A-Za-z0-9._-]*) return 1 ;; *) return 0 ;; esac; }
 _valid_schedid() { case "$1" in schd-com-*) _valid_id "${1#schd-com-}" ;; *) return 1 ;; esac; }
 
@@ -1891,7 +2069,7 @@ net_down() {
 }
 
 # Minimal boot for an unattended wake: NO shares, NO GUI — just the base container
-# + network, so a quota primer can reach Anthropic even while you're offline.
+# + network, so a quota primer can reach Anthropic while you're away (box was off).
 boot_min() {
     running && return 0
     [ -f "$JAIL_ROOT/.waterbox-ready" ] || { echo "helper: rootfs not built at $JAIL_ROOT"; exit 3; }
@@ -2191,6 +2369,26 @@ case "$verb" in
         id="$1"; _valid_schedid "$id" || { echo "helper: bad id"; exit 2; }
         _sched_remove "$id"
         ;;
+    sched-rename)
+        # Repoint every schedule-command timer aimed at session <old> to <new> by
+        # rewriting it in place (same id keeps its .msg command). Time-of-day + mode
+        # are pulled from the timer's own "# waterbox:" line; _sched_install re-fixes
+        # User= and the ExecStart shape, so nothing new can be smuggled in.
+        old="$1"; new="$2"
+        _valid_session "$old" || { echo "helper: bad session"; exit 2; }
+        _valid_session "$new" || { echo "helper: bad session"; exit 2; }
+        for f in "$JAIL_ROOT$TASK_ETC"/waterbox-schd-com-*.timer; do
+            [ -e "$f" ] || continue
+            info=$(grep -m1 '^# waterbox:' "$f" 2>/dev/null | sed 's/^# waterbox: //')
+            [ "${info%% @ *}" = "$old" ] || continue
+            rest="${info#* @ }"                     # "<time> <mode>"
+            time="${rest%% *}"; mode="${rest##* }"
+            _valid_time "$time" || continue
+            [ "$mode" = once ] || [ "$mode" = daily ] || continue
+            base=$(basename "$f" .timer); id="${base#waterbox-}"
+            _sched_install "$id" "$new" "$time" "$mode"
+        done
+        ;;
     unshare)
         name="$1"
         case "$name" in ''|.|..|*/*) echo "helper: bad name"; exit 2 ;; esac
@@ -2393,8 +2591,13 @@ case "$kind" in
         sess="$1"; msgfile="$2"
         [ -n "$sess" ] && [ -f "$msgfile" ] || exit 0
         export TMUX_TMPDIR=/tmp
-        tmux has-session -t "$sess" 2>/dev/null || exit 0
-        tmux send-keys -t "$sess" -l -- "$(cat "$msgfile")"
+        # Only type into a session whose name matches EXACTLY, so a command for a
+        # since-gone 'box' never lands in 'box-2'. grep -Fx is a whole-line exact
+        # match that works on every tmux version — send-keys does NOT accept the '='
+        # exact-target prefix, so we must not rely on it here.
+        tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -qxF "$sess" || exit 0
+        msg=$(cat "$msgfile")
+        [ -n "$msg" ] && tmux send-keys -t "$sess" -l -- "$msg"   # empty command → just Enter
         sleep 0.3
         tmux send-keys -t "$sess" Enter
         ;;
@@ -2416,6 +2619,33 @@ case "$kind" in
             removed=1
         done
         [ "$removed" = 1 ] && sudo systemctl daemon-reload >/dev/null 2>&1 || true
+        ;;
+    rename-session)
+        # Fired from the tmux 'session-renamed' hook with the NEW name. @wb_name holds
+        # the previous name (seeded at creation / updated here), so we can repoint every
+        # schedule-command timer old -> new. Needs root for the units (box gives sudo).
+        new="$1"
+        [ -n "$new" ] || exit 0
+        # NB: show-/set-option don't take the '=' exact prefix — but $new is an exact,
+        # unique session name, so plain -t resolves it (exact match wins over prefix).
+        old=$(tmux show-options -qv -t "$new" @wb_name 2>/dev/null)
+        tmux set-option -t "$new" @wb_name "$new" 2>/dev/null || true
+        [ -n "$old" ] && [ "$old" != "$new" ] || exit 0
+        # Only repoint between names allowed in units (this also guards the seds).
+        case "$old" in ''|*[!A-Za-z0-9._-]*) exit 0 ;; esac
+        case "$new" in ''|*[!A-Za-z0-9._-]*) exit 0 ;; esac
+        changed=0
+        for f in /etc/systemd/system/waterbox-schd-com-*.timer; do
+            [ -e "$f" ] || continue
+            info=$(grep -m1 '^# waterbox:' "$f" 2>/dev/null | sed 's/^# waterbox: //')
+            [ "${info%% @ *}" = "$old" ] || continue
+            base=$(basename "$f" .timer)
+            sudo sed -i "s|^# waterbox: $old @|# waterbox: $new @|" "$f" 2>/dev/null || true
+            sudo sed -i "s|waterbox-fire send $old |waterbox-fire send $new |" \
+                "/etc/systemd/system/$base.service" 2>/dev/null || true
+            changed=1
+        done
+        [ "$changed" = 1 ] && sudo systemctl daemon-reload >/dev/null 2>&1 || true
         ;;
 esac
 FIRE
@@ -2449,7 +2679,9 @@ _sched_remove() {
 # message file ($TASK_MSG_DIR/<id>.msg) holds the command to show and clean up.
 TL_IDS=(); TL_ROWS=()
 _timer_collect() {
-    local prefix="$1" hasmsg="$2" f b id info expr next left cmd msg
+    local prefix="$1" hasmsg="$2" f b id info expr cmd msg now shown
+    local -a t_ids=() t_rows=() t_keys=()
+    now=$(date +%s)
     TL_IDS=(); TL_ROWS=()
     for f in "$JAIL_ROOT$TASK_ETC/${prefix}"*.timer; do
         [ -e "$f" ] || continue
@@ -2457,20 +2689,26 @@ _timer_collect() {
         info=$(grep -m1 '^# waterbox:' "$f" 2>/dev/null | sed 's/^# waterbox: //')
         expr=$(grep -m1 '^OnCalendar=' "$f" 2>/dev/null | sed 's/^OnCalendar=//')
         msg="$JAIL_ROOT$TASK_MSG_DIR/${id}.msg"
-        left=""
-        if command -v systemd-analyze >/dev/null 2>&1 && [ -n "$expr" ]; then
-            next=$(systemd-analyze calendar "$expr" 2>/dev/null || true)
-            if printf '%s' "$next" | grep -q 'Next elapse: *never'; then
-                _sched_remove "$id"    # elapsed one-shot: garbage-collect
-                continue
-            fi
-            left=$(printf '%s' "$next" | sed -n 's/.*From now: *//p' | head -n1)
+        _timer_next "tc-$id" "$expr" "$now"
+        [ "$_TIMER_GC" = 1 ] && { _sched_remove "$id"; continue; }   # elapsed one-shot
+        cmd=""; shown=""
+        if [ "$hasmsg" = 1 ] && [ -f "$msg" ]; then
+            cmd=$(cat "$msg")
+            [ -n "$cmd" ] && shown="$cmd" || shown="<enter>"   # empty command = just Enter
         fi
-        cmd=""
-        [ "$hasmsg" = 1 ] && [ -f "$msg" ] && cmd=$(cat "$msg")
-        TL_IDS+=("$id")
-        TL_ROWS+=("${info}${cmd:+   ->  $cmd}${left:+   [$left]}")
+        t_ids+=("$id")
+        t_rows+=("${info}${shown:+   ->  $shown}${_TIMER_LEFT:+   [$_TIMER_LEFT]}")
+        # key = <session>\t<epoch>\t<index>; session is the 1st token of the info line.
+        # Index is plain %d (a zero-padded "0008" would be misread as octal).
+        t_keys+=("$(printf '%s\t%011d\t%d' "${info%% @ *}" "${_TIMER_EPOCH:-99999999999}" "$(( ${#t_ids[@]} - 1 ))")")
     done
+    [ "${#t_ids[@]}" -eq 0 ] && return 0
+    # Sort by SESSION then time-left (each session's commands grouped, soonest first).
+    local idx
+    while IFS=$'\t' read -r _ _ idx; do
+        [ -n "$idx" ] || continue
+        TL_IDS+=("${t_ids[$idx]}"); TL_ROWS+=("${t_rows[$idx]}")
+    done < <(printf '%s\n' "${t_keys[@]}" | sort -t $'\t' -k1,1 -k2,2n)
 }
 
 # Print the collected timers as a bulleted "  - <id>   <detail>" list.
@@ -2489,8 +2727,8 @@ _timer_list() {
 
 # `wake-claude` — start a profile's fresh 5-hour quota window (default daily).
 # Backed by HOST root systemd timers (installed via the helper) that call
-# `waterbox-helper wake <profile>`, so a wake fires even while the box is stopped
-# and you're offline — the helper boots the box, primes, and powers it back off.
+# `waterbox-helper wake <profile>`, so a wake fires unattended even while the box is
+# powered off — the helper boots the box, primes, and powers it back off.
 HOSTWAKE_GLOB="/etc/systemd/system/waterbox-hostwake-"
 
 # Next free integer id across the host wake timers (readable without sudo; 0644).
@@ -2505,11 +2743,62 @@ _hostwake_next_id() {
     echo $((max + 1))
 }
 
+# Human "time left" from a second count. Seconds are only shown in the final 10
+# minutes (< 600s) — that's when a live screen visibly ticks each second; above
+# that it's minute-granular (a held countdown doesn't flicker every second).
+_fmt_left() {
+    local s=$1
+    [ "$s" -lt 0 ] && s=0
+    local d=$(( s / 86400 )) h=$(( (s % 86400) / 3600 )) m=$(( (s % 3600) / 60 )) sec=$(( s % 60 ))
+    if   [ "$s" -lt 600 ]; then
+        if [ "$m" -gt 0 ]; then printf '%dm %02ds' "$m" "$sec"
+        else                    printf '%ds' "$sec"; fi
+    elif [ "$d" -gt 0 ]; then printf '%dd %dh %02dm' "$d" "$h" "$m"
+    elif [ "$h" -gt 0 ]; then printf '%dh %02dm' "$h" "$m"
+    else                      printf '%dm' "$m"; fi
+}
+
+# Shared next-elapse resolver for the live timer screens (wake-claude + schedule-
+# command show "time left" identically through this). Given a cache key $1, an
+# OnCalendar expression $2, and now=$3 (epoch), it sets:
+#   _TIMER_EPOCH  next-elapse epoch ("" if none / unresolvable)
+#   _TIMER_LEFT   human "time left" via _fmt_left ("" when there's no epoch)
+#   _TIMER_GC     1 when the calendar will never fire again (caller garbage-collects)
+# The epoch is cached under $1 in _NEXT_EPOCH so the 1s live refresh doesn't re-spawn
+# systemd-analyze every tick — only when the cached elapse has already passed.
+declare -A _NEXT_EPOCH
+_TIMER_EPOCH=""; _TIMER_LEFT=""; _TIMER_GC=0
+_timer_next() {
+    local key="$1" expr="$2" now="$3" next nutc epoch
+    _TIMER_EPOCH=""; _TIMER_LEFT=""; _TIMER_GC=0
+    epoch="${_NEXT_EPOCH[$key]:-}"
+    if [ -z "$epoch" ] || [ "$now" -ge "$epoch" ]; then
+        epoch=""
+        if command -v systemd-analyze >/dev/null 2>&1 && [ -n "$expr" ]; then
+            next=$(systemd-analyze calendar "$expr" 2>/dev/null || true)
+            if printf '%s' "$next" | grep -q 'Next elapse: *never'; then
+                unset "_NEXT_EPOCH[$key]"; _TIMER_GC=1; return 0
+            fi
+            nutc=$(printf '%s' "$next" | sed -n 's/.*(in UTC): *//p' | head -n1)
+            nutc="${nutc#* }"                       # drop the leading weekday word
+            [ -n "$nutc" ] && epoch=$(date -d "$nutc" +%s 2>/dev/null || true)
+        fi
+        [ -n "$epoch" ] && _NEXT_EPOCH[$key]="$epoch"
+    fi
+    _TIMER_EPOCH="$epoch"
+    [ -n "$epoch" ] && _TIMER_LEFT=$(_fmt_left $(( epoch - now )))
+    return 0
+}
+
 # Fill HW_IDS ("wake-N") + HW_ROWS ("<profile @ time mode>[  [time-left]]") from the
-# host wake timers. Garbage-collects elapsed one-shots (needs the helper present).
+# host wake timers, sorted by PROFILE then time-left (each profile's wakes grouped,
+# soonest first). Garbage-collects elapsed one-shots (needs the helper present). The
+# next-elapse epoch + "time left" come from _timer_next (cached, second-granular).
 HW_IDS=(); HW_ROWS=()
 _hostwake_collect() {
-    local f n info expr next left
+    local now f n info expr
+    local -a t_ids=() t_rows=() t_keys=()
+    now=$(date +%s)
     HW_IDS=(); HW_ROWS=()
     for f in "$HOSTWAKE_GLOB"*.timer; do
         [ -e "$f" ] || continue
@@ -2517,18 +2806,24 @@ _hostwake_collect() {
         case "$n" in ''|*[!0-9]*) continue ;; esac
         info=$(grep -m1 '^# waterbox:' "$f" 2>/dev/null | sed 's/^# waterbox: //')
         expr=$(grep -m1 '^OnCalendar=' "$f" 2>/dev/null | sed 's/^OnCalendar=//')
-        left=""
-        if command -v systemd-analyze >/dev/null 2>&1 && [ -n "$expr" ]; then
-            next=$(systemd-analyze calendar "$expr" 2>/dev/null || true)
-            if printf '%s' "$next" | grep -q 'Next elapse: *never'; then
-                _helper_current && run_priv remove-host-wake "$n" >/dev/null 2>&1 || true
-                continue
-            fi
-            left=$(printf '%s' "$next" | sed -n 's/.*From now: *//p' | head -n1)
+        _timer_next "hw-$n" "$expr" "$now"
+        if [ "$_TIMER_GC" = 1 ]; then           # elapsed one-shot: garbage-collect
+            _helper_current && run_priv remove-host-wake "$n" >/dev/null 2>&1 || true
+            continue
         fi
-        HW_IDS+=("wake-$n")
-        HW_ROWS+=("${info}${left:+   [$left]}")
+        t_ids+=("wake-$n")
+        t_rows+=("${info}${_TIMER_LEFT:+   [$_TIMER_LEFT]}")
+        # key = <profile>\t<epoch>\t<index-into-t_ids>; profile is the 1st token of
+        # "<profile> @ <time> <mode>". Missing epoch sorts last within the profile.
+        # Index is plain %d (no zero-pad — a padded "0008" would be read as octal).
+        t_keys+=("$(printf '%s\t%011d\t%d' "${info%% @ *}" "${_TIMER_EPOCH:-99999999999}" "$(( ${#t_ids[@]} - 1 ))")")
     done
+    [ "${#t_ids[@]}" -eq 0 ] && return 0
+    local idx
+    while IFS=$'\t' read -r _ _ idx; do
+        [ -n "$idx" ] || continue
+        HW_IDS+=("${t_ids[$idx]}"); HW_ROWS+=("${t_rows[$idx]}")
+    done < <(printf '%s\n' "${t_keys[@]}" | sort -t $'\t' -k1,1 -k2,2n)
 }
 
 manage_wake_claude() {
@@ -2539,8 +2834,9 @@ manage_wake_claude() {
             [ -n "$profile" ] && [ -n "$time" ] \
                 || log_error "Usage: waterbox wake-claude <profile> <HH:MM> [once|daily]"
             [[ "$profile" =~ ^[A-Za-z0-9._-]+$ ]] || log_error "Invalid profile name: '$profile'."
-            [[ "$time" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] \
+            [[ "$time" =~ ^([01]?[0-9]|2[0-3]):[0-5][0-9]$ ]] \
                 || log_error "Time must be HH:MM (24-hour), got '$time'."
+            time=$(printf '%02d:%s' "$((10#${time%%:*}))" "${time#*:}")   # 9:30 -> 09:30
             [ "$mode" = once ] || [ "$mode" = daily ] \
                 || log_error "Mode must be 'once' or 'daily', got '$mode'."
             [ -d "$JAIL_ROOT/home/$USER_NAME/.claude-env/$profile" ] \
@@ -2548,7 +2844,7 @@ manage_wake_claude() {
             ensure_helper
             local n; n=$(_hostwake_next_id)
             run_priv install-host-wake "$n" "$profile" "$time" "$mode"
-            log_success "wake-claude 'wake-$n' set: $mode at $time for '$profile' — fires even while the box is stopped and you're offline."
+            log_success "wake-claude 'wake-$n' set: $mode at $time for '$profile' — fires unattended even while the box is powered off."
             ;;
         del|rm)
             local id="$1" n
@@ -2580,18 +2876,24 @@ manage_schedule() {
     local action="$1"; shift || true
     case "$action" in
         add)
-            local session="$1" time="$2" mode command
-            if [ "$3" = once ] || [ "$3" = daily ]; then mode="$3"; command="$4"
-            else mode="once"; command="$3"; fi
-            [ -n "$session" ] && [ -n "$time" ] && [ -n "$command" ] \
-                || log_error "Usage: waterbox schedule-command <session> <HH:MM> [once|daily] \"<command>\""
+            # The command may be an explicit "" — that means "just send Enter". Use the
+            # arg COUNT (not -n) to tell an empty command apart from a missing one.
+            local nargs=$# session="$1" time="$2" mode command have_cmd=0
+            if [ "$3" = once ] || [ "$3" = daily ]; then
+                mode="$3"; command="$4"; [ "$nargs" -ge 4 ] && have_cmd=1
+            else
+                mode="once"; command="$3"; [ "$nargs" -ge 3 ] && have_cmd=1
+            fi
+            [ -n "$session" ] && [ -n "$time" ] && [ "$have_cmd" = 1 ] \
+                || log_error "Usage: waterbox schedule-command <session> <HH:MM> [once|daily] \"<command>\"  (\"\" sends just Enter)"
             [[ "$session" =~ ^[A-Za-z0-9._-]+$ ]] || log_error "Invalid session name: '$session'."
-            [[ "$time" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] \
+            [[ "$time" =~ ^([01]?[0-9]|2[0-3]):[0-5][0-9]$ ]] \
                 || log_error "Time must be HH:MM (24-hour), got '$time'."
+            time=$(printf '%02d:%s' "$((10#${time%%:*}))" "${time#*:}")   # 9:30 -> 09:30
             [ "$mode" = once ] || [ "$mode" = daily ] \
                 || log_error "Mode must be 'once' or 'daily', got '$mode'."
             is_running || log_error "The box must be running to schedule into a live session ('waterbox start' first)."
-            container_tmux has-session -t "$session" 2>/dev/null \
+            container_tmux has-session -t "=$session" 2>/dev/null \
                 || log_error "No live session '$session'. Start it and check 'waterbox status'."
             local id
             id="schd-com-$(_next_task_id waterbox-schd-com-)"
@@ -2599,7 +2901,7 @@ manage_schedule() {
             # timer units into the rootfs and starts them.
             printf '%s' "$command" | run_priv sched-msg "$id"
             run_priv sched-install "$id" "$session" "$time" "$mode"
-            log_success "schedule-command '$id' set: '$command' $mode at $time into session '$session'."
+            log_success "schedule-command '$id' set: '${command:-<enter>}' $mode at $time into session '$session'."
             ;;
         del|rm)
             local id="$1"
@@ -2633,8 +2935,8 @@ _list_profiles() {
 # Shared wizard step: typed HH:MM (validated) + once/daily menu.
 # Sets AW_TIME / AW_MODE in the caller's scope; returns 1 on cancel.
 _wizard_when() {
-    prompt_field "Time (HH:MM): " '([01][0-9]|2[0-3]):[0-5][0-9]' \
-        "use 24-hour HH:MM, e.g. 07:00" || return 1
+    prompt_field "Time (HH:MM): " '([01]?[0-9]|2[0-3]):[0-5][0-9]' \
+        "use 24-hour HH:MM, e.g. 07:00 (or 7:00)" || return 1
     AW_TIME="$FIELD"
     MENU_CANCEL=1
     choose_menu "When:" once daily
@@ -2651,19 +2953,26 @@ wake_load() {
     done
 }
 wake_add() {
-    local profiles=() p profile AW_TIME AW_MODE
-    while IFS= read -r p; do [ -n "$p" ] && profiles+=("$p"); done < <(_list_profiles)
-    [ "${#profiles[@]}" -gt 0 ] \
-        || { log_warn "No Claude profiles yet — create one with 'claude-env' inside the box."; return 0; }
-    MENU_CANCEL=1
-    choose_menu "Profile to wake:" "${profiles[@]}"
-    [ "$MENU_CANCELLED" = 1 ] && { log_info "Cancelled."; return 0; }
-    profile="${profiles[$MENU_CHOICE]}"   # capture before _wizard_when reuses MENU_CHOICE
+    local profile="${1:-}" profiles=() p AW_TIME AW_MODE
+    if [ -n "$profile" ]; then
+        # Pre-seeded from the CLI (`waterbox wake-claude <profile>`): skip the picker
+        # and jump straight to asking time + when.
+        [ -d "$JAIL_ROOT/home/$USER_NAME/.claude-env/$profile" ] \
+            || log_error "No such Claude profile: '$profile'. Create it with 'claude-env' inside the box."
+    else
+        while IFS= read -r p; do [ -n "$p" ] && profiles+=("$p"); done < <(_list_profiles)
+        [ "${#profiles[@]}" -gt 0 ] \
+            || { log_warn "No Claude profiles yet — create one with 'claude-env' inside the box."; return 0; }
+        MENU_CANCEL=1
+        choose_menu "Profile to wake:" "${profiles[@]}"
+        [ "$MENU_CANCELLED" = 1 ] && { log_info "Cancelled."; return 0; }
+        profile="${profiles[$MENU_CHOICE]}"   # capture before _wizard_when reuses MENU_CHOICE
+    fi
     _wizard_when || { log_info "Cancelled."; return 0; }
     manage_wake_claude add "$profile" "$AW_TIME" "$AW_MODE"
 }
 wake_del() { manage_wake_claude del "$1"; }
-wake_manager() { task_manager "Quota wakes (wake-claude)" wake_load wake_add wake_del; }
+wake_manager() { task_manager "Quota wakes (wake-claude)" wake_load wake_add wake_del delete 1; }
 
 sched_load() {
     _timer_collect "waterbox-schd-com-" 1
@@ -2674,22 +2983,31 @@ sched_load() {
 }
 sched_add() {
     is_running || { log_warn "The box must be running to schedule into a live session."; return 0; }
-    local sessions=() s session AW_TIME AW_MODE command
-    while IFS= read -r s; do [ -n "$s" ] && sessions+=("$s"); done \
-        < <(container_tmux list-sessions -F '#{session_name}' 2>/dev/null | sort)
-    [ "${#sessions[@]}" -gt 0 ] \
-        || { log_warn "No live sessions — start one first ('waterbox' → new session)."; return 0; }
-    MENU_CANCEL=1
-    choose_menu "Target session:" "${sessions[@]}"
-    [ "$MENU_CANCELLED" = 1 ] && { log_info "Cancelled."; return 0; }
-    session="${sessions[$MENU_CHOICE]}"
+    local session="${1:-}" sessions=() s AW_TIME AW_MODE command
+    if [ -n "$session" ]; then
+        # Pre-seeded from the CLI (`waterbox schedule-command <session>`): skip the
+        # picker and jump straight to time + when + command.
+        container_tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -qxF "$session" \
+            || log_error "No live session '$session'. Start it and check 'waterbox status'."
+    else
+        while IFS= read -r s; do [ -n "$s" ] && sessions+=("$s"); done \
+            < <(container_tmux list-sessions -F '#{session_name}' 2>/dev/null | sort)
+        [ "${#sessions[@]}" -gt 0 ] \
+            || { log_warn "No live sessions — start one first ('waterbox' → new session)."; return 0; }
+        MENU_CANCEL=1
+        choose_menu "Target session:" "${sessions[@]}"
+        [ "$MENU_CANCELLED" = 1 ] && { log_info "Cancelled."; return 0; }
+        session="${sessions[$MENU_CHOICE]}"
+    fi
     _wizard_when || { log_info "Cancelled."; return 0; }
-    prompt_field "Command to send: " || { log_info "Cancelled."; return 0; }
+    # allow_empty=1: an empty command means "just send Enter" (Ctrl-C to cancel).
+    prompt_field "Command to send (empty = just Enter): " "" "" 1 \
+        || { log_info "Cancelled."; return 0; }
     command="$FIELD"
     manage_schedule add "$session" "$AW_TIME" "$AW_MODE" "$command"
 }
 sched_del() { manage_schedule del "$1"; }
-schedule_manager() { task_manager "Scheduled commands (schedule-command)" sched_load sched_add sched_del; }
+schedule_manager() { task_manager "Scheduled commands (schedule-command)" sched_load sched_add sched_del delete 1; }
 
 share_load() {
     local line
@@ -2720,6 +3038,11 @@ emit_completion() {
     cat <<'COMPLETION'
 #compdef waterbox
 # waterbox zsh completion — enable with: eval "$(waterbox completion zsh)"
+# Time slot: show the HH:MM hint and offer "now + 1 min" as a ready-to-edit value.
+_waterbox_time() {
+    local now1; now1=$(date -d '+1 minute' +%H:%M 2>/dev/null)
+    compadd -X "time · 24-hour HH:MM (e.g. 07:00) · Tab = now+1min" -- "${now1:-07:00}"
+}
 _waterbox() {
     local root="$HOME/.waterbox/root"
     local -a cmds items
@@ -2732,6 +3055,11 @@ _waterbox() {
     fi
 
     case "${words[2]}" in
+        start)
+            # `waterbox start <session>` boots (if needed) and attaches that session
+            # directly — complete existing live session names.
+            (( CURRENT == 3 )) && \
+                { items=(${(f)"$(command waterbox _sessions 2>/dev/null)"}); compadd -a items; } ;;
         share)
             if (( CURRENT == 3 )); then items=(add detach list); compadd -a items
             else _files -/; fi ;;
@@ -2741,6 +3069,10 @@ _waterbox() {
             elif [[ "${words[3]}" == (del|rm) ]]; then
                 items=(/etc/systemd/system/waterbox-hostwake-*.timer(N:t:r))
                 items=(wake-${items#waterbox-hostwake-}); compadd -a items
+            elif (( CURRENT == 4 )); then
+                _waterbox_time                          # <profile> <HH:MM>
+            elif (( CURRENT == 5 )); then
+                items=(once daily); compadd -a items    # [once|daily]
             fi ;;
         schedule-command)
             if (( CURRENT == 3 )); then
@@ -2749,14 +3081,21 @@ _waterbox() {
             elif [[ "${words[3]}" == (del|rm) ]]; then
                 items=("$root"/etc/systemd/system/waterbox-schd-com-*.timer(N:t:r))
                 items=(${items#waterbox-}); compadd -a items
+            elif (( CURRENT == 4 )); then
+                _waterbox_time                          # <session> <HH:MM>
             elif (( CURRENT == 5 )); then
-                items=(once daily); compadd -a items
+                items=(once daily); compadd -a items    # [once|daily]
+            elif (( CURRENT == 6 )); then
+                _message -e command 'command to send — e.g. "continue"'
             fi ;;
         completion)
             (( CURRENT == 3 )) && { items=(zsh); compadd -a items; } ;;
     esac
 }
 compdef _waterbox waterbox
+# Render group descriptions/hints (e.g. the "command to send" message and the time
+# hint) for waterbox completions only — scoped so other commands are untouched.
+zstyle ':completion:*:waterbox:*' format '%d'
 COMPLETION
 }
 
@@ -2784,7 +3123,7 @@ if [ "$WATERBOX_GUI" = auto ]; then
 fi
 
 case "${1:-start}" in
-    start|"") start_sandbox ;;
+    start|"") start_sandbox "$2" ;;
     stop)     stop_sandbox ;;
     restart)  restart_sandbox ;;
     status)   status_sandbox ;;
@@ -2810,7 +3149,9 @@ case "${1:-start}" in
             list)      manage_wake_claude list ;;
             del|rm)    manage_wake_claude del "$3" ;;
             -h|--help) help_wake ;;
-            *)         manage_wake_claude add "${@:2}" ;;
+            # Just a profile (no time yet) → open the wizard on time + when for it.
+            *)         if [ -z "$3" ]; then wake_add "$2"
+                       else manage_wake_claude add "${@:2}"; fi ;;
         esac
         ;;
     schedule-command)
@@ -2819,7 +3160,9 @@ case "${1:-start}" in
             list)      manage_schedule list ;;
             del|rm)    manage_schedule del "$3" ;;
             -h|--help) help_schedule ;;
-            *)         manage_schedule add "${@:2}" ;;
+            # Just a session (no time yet) → open the wizard on time + when + command.
+            *)         if [ -z "$3" ]; then sched_add "$2"
+                       else manage_schedule add "${@:2}"; fi ;;
         esac
         ;;
     version|--version|-v) echo "waterbox v$WATERBOX_VERSION" ;;
