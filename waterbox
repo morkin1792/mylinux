@@ -23,6 +23,14 @@ INSIDE_HOSTNAME="box"           # hostname shown inside the container
 TMUX_SESSION="box"              # tmux session that wraps the interactive shell
 CONTAINER_WORKSPACE="/home/$USER_NAME/workspace"
 
+# --- Self-update ---------------------------------------------------------------
+# Canonical release of this script. The session picker refreshes UPDATE_CHECK_FILE
+# in the background (throttled) and shows a one-line WARN when upstream is newer;
+# `waterbox update` fetches this and overwrites SELF_PATH.
+UPDATE_URL="https://raw.githubusercontent.com/morkin1792/mylinux/master/waterbox"
+UPDATE_CHECK_FILE="$CONFIG_DIR/latest_version"   # cached upstream version (bg-refreshed)
+UPDATE_CHECK_INTERVAL=86400                       # seconds between background checks (24h)
+
 # Root helper (req: safe privilege model). All privileged RUNTIME ops go through
 # this root-owned, uid-1000-immutable binary so the sudoers rule can be NOPASSWD
 # for THIS one file only (fixed verbs, no argument-injection path). bootstrap/reset
@@ -112,6 +120,7 @@ Box
   restart [--gui]             stop + start (e.g. for --gui / GPU changes).
   status                      Show if the box is running.
   reset                       Wipe the rootfs and rebuild.
+  update                      Self-update waterbox to the latest release from GitHub.
 
 Scheduling  (bare command opens a TUI; both fire at a set time)
   wake-claude                 Open an account's fresh 5-hour quota window —
@@ -1638,6 +1647,75 @@ _rename_session() {
 # sessions yet, we skip the picker and go straight to creating one.
 # $1 (optional): a target session name (`waterbox start <name>`) — attach it if live,
 # else create it, with no picker at all.
+# --- Self-update ---------------------------------------------------------------
+# True when A is a strictly-newer version than B (numeric/dotted, e.g. 1.10 > 1.9).
+_version_gt() {
+    [ "$1" = "$2" ] && return 1
+    [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" = "$1" ]
+}
+
+# Fire-and-forget upstream version probe, throttled to once per UPDATE_CHECK_INTERVAL.
+# Touches the cache up front so a failed/offline probe doesn't re-run every launch;
+# a successful probe overwrites it with the upstream version. Fully detached — never
+# blocks the picker, all output discarded. The notice below reads last run's result.
+_spawn_update_check() {
+    local now mtime
+    if [ -f "$UPDATE_CHECK_FILE" ]; then
+        now=$(date +%s 2>/dev/null || echo 0)
+        mtime=$(stat -c %Y "$UPDATE_CHECK_FILE" 2>/dev/null || echo 0)
+        [ $((now - mtime)) -ge "$UPDATE_CHECK_INTERVAL" ] || return 0
+    fi
+    touch "$UPDATE_CHECK_FILE" 2>/dev/null || return 0   # reset throttle regardless of outcome
+    (
+        set +e
+        local remote
+        remote=$(curl -fsSL --max-time 8 "$UPDATE_URL" 2>/dev/null \
+                 | grep -m1 '^WATERBOX_VERSION=' | cut -d'"' -f2)
+        [ -n "$remote" ] && printf '%s\n' "$remote" > "$UPDATE_CHECK_FILE"
+    ) >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+}
+
+# Prints the cached upstream version (exit 0) when it's newer than ours, else exit 1.
+_update_notice() {
+    local remote
+    [ -f "$UPDATE_CHECK_FILE" ] || return 1
+    remote=$(cat "$UPDATE_CHECK_FILE" 2>/dev/null)
+    [ -n "$remote" ] || return 1
+    _version_gt "$remote" "$WATERBOX_VERSION" || return 1
+    printf '%s' "$remote"
+}
+
+# `waterbox update`: fetch the canonical script and overwrite ourselves in place.
+self_update() {
+    local tmp remote
+    log_info "Checking $UPDATE_URL ..."
+    tmp=$(mktemp)
+    if ! curl -fsSL --max-time 20 "$UPDATE_URL" -o "$tmp" 2>/dev/null || [ ! -s "$tmp" ]; then
+        rm -f "$tmp"; log_error "Couldn't download the latest waterbox (network?). Try again later."
+    fi
+    # Sanity-check it's actually a waterbox script before overwriting ourselves.
+    if ! head -n1 "$tmp" | grep -q '^#!/usr/bin/env bash' || ! grep -q '^WATERBOX_VERSION=' "$tmp"; then
+        rm -f "$tmp"; log_error "That download doesn't look like waterbox — refusing to install it."
+    fi
+    remote=$(grep -m1 '^WATERBOX_VERSION=' "$tmp" | cut -d'"' -f2)
+    printf '%s\n' "${remote:-$WATERBOX_VERSION}" > "$UPDATE_CHECK_FILE" 2>/dev/null || true
+    if [ "$remote" = "$WATERBOX_VERSION" ]; then
+        rm -f "$tmp"; log_success "Already on the latest waterbox (v$WATERBOX_VERSION)."; return 0
+    fi
+    if ! _version_gt "$remote" "$WATERBOX_VERSION"; then
+        rm -f "$tmp"; log_warn "Your waterbox (v$WATERBOX_VERSION) is ahead of upstream (v$remote) — leaving it as is."; return 0
+    fi
+    # Overwrite in place (keeps the file's mode/owner). Fall back to sudo when the
+    # install path isn't user-writable (e.g. /usr/local/bin).
+    if cp -f "$tmp" "$SELF_PATH" 2>/dev/null; then :
+    elif sudo cp -f "$tmp" "$SELF_PATH"; then :
+    else rm -f "$tmp"; log_error "Couldn't write $SELF_PATH — check permissions or update it manually."; fi
+    chmod +x "$SELF_PATH" 2>/dev/null || sudo chmod +x "$SELF_PATH" 2>/dev/null || true
+    rm -f "$tmp"
+    log_success "Updated waterbox: v$WATERBOX_VERSION → v$remote. The next 'waterbox start' syncs the box to it."
+}
+
 attach_session() {
     # GUI env reaches the shell via the in-box /etc/waterbox/gui-env (sourced by
     # .zshrc), so nothing to forward here beyond an optional API key.
@@ -1660,6 +1738,14 @@ attach_session() {
         if _live_sessions | grep -qxF "$want"; then log_info "Attaching to '$want'."
         else log_info "Creating new session '$want'."; fi
         exec sudo "$HELPER_PATH" shell "$want" "${ANTHROPIC_API_KEY:-}"
+    fi
+    # Reaching the picker: refresh the upstream-version cache in the background and, if
+    # last run's probe found a newer release, drop one WARN above the menu (it stays put
+    # — the menu only ever redraws its own rows). Never blocks; silent when up to date.
+    _spawn_update_check
+    local _newver
+    if _newver="$(_update_notice)"; then
+        log_warn "waterbox v$_newver is available (you have v$WATERBOX_VERSION) — run 'waterbox update'." > /dev/tty
     fi
     while true; do
         sessions=()
@@ -3437,6 +3523,7 @@ case "${1:-start}" in
                        else manage_schedule add "${@:2}"; fi ;;
         esac
         ;;
+    update)   self_update ;;
     version|--version|-v) echo "waterbox v$WATERBOX_VERSION" ;;
     help|--help|-h) show_help ;;
     *) log_error "Unknown command '$1'. See 'waterbox --help'." ;;
