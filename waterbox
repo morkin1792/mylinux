@@ -4,7 +4,7 @@
 
 set -e
 
-WATERBOX_VERSION="1.7"
+WATERBOX_VERSION="1.8"
 
 # Absolute path to this script, recorded so the shell-completion snippet can fall
 # back to it when 'waterbox' isn't on $PATH (e.g. run by ./waterbox, or moved).
@@ -78,6 +78,7 @@ PKGS=(
 # exclusive, so it's bound by default; --no-gpu off.
 WATERBOX_GUI="${WATERBOX_GUI:-auto}"
 WATERBOX_NO_GPU="${WATERBOX_NO_GPU:-0}"
+WATERBOX_HERE="${WATERBOX_HERE:-0}"   # `start --here`: share cwd + open a session in it
 
 mkdir -p "$CONFIG_DIR"
 touch "$SHARE_LIST"
@@ -105,8 +106,10 @@ Usage: waterbox [command] [args] [--gui|--no-gui] [--no-gpu]
 Box
   start [<session>] [--gui]   Boot if needed and attach (the default). A name
                               opens/creates it; Tab-completes live ones.
+  start --here                Name the session after the current directory and open
+                              it inside, sharing that directory into the box first.
   stop                        Power the box off.
-  restart [--gui]             stop + start (after 'share' changes or --gui).
+  restart [--gui]             stop + start (e.g. for --gui / GPU changes).
   status                      Show if the box is running.
   reset                       Wipe the rootfs and rebuild.
 
@@ -171,8 +174,9 @@ Expose a host directory inside the box's ~/workspace. For safety 'add' allows on
 a directory inside your home (e.g. a project subdir) or a folder you own under
 /mnt, /media or /run/media — a sandboxed root (container root == host root here)
 could abuse anything else to escape, and the privileged boot would refuse it
-anyway. Adding/detaching takes effect on the next 'waterbox restart'. A leading ~
-is expanded to your home. 'detach' only unmounts — it never deletes files.
+anyway. Adding/detaching takes effect immediately — mounted (or unmounted) live in
+the running box, no restart; while stopped it just applies on the next start. A
+leading ~ is expanded to your home. 'detach' only unmounts — it never deletes files.
 
   (no args)      Open the live manager (a add · d detach · q quit).
   add <path>     Share a directory.
@@ -1354,7 +1358,7 @@ prompt_field() {
 # action prints its wizard below (scrolling), then the list is redrawn fresh.
 M_IDS=(); M_ROWS=(); M_SEL=0
 task_manager() {
-    local title="$1" load_fn="$2" add_fn="$3" del_fn="$4" del_verb="${5:-delete}" live="${6:-0}"
+    local title="$1" load_fn="$2" add_fn="$3" del_fn="$4" del_verb="${5:-delete}" live="${6:-0}" warn_fn="${7:-}"
     local key n i first=1 drawn=0 rc redraw=1
     M_SEL=0
     printf '\e[?25l' > /dev/tty                    # hide cursor while navigating
@@ -1418,11 +1422,25 @@ task_manager() {
                 first=1 ;;                          # redraw fresh below the wizard
             d|D)
                 if [ "$n" -gt 0 ]; then
-                    printf '\e[?25h\n%s "\e[36m%s\e[0m"? [y/N] ' "${del_verb^}" "${M_ROWS[$M_SEL]}" > /dev/tty
-                    local ans=""; IFS= read -r ans < /dev/tty || true
-                    if [[ "$ans" == [Yy]* ]]; then
-                        ( "$del_fn" "${M_IDS[$M_SEL]}" ) || true
+                    printf '\e[?25h\n' > /dev/tty
+                    # A warn_fn (only shares set one) prints a caution AND returns 0
+                    # when the action is risky → default No; otherwise it's safe →
+                    # default Yes (Enter confirms). Managers with no warn_fn keep the
+                    # cautious default No.
+                    local defyes=0 ans=""
+                    if [ -n "$warn_fn" ]; then
+                        if ( "$warn_fn" "${M_IDS[$M_SEL]}" ); then defyes=0; else defyes=1; fi
                     fi
+                    if [ "$defyes" = 1 ]; then
+                        printf '%s "\e[36m%s\e[0m"? [Y/n] ' "${del_verb^}" "${M_ROWS[$M_SEL]}" > /dev/tty
+                        IFS= read -r ans < /dev/tty || true
+                        case "$ans" in [Nn]*) ans="" ;; *) ans="y" ;; esac
+                    else
+                        printf '%s "\e[36m%s\e[0m"? [y/N] ' "${del_verb^}" "${M_ROWS[$M_SEL]}" > /dev/tty
+                        IFS= read -r ans < /dev/tty || true
+                        case "$ans" in [Yy]*) ans="y" ;; *) ans="" ;; esac
+                    fi
+                    [ "$ans" = y ] && ( "$del_fn" "${M_IDS[$M_SEL]}" ) || true
                     printf '\e[?25l\n' > /dev/tty
                     first=1
                 fi ;;
@@ -1511,6 +1529,54 @@ _default_session_base() {
     printf '%s' "$base"
 }
 
+# Echo a session name that isn't currently live: <base>, then <base>-2, -3, … — the
+# same collision suffixing the picker's default uses, for the non-interactive
+# `--here` path. One _live_sessions snapshot (cheap; collisions are rare).
+_free_session_name() {
+    local base="$1" name="$1" n=2 live
+    live="$(_live_sessions)"
+    while printf '%s\n' "$live" | grep -qxF "$name"; do name="$base-$n"; n=$((n + 1)); done
+    printf '%s' "$name"
+}
+
+# If an existing share equals or contains $1 (a realpath), echo where it's reachable
+# inside the box relative to the workspace — shared /home/u/work mounts as
+# workspace/work, so /home/u/work/proj → "work/proj" — and return 0; else return 1.
+# Lets --here reuse an ancestor share instead of adding an overlapping one, and lets
+# the TUI skip offering a dir that's already covered.
+_covering_subdir() {
+    local rp="$1" line
+    [ -s "$SHARE_LIST" ] || return 1
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        [ "$rp" = "$line" ] && { printf '%s' "$(basename "$line")"; return 0; }
+        case "$rp" in
+            "$line"/*) printf '%s/%s' "$(basename "$line")" "${rp#"$line"/}"; return 0 ;;
+        esac
+    done < "$SHARE_LIST"
+    return 1
+}
+
+# After naming a NEW session in the picker, offer to share the launch directory —
+# only when it isn't $HOME, isn't already shared, and passes the same security policy
+# as `share add`. On yes it's shared (mounted live, since the box is already up); the
+# session still opens in the default workspace, so this just makes the dir reachable
+# at $CONTAINER_WORKSPACE/<name>. Never fatal: declined or ineligible → silent skip.
+_maybe_offer_share() {
+    local here rp ans
+    here="$PWD"
+    [ -n "$here" ] && [ "$here" != "$HOME" ] || return 0
+    rp=$(realpath "$here" 2>/dev/null) || return 0
+    [ "$rp" != "$(realpath "$HOME" 2>/dev/null || echo "$HOME")" ] || return 0
+    _covering_subdir "$rp" >/dev/null 2>&1 && return 0        # already shared (or under one)
+    _host_share_allowed "$rp" || return 0                     # not shareable → don't ask
+    printf "Share this directory '%s' into the box (as %s/%s)? [y/N] " \
+        "$here" "$CONTAINER_WORKSPACE" "$(basename "$rp")" > /dev/tty
+    IFS= read -r ans < /dev/tty || return 0
+    [[ "$ans" == [Yy]* ]] || return 0
+    manage_share add "$rp"
+}
+
 # Prompt for a NEW session name (Enter alone accepts the suggested default). Sets
 # NEW_SESSION to a validated, unique name; returns 1 only on read failure (EOF).
 # tmux forbids '.' and ':', so we constrain to letters/digits/-/_ and auto-suffix
@@ -1576,6 +1642,18 @@ attach_session() {
     # GUI env reaches the shell via the in-box /etc/waterbox/gui-env (sourced by
     # .zshrc), so nothing to forward here beyond an optional API key.
     local want="${1:-}" target sessions=() s dn default_name base_name keep_name="" ki
+    # `start --here`: skip the picker — open a brand-new session named after the launch
+    # dir (dir, dir-2, …), landing inside its shared copy when start_sandbox mounted one
+    # (WB_START_SUBDIR); empty subdir → the default workspace (couldn't/needn't share).
+    if [ "${WB_HERE:-0}" = 1 ]; then
+        target="$(_free_session_name "$(_default_session_base)")"
+        if [ -n "${WB_START_SUBDIR:-}" ]; then
+            log_info "Creating session '$target' in $CONTAINER_WORKSPACE/$WB_START_SUBDIR."
+        else
+            log_info "Creating new session '$target'."
+        fi
+        exec sudo "$HELPER_PATH" shell "$target" "${ANTHROPIC_API_KEY:-}" "${WB_START_SUBDIR:-}"
+    fi
     if [ -n "$want" ]; then
         [[ "$want" =~ ^[A-Za-z0-9._-]+$ ]] \
             || log_error "Invalid session name '$want' (letters, digits, . _ - only)."
@@ -1602,6 +1680,7 @@ attach_session() {
         if [ "${#sessions[@]}" -eq 0 ]; then
             _prompt_new_session "$default_name" || return 0
             target="$NEW_SESSION"; log_info "Creating new session '$target'."
+            _maybe_offer_share
             break
         fi
 
@@ -1624,6 +1703,7 @@ attach_session() {
         if [ "$MENU_ACTION" = add ]; then
             _prompt_new_session "$default_name" || continue
             target="$NEW_SESSION"; log_info "Creating new session '$target'."
+            _maybe_offer_share
             break
         fi
 
@@ -1737,6 +1817,34 @@ start_sandbox() {
     bootstrap_sandbox
     ensure_host_privs    # immutable helper (narrow sudoers) + completion; no manual 'setup'
 
+    # `--here`: share the launch directory (unless it's $HOME or fails the security
+    # policy) and steer attach into a fresh session opened inside it. Persist the share
+    # BEFORE boot so a cold start mounts it via the normal boot path; the bind-share
+    # below (idempotent) covers the already-running case. WB_HERE is honoured even when
+    # we can't share, so the session is still named after the dir (at the workspace root).
+    local here_rp="" home_rp="" here_added=0 cover_sub=""
+    WB_HERE=0; WB_START_SUBDIR=""
+    if [ "${WATERBOX_HERE:-0}" = 1 ]; then
+        WB_HERE=1
+        here_rp=$(realpath "$PWD" 2>/dev/null || echo "$PWD")
+        home_rp=$(realpath "$HOME" 2>/dev/null || echo "$HOME")
+        if [ "$here_rp" = "$home_rp" ]; then
+            log_info "--here: you're in \$HOME — nothing to share; opening a new session."
+        elif cover_sub=$(_covering_subdir "$here_rp"); then
+            # Already reachable via an existing (possibly ancestor) share — reuse it,
+            # don't add an overlapping one; just open the session at that subpath.
+            WB_START_SUBDIR="$cover_sub"
+            log_info "--here: '$here_rp' is already shared — opening in $CONTAINER_WORKSPACE/$cover_sub."
+        elif _host_share_allowed "$here_rp"; then
+            mkdir -p "$CONFIG_DIR"
+            echo "$here_rp" >> "$SHARE_LIST"
+            WB_START_SUBDIR="$(basename "$here_rp")"; here_added=1
+            log_info "--here: sharing '$here_rp' → $CONTAINER_WORKSPACE/$WB_START_SUBDIR."
+        else
+            log_warn "--here: can't share '$PWD' (only a dir inside your home, or one you own under /mnt, /media, /run/media). Opening a session without it."
+        fi
+    fi
+
     if is_running; then
         log_info "Sandbox already running, attaching..."
         [ "$WATERBOX_GUI" = "1" ] && [ ! -s "$GUI_BINDS_FILE" ] \
@@ -1791,6 +1899,17 @@ start_sandbox() {
     if is_running && ! _fire_current; then
         log_info "Updating the in-box task helper (waterbox-fire)..."
         ( write_task_helper ) || log_warn "Couldn't update waterbox-fire now (scheduling may not deliver until 'refresh-config')."
+    fi
+
+    # Mount a NEWLY-added --here share live if the box was already up (idempotent: a
+    # cold boot above already mounted it via add_share_binds, so this no-ops). A share
+    # we merely reused (cover_sub) is already mounted, so it's skipped. On failure, drop
+    # the start-subdir so we don't try to cd into a dir that isn't there.
+    if [ "$WB_HERE" = 1 ] && [ "$here_added" = 1 ] && is_running; then
+        if ! run_priv bind-share "$here_rp" 2>/dev/null; then
+            log_warn "Couldn't mount '$WB_START_SUBDIR' live; it'll be there after 'waterbox restart'."
+            WB_START_SUBDIR=""
+        fi
     fi
 
     attach_session "$want"
@@ -1946,6 +2065,7 @@ _write_config_version() {
 refresh_config() {
     [ -f "$JAIL_ROOT/.waterbox-ready" ] \
         || log_error "No built sandbox to refresh. Run 'waterbox start' first."
+    ensure_helper    # keep the root helper in lockstep with this script's verbs too
     log_info "Re-applying in-box config to $JAIL_ROOT ..."
     configure_dotfiles
     configure_hosts          # box→127.0.0.1 + host reachable by 'host' and its hostname
@@ -2010,7 +2130,11 @@ enable_completion() {
 install_helper() {
     log_info "Installing the waterbox root helper (needs your password once)..."
     sudo install -d -m 0755 -o root -g root "$HELPER_DIR"
-    local tmp; tmp=$(mktemp)
+    # Marker = a checksum of THIS script (same one _config_current uses), not just the
+    # version string: the immutable helper is then reinstalled whenever the script that
+    # generates it changes at all — so it can never silently lag the caller's verbs
+    # (a version bump isn't required, and two edits under one version still self-heal).
+    local tmp hmark; tmp=$(mktemp); hmark=$(_config_marker)
     {
         cat <<EOF
 #!/usr/bin/env bash
@@ -2018,7 +2142,7 @@ install_helper() {
 # waterbox v$WATERBOX_VERSION. Do not edit. Runs privileged RUNTIME ops (fixed
 # verbs) so sudo can be NOPASSWD for this file only.
 set -e
-WB_HELPER_VERSION="$WATERBOX_VERSION"
+WB_HELPER_VERSION="$hmark"
 MACHINE_NAME="$MACHINE_NAME"
 USER_NAME="$USER_NAME"
 HOST_IP="$HOST_IP"
@@ -2374,12 +2498,28 @@ case "$verb" in
         ;;
     tmux)  run_tmux "$@" ;;
     shell)
-        sess="${1:-}"; key="${2:-}"
+        sess="${1:-}"; key="${2:-}"; sub="${3:-}"
         _valid_session "$sess" || { echo "helper: bad session"; exit 2; }
+        # Optional start dir: a path UNDER the workspace — a single share basename, or
+        # a nested path when a PARENT dir is the actual share (`--here` in a subdir of a
+        # shared folder). Forbid absolute + any '.'/'..'/empty segment, so it can only
+        # ever resolve within $CONTAINER_WORKSPACE. Ignored when the session already
+        # exists (new-session -A just re-attaches).
+        startdir="$CONTAINER_WORKSPACE"
+        if [ -n "$sub" ]; then
+            case "$sub" in /*) echo "helper: bad subdir"; exit 2 ;; esac
+            _rest="$sub"
+            while [ -n "$_rest" ]; do
+                _seg="${_rest%%/*}"
+                case "$_seg" in ''|.|..) echo "helper: bad subdir"; exit 2 ;; esac
+                if [ "$_rest" = "$_seg" ]; then _rest=""; else _rest="${_rest#*/}"; fi
+            done
+            startdir="$CONTAINER_WORKSPACE/$sub"
+        fi
         env_args=()
         [ -n "$key" ] && env_args=(-E "ANTHROPIC_API_KEY=$key")
         exec machinectl shell "${env_args[@]}" "$USER_NAME@$MACHINE_NAME" \
-            /usr/bin/tmux new-session -A -s "$sess" -c "$CONTAINER_WORKSPACE"
+            /usr/bin/tmux new-session -A -s "$sess" -c "$startdir"
         ;;
     sched-install)
         id="$1"; sess="$2"; time="$3"; mode="$4"
@@ -2461,6 +2601,61 @@ case "$verb" in
         rm -f "$HW_ETC/$base.timer" "$HW_ETC/$base.service"
         systemctl daemon-reload
         ;;
+    bind-share)
+        # Live-bind ONE shared path into the running container's mount namespace —
+        # the mirror of 'unshare' (which live-umounts). The path is re-validated here
+        # exactly as boot does (realpath + _share_allowed), so a compromised uid-1000
+        # can't widen its escape surface by asking the helper to bind an unsafe path.
+        # No-op when stopped (boot mounts it from the list) or already mounted, so it's
+        # safe to call unconditionally after a start.
+        p="$1"
+        case "$p" in '') echo "helper: bad path"; exit 2 ;; esac
+        running || exit 0
+        rp=$(realpath "$p" 2>/dev/null) || { echo "helper: no such path"; exit 2; }
+        [ -d "$rp" ] || { echo "helper: not a directory"; exit 2; }
+        _share_allowed "$rp" || { echo "helper: refusing to share unsafe path: $rp"; exit 2; }
+        base=$(basename "$rp")
+        case "$base" in ''|.|..|*/*) echo "helper: bad basename"; exit 2 ;; esac
+        target="$CONTAINER_WORKSPACE/$base"
+        leader=$(machinectl show "$MACHINE_NAME" -p Leader --value 2>/dev/null)
+        [ -n "$leader" ] && [ "$leader" != 0 ] || { echo "helper: no leader"; exit 3; }
+        grep -qF " $target " "/proc/$leader/mountinfo" 2>/dev/null && exit 0   # already bound
+        mkdir -p "$JAIL_ROOT$target"
+        chown 1000:1000 "$JAIL_ROOT$target"
+        machinectl bind "$MACHINE_NAME" "$rp" "$target"
+        ;;
+    share-users)
+        # List processes INSIDE the box still using the share at ~/workspace/<name>
+        # (cwd, root, or an open file under it) as "PID COMM" lines. Enters only the
+        # container's mount namespace and reads its own /proc — no in-box tools needed.
+        # Used to warn before a detach, whose lazy-unmount would strand those processes
+        # on a stale, disconnected copy of the mount. Never fatal (best-effort).
+        name="$1"
+        case "$name" in ''|.|..|*/*) echo "helper: bad name"; exit 2 ;; esac
+        running || exit 0
+        leader=$(machinectl show "$MACHINE_NAME" -p Leader --value 2>/dev/null)
+        [ -n "$leader" ] && [ "$leader" != 0 ] || exit 0
+        target="$CONTAINER_WORKSPACE/$name"
+        nsenter --target "$leader" --mount -- /bin/sh -c '
+            cd / 2>/dev/null || true
+            t=$1
+            for p in /proc/[0-9]*; do
+                hit=""
+                for l in "$p/cwd" "$p/root"; do
+                    d=$(readlink "$l" 2>/dev/null) || continue
+                    case "$d" in "$t"|"$t"/*) hit=1; break ;; esac
+                done
+                if [ -z "$hit" ] && [ -d "$p/fd" ]; then
+                    for f in "$p"/fd/*; do
+                        d=$(readlink "$f" 2>/dev/null) || continue
+                        case "$d" in "$t"|"$t"/*) hit=1; break ;; esac
+                    done
+                fi
+                [ -n "$hit" ] || continue
+                printf "%s %s\n" "${p#/proc/}" "$(cat "$p/comm" 2>/dev/null || echo ?)"
+            done
+        ' sh "$target" 2>/dev/null || true
+        ;;
     *) echo "helper: unknown verb '$verb'"; exit 2 ;;
 esac
 HELPER
@@ -2484,7 +2679,7 @@ HELPER
 
 # True unless an up-to-date helper is already installed (version marker matches).
 _helper_current() {
-    [ -x "$HELPER_PATH" ] && grep -q "^WB_HELPER_VERSION=\"$WATERBOX_VERSION\"\$" "$HELPER_PATH" 2>/dev/null
+    [ -x "$HELPER_PATH" ] && grep -q "^WB_HELPER_VERSION=\"$(_config_marker)\"\$" "$HELPER_PATH" 2>/dev/null
 }
 ensure_helper() { _helper_current || install_helper; }
 run_priv() { sudo "$HELPER_PATH" "$@"; }
@@ -2551,14 +2746,30 @@ manage_share() {
             fi
             echo "$absolute_path" >> "$SHARE_LIST"
             if is_running; then
-                log_success "Added '$absolute_path'. Run 'waterbox restart' to mount it inside."
+                # Mount it live — no restart. bind-share re-validates the path and
+                # injects the bind into the running container's mount namespace (mirror
+                # of 'detach', which live-unmounts). Falls back to a boot-time mount only
+                # if the live bind is unavailable (e.g. helper not yet updated to 1.8).
+                if _helper_current && run_priv bind-share "$absolute_path" 2>/dev/null; then
+                    log_success "Shared '$absolute_path' — mounted live at $mount_target."
+                else
+                    log_success "Added '$absolute_path'. It'll mount at $mount_target on next start."
+                fi
             else
-                log_success "Added '$absolute_path' (will mount on next start)."
+                log_success "Added '$absolute_path' (will mount at $mount_target on next start)."
             fi
             ;;
         del|detach)
             if ! grep -Fxq "$absolute_path" "$SHARE_LIST"; then
                 log_error "Path '$absolute_path' is not currently shared."
+            fi
+            # Warn (and confirm) if the box is still using it — a lazy-unmount would
+            # strand those processes. Only prompts when actually in use, so a clean
+            # detach stays non-interactive/scriptable.
+            if _print_share_in_use "$folder_name"; then
+                printf "Detach anyway? [y/N] " > /dev/tty
+                local ans=""; IFS= read -r ans < /dev/tty || true
+                [[ "$ans" == [Yy]* ]] || { log_info "Kept '$absolute_path' shared."; return 0; }
             fi
             # grep -v exits 1 when it removes the *last* line (zero output), so
             # don't gate the mv on it — otherwise detaching the only share no-ops.
@@ -3065,8 +3276,26 @@ share_add() {
     manage_share add "$FIELD"
 }
 share_del() { manage_share del "$1"; }
+# Warn (to the terminal) when processes inside the box are still using the share at
+# ~/workspace/<folder>. Detach lazy-unmounts it, so anything cd'd in (or holding a
+# file open) is stranded on a stale, disconnected copy — it can't cd out and new
+# writes stay in the box instead of reaching the host. Returns 0 iff it warned.
+_print_share_in_use() {
+    local folder="$1" users pid cmd
+    is_running || return 1
+    _helper_current || return 1
+    users="$(run_priv share-users "$folder" 2>/dev/null)" || return 1
+    [ -n "$users" ] || return 1
+    printf '\e[33m[WARN]\e[0m Still in use inside the box (~/workspace/%s):\n' "$folder" > /dev/tty
+    printf '%s\n' "$users" | while IFS=' ' read -r pid cmd; do
+        [ -n "$pid" ] && printf '         • %s (pid %s)\n' "${cmd:-?}" "$pid" > /dev/tty
+    done
+    return 0
+}
+# TUI pre-detach hook (task_manager warn_fn): $1 is the selected share's host path.
+share_warn() { _print_share_in_use "$(basename "$1")"; }
 # "detach" (not "delete"): removing a share only unmounts it — no files are deleted.
-share_manager() { task_manager "Shared folders (share)" share_load share_add share_del detach; }
+share_manager() { task_manager "Shared folders (share)" share_load share_add share_del detach 0 share_warn; }
 
 # --- Shell completion ---------------------------------------------------------
 # Print a zsh completion script to stdout. Enable it with:
@@ -3099,9 +3328,9 @@ _waterbox() {
     case "${words[2]}" in
         start)
             # `waterbox start <session>` boots (if needed) and attaches that session
-            # directly — complete existing live session names.
-            (( CURRENT == 3 )) && \
-                { items=(${(f)"$(command waterbox _sessions 2>/dev/null)"}); compadd -a items; } ;;
+            # directly — complete existing live session names, plus the flags.
+            items=(--here --gui --no-gui --no-gpu ${(f)"$(command waterbox _sessions 2>/dev/null)"})
+            compadd -a items ;;
         share)
             if (( CURRENT == 3 )); then items=(add detach list); compadd -a items
             else _files -/; fi ;;
@@ -3149,6 +3378,7 @@ while [ $# -gt 0 ]; do
         --gui)    WATERBOX_GUI=1; shift ;;
         --no-gui) WATERBOX_GUI=0; shift ;;
         --no-gpu) WATERBOX_NO_GPU=1; shift ;;
+        --here)   WATERBOX_HERE=1; shift ;;
         *)        POSITIONAL+=("$1"); shift ;;
     esac
 done
