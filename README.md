@@ -12,5 +12,8 @@
 - [.nanorc](nanorc)
 
 ## 🛠️ mylinux tools
-- 💦 [Waterbox: script for sandboxing CLI agents, specially claude-code](waterbox)
+- 💦 [waterbox: script for sandboxing CLI agents, specially claude-code](waterbox)
+- 🎬 [manodavinci: helps you deal with DaVinci Resolve free's codec limitations on Linux by transcoding footage it can't edit](manodavinci)
 - 🛡️ [pvpn: ProtonVPN CLI wrapper to make it a bit decent](pvpn)
+
+
