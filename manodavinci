@@ -79,13 +79,13 @@ OPTIONS
 Output is written next to the input as NAME.mov unless -o is given.
 """.format(v=VERSION)
 
-LIST = """VIDEO PROFILES  (-p NAME)   all output .mov;  VMAF 100 = identical to source
-  mpeg4_q3 *  small video, good quality, fast                     (default)
+LIST = """VIDEO PROFILES  (-p NAME)   # all output are .mov
+  mpeg4_q3 *  small video, good quality, fast                 (default)
   mpeg4_q5    smallest video, slightly lower quality, fast
   dnxhr_lb    big video, but supposedly the smoothest to scrub/edit
   dnxhr_sq    largest video, near-lossless, slow
 
-AUDIO OPTIONS   (-a NAME)   Resolve free rejects AAC
+AUDIO OPTIONS   (-a NAME)   # Resolve free rejects AAC
   pcm16 *  lossless PCM, universal                            (default)
   alac     lossless but ~half the size (great for long clips)
   mp3      lossy, smallest
@@ -443,17 +443,30 @@ def resolve_flow(resolve):
                    "(it may be a timeline or compound clip).\n\n" + where)
         return
 
+    # figure out whether we converted video clips, audio files, or a mix,
+    # so the message names the right thing and the right output extension.
+    kinds = set()
+    for p in paths:
+        info = probe(p)
+        kinds.add("video" if info["has_video"] else "audio")
+    if kinds == {"audio"}:
+        noun, ext, orig = "audio file(s)", ".wav", "the original file that was not working"
+    elif kinds == {"video"}:
+        noun, ext, orig = "clip(s)", ".mov", "the original clip that was not working"
+    else:
+        noun, ext, orig = "file(s)", ".mov / .wav", "the original file that wasn't working"
+
     ok, fail, out_dir = run_batch(paths, DEFAULT_PROFILE, "pcm16", force=False, dlg=dlg)
     if ok and out_dir:
         if have("xdg-open"):
             subprocess.Popen(["xdg-open", out_dir],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         dlg.notice(
-            "Converted %d clip(s). The output folder just opened (check for .mov files).\n\n"
+            "Converted %d %s. The output folder just opened (check for %s files).\n\n"
             "To use: drag it into the Media Pool "
             "(or File ▸ Import ▸ Media (CTRL+I)).\n"
-            "Now you can delete, from the project, the original clip that showed black.%s"
-            % (ok, "" if not fail else "\n\n%d failed." % fail))
+            "Now you can delete, from the project, %s.%s"
+            % (ok, noun, ext, orig, "" if not fail else "\n\n%d failed." % fail))
     elif fail:
         dlg.error("Conversion failed for %d file(s)." % fail)
 
