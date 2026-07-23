@@ -265,6 +265,20 @@ _container_nameservers() {
     echo "options timeout:2 attempts:2"   # fall through to the fallback quickly
 }
 
+# --restrict-address-families landed in systemd-nspawn v256; older hosts (e.g. the
+# systemd 255 on Ubuntu/Mint) reject the flag with "unrecognized option". Probe
+# --help once and cache the answer, so we pass the allowlist where it's understood
+# and silently skip it where it isn't (those builds don't enforce a default family
+# restriction anyway, so dropping the flag just leaves the box as permissive as it
+# already was there). Used by both this host function and the root helper's boots.
+_NSPAWN_RAF=""   # "" until probed, then "yes"/"no"
+_nspawn_supports_raf() {
+    [ -n "$_NSPAWN_RAF" ] || \
+        { systemd-nspawn --help 2>/dev/null | grep -q -- '--restrict-address-families' \
+            && _NSPAWN_RAF=yes || _NSPAWN_RAF=no; }
+    [ "$_NSPAWN_RAF" = yes ]
+}
+
 # Every build-time nspawn run gets the same explicit socket-address-family allowlist
 # the booted box uses (see boot_min/boot_full). systemd-nspawn will soon default to
 # permitting only AF_INET/AF_INET6/AF_UNIX and warns until you set this; that default
@@ -272,9 +286,9 @@ _container_nameservers() {
 # AF_NETLINK route socket (AI_ADDRCONFIG) to pick a source address, so pacman/git
 # downloads need it. AF_PACKET matches the box's CAP_NET_RAW.
 _nspawn_build() {
-    sudo systemd-nspawn -q \
-        --restrict-address-families="AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET" \
-        -D "$JAIL_ROOT" "$@"
+    local raf=()
+    _nspawn_supports_raf && raf=(--restrict-address-families="AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET")
+    sudo systemd-nspawn -q "${raf[@]}" -D "$JAIL_ROOT" "$@"
 }
 
 # Write waterbox's /etc/hosts entries idempotently (safe to re-run on refresh): the
@@ -421,8 +435,11 @@ bootstrap_sandbox() {
     _nspawn_build systemctl mask tmp.mount >/dev/null 2>&1 || true
 
     # AUR + extras (yay, claude-code, oh-my-posh). No veth here => host network.
+    # Run the build as $USER_NAME (makepkg refuses root). Use the short -u: its long
+    # form was renamed --user= → --uid= in systemd 261, but -u has meant "run as this
+    # user" since forever, so it works on both Arch (261) and the systemd 255 on Mint.
     log_info "Installing yay + claude-code + extras inside the rootfs..."
-    _nspawn_build --uid="$USER_NAME" bash -c "
+    _nspawn_build -u "$USER_NAME" bash -c "
         cd /tmp &&
         git clone https://aur.archlinux.org/yay.git &&
         cd yay &&
@@ -2276,6 +2293,17 @@ _valid_schedid() { case "$1" in schd-com-*) _valid_id "${1#schd-com-}" ;; *) ret
 
 running() { machinectl show "$MACHINE_NAME" --property=State 2>/dev/null | grep -q "State=running"; }
 
+# --restrict-address-families exists only on systemd-nspawn v256+; probe --help once
+# and cache, so boots also work on the older systemd (255) shipped by Ubuntu/Mint,
+# where the flag would abort the boot with "unrecognized option".
+_NSPAWN_RAF=""
+_nspawn_supports_raf() {
+    [ -n "$_NSPAWN_RAF" ] || \
+        { systemd-nspawn --help 2>/dev/null | grep -q -- '--restrict-address-families' \
+            && _NSPAWN_RAF=yes || _NSPAWN_RAF=no; }
+    [ "$_NSPAWN_RAF" = yes ]
+}
+
 net_up() {
     local tries=30
     while [ $tries -gt 0 ] && ! ip link show "$VE_IFACE" >/dev/null 2>&1; do
@@ -2312,13 +2340,15 @@ net_down() {
 boot_min() {
     running && return 0
     [ -f "$JAIL_ROOT/.waterbox-ready" ] || { echo "helper: rootfs not built at $JAIL_ROOT"; exit 3; }
+    local raf=()
+    _nspawn_supports_raf && raf=(--restrict-address-families="AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET")
     systemd-run --unit="$MACHINE_NAME" --collect --service-type=notify \
         --description="Waterbox container ($MACHINE_NAME)" \
         --property=KillMode=mixed --property=TimeoutStopSec=30 --property=SuccessExitStatus=133 \
         systemd-nspawn --boot --quiet --keep-unit --notify-ready=yes \
             --directory="$JAIL_ROOT" --machine="$MACHINE_NAME" --network-veth \
             --resolv-conf=off --capability=CAP_NET_ADMIN,CAP_NET_RAW --bind=/dev/net/tun \
-            --restrict-address-families="AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET" \
+            "${raf[@]}" \
         >/dev/null 2>&1
     running || { echo "helper: boot failed"; exit 3; }
     net_up || true
@@ -2398,10 +2428,11 @@ boot_full() {
     BINDS=()
     add_share_binds
     if [ "$gui" = 1 ]; then add_gui_binds; write_gui_env; else rm -f "$JAIL_ROOT/etc/waterbox/gui-env"; fi
-    local gpu=() props=()
+    local gpu=() props=() raf=()
     if [ "$nogpu" != 1 ] && [ -d /dev/dri ]; then
         gpu+=(--bind=/dev/dri); props+=(--property=DeviceAllow="char-drm rw")
     fi
+    _nspawn_supports_raf && raf=(--restrict-address-families="AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET")
     # KillMode=mixed: on stop, SIGTERM reaches nspawn (clean container poweroff),
     # not the container PID 1 (where SIGTERM means reexec, hanging the host).
     systemd-run --unit="$MACHINE_NAME" --collect --service-type=notify \
@@ -2411,7 +2442,7 @@ boot_full() {
         systemd-nspawn --boot --quiet --keep-unit --notify-ready=yes \
             --directory="$JAIL_ROOT" --machine="$MACHINE_NAME" --network-veth \
             --resolv-conf=off --capability=CAP_NET_ADMIN,CAP_NET_RAW --bind=/dev/net/tun \
-            --restrict-address-families="AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET" \
+            "${raf[@]}" \
             "${BINDS[@]}" "${gpu[@]}"
     running || { echo "helper: boot failed"; exit 3; }
     net_up || true
