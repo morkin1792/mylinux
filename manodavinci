@@ -23,18 +23,42 @@ This is ONE self-contained file. It works three ways:
 Requires: ffmpeg + ffprobe. GUI dialogs use kdialog (KDE) or zenity (GNOME/
 Cinnamon/Mint); it falls back to the terminal if neither is present.
 """
+import difflib
 import json
 import os
+import shlex
 import subprocess
 import sys
 
-VERSION = "1.0"
+VERSION = "1.1"
+
+
+# -------------------------------------------------------------------- colour --
+# Just enough colour that someone skimming a wall of text still catches the
+# parts that matter: section titles, commands to type, the codec to pick.
+# Off when piped to a file, on a dumb terminal, or when NO_COLOR is set.
+def palette(color=None):
+    if color is None:
+        color = (sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
+                 and not os.environ.get("NO_COLOR"))
+    if not color:
+        return dict(H="", G="", C="", Y="", D="", Z="")
+    return dict(H="\033[1m",       # section headings
+                G="\033[1;32m",    # the part to read if you read nothing else
+                C="\033[1;36m",    # a command to type
+                Y="\033[1;33m",    # a setting to pick / the default
+                D="\033[2m",       # side notes
+                Z="\033[0m")
+
+
+def paint(text, color=None, **kw):
+    return text.format(v=VERSION, **dict(palette(color), **kw))
 
 # ------------------------------------------------------------------ profiles --
 # name -> (ffmpeg video args, pixel format, container extension)
 PROFILES = {
     "mpeg4_q3": (["-c:v", "mpeg4", "-q:v", "3"], "yuv420p", "mov"),
-    "mpeg4_q5": (["-c:v", "mpeg4", "-q:v", "5"], "yuv420p", "mov"),
+    "av1":      (["-c:v", "libsvtav1", "-crf", "34", "-preset", "6"], "yuv420p", "mp4"),
     "dnxhr_lb": (["-c:v", "dnxhd", "-profile:v", "dnxhr_lb"], "yuv422p", "mov"),
     "dnxhr_sq": (["-c:v", "dnxhd", "-profile:v", "dnxhr_sq"], "yuv422p", "mov"),
 }
@@ -42,12 +66,20 @@ DEFAULT_PROFILE = "mpeg4_q3"
 # name -> (ffmpeg audio args, allowed containers)
 AUDIO = {
     "pcm16": (["-c:a", "pcm_s16le", "-ar", "48000"], {"mov", "mkv", "avi", "wav"}),
-    "alac":  (["-c:a", "alac"], {"mov", "mkv", "m4a"}),
+    "alac":  (["-c:a", "alac"], {"mov", "mkv", "m4a", "mp4"}),
     "mp3":   (["-c:a", "libmp3lame", "-q:a", "2"], {"mov", "mkv", "mp4", "avi", "mp3"}),
     "none":  (["-an"], {"mov", "mkv", "mp4", "avi", "wav"}),
 }
 # container to use for an AUDIO-ONLY input, per audio codec
 AUDIO_ONLY_EXT = {"pcm16": "wav", "alac": "m4a", "mp3": "mp3", "none": "wav"}
+
+# ------------------------------------------------------------------ deliver ----
+# `deliver` turns a Resolve export (e.g. DNxHR .mov) into a small, universal MP4
+# that YouTube / Instagram / etc. accept.  H.264 by default, AV1 with --av1.
+# CRF: lower = better quality + bigger file.
+DELIVER_DEFAULT_CRF = {"h264": 20, "hevc": 24, "av1": 30}
+DELIVER_ENCODER = {"h264": "libx264", "hevc": "libx265", "av1": "libsvtav1"}
+DELIVER_LABEL = {"h264": "H.264", "hevc": "H.265", "av1": "AV1"}
 
 VIDEO_EXTS = ("mp4", "m4v", "mov", "mkv", "avi", "mts", "m2ts", "webm",
               "m2v", "mpg", "mpeg", "wmv", "flv", "3gp")
@@ -55,43 +87,81 @@ VIDEO_EXTS = ("mp4", "m4v", "mov", "mkv", "avi", "mts", "m2ts", "webm",
 RESOLVE_UTILITY = os.path.expanduser(
     "~/.local/share/DaVinciResolve/Fusion/Scripts/Utility")
 INSTALL_NAME = "manodavinci.py"
+# when run from inside Resolve, converted files are grouped in this subfolder,
+# created next to each source clip, so the originals stay tidy.
+RESOLVE_SUBDIR = "davinci_mov_files"
 
-HELP = """manodavinci {v} - make footage editable in DaVinci Resolve (free).
+INTRO = """{H}manodavinci {v}{Z} - make footage editable in DaVinci Resolve free (Linux),
+and turn your finished edit into a small MP4 for YouTube / Instagram / TikTok.
+"""
 
-USAGE
-  manodavinci [options] FILE|FOLDER ...   convert in the terminal
-  manodavinci --gui [options] [FILE ...]  convert with a progress dialog
-  manodavinci install | uninstall         add/remove it inside DaVinci Resolve
+# the one section a first-timer must read, so both HELP and SHORT end with it
+GETTING_STARTED = """{G}GETTING STARTED{Z}
+  Resolve free can't open H.264 / H.265 / AAC files.  manodavinci fixes both ends:
+    1. Install it into Resolve:   {C}manodavinci install{Z}
+       {D}(then just follow the short instructions it prints){Z}
+    2. In Resolve, select a clip that shows black and run manodavinci - it
+       saves a converted copy in a folder next to it.  Import that and edit.
+    3. Done editing?  Render it using the following specs:
+         Format  {Y}QuickTime{Z}
+         Codec   {Y}Avid DNxHR{Z}
+         Type    {Y}Avid DNxHR LB 12-bit{Z}
+       {D}(the "Network Optimization" checkbox changes nothing here - ignore it){Z}
+    4. Make it uploadable:        {C}manodavinci deliver video.mov{Z}
+       {D}(generates a small H.264 .mp4 that every platform accepts){Z}
+"""
+
+HELP = INTRO + """
+{H}USAGE{Z}
+  manodavinci [options] FILE|FOLDER ...   convert INTO Resolve (editable codec)
+  manodavinci --gui [options] [FILE ...]  same, with a progress dialog
+  manodavinci {C}deliver{Z} FILE|FOLDER ...     convert OUT of Resolve (upload MP4)
+  manodavinci {C}install{Z} | uninstall         add/remove it inside DaVinci Resolve
   manodavinci --list                      all profiles + audio options
   manodavinci --help
 
-OPTIONS
-  -p, --profile NAME   video profile (default: mpeg4_q3).  Most useful:
-                         mpeg4_q3  near source size, great quality, fast
-                         dnxhr_lb  bigger, but smoothest to scrub (heavy edits)
-                       Run --list to see every profile.
-  -a, --audio  NAME    audio codec (default: pcm16).       --list for all
+{H}OPTIONS{Z}
+  -p, --profile NAME   video profile (default: {Y}mpeg4_q3{Z}).  Most useful:
+                         {Y}mpeg4_q3{Z}  near source size, great quality, fast
+                         {Y}dnxhr_lb{Z}  bigger, but smoothest to scrub (heavy edits)
+                       {D}Run --list to see every profile.{Z}
+  -a, --audio  NAME    audio codec (default: {Y}pcm16{Z}).       {D}--list for all{Z}
   -o, --output PATH    output file (single input) or output folder.
-                       The .mov extension is applied for you.
-      --hwaccel MODE   auto | off | vaapi | cuda | qsv     (default: auto)
+                       {D}The .mov extension is applied for you.{Z}
   -f, --force          overwrite existing outputs without asking
 
 Output is written next to the input as NAME.mov unless -o is given.
-""".format(v=VERSION)
 
-LIST = """VIDEO PROFILES  (-p NAME)   # all output are .mov
-  mpeg4_q3 *  small video, good quality, fast                 (default)
-  mpeg4_q5    smallest video, slightly lower quality, fast
-  dnxhr_lb    big video, but supposedly the smoothest to scrub/edit
-  dnxhr_sq    largest video, near-lossless, slow
+{H}DELIVER{Z}  (manodavinci deliver FILE ...)
+  Turn a Resolve export (e.g. a DNxHR .mov) into a small, universal MP4.
+  {Y}H.264{Z} (default) is accepted everywhere - keep it unless you have a reason.
+      --hevc     H.265 instead - smaller (YouTube / Instagram / TikTok ok)
+      --av1      AV1 instead - smallest, but YouTube only (not IG / TikTok)
+      -o PATH    output file or folder
+  e.g.  {C}manodavinci deliver "Timeline 1.mov"{Z}
 
-AUDIO OPTIONS   (-a NAME)   # Resolve free rejects AAC
-  pcm16 *  lossless PCM, universal                            (default)
+""" + GETTING_STARTED
+
+# shown when there is nothing to do (no arguments, or opened from a file
+# manager): USAGE / OPTIONS / DELIVER are a wall of text for someone who just
+# wants to get going, so keep only the steps.
+SHORT = INTRO + "\n" + GETTING_STARTED + """
+Run {C}manodavinci --help{Z} to see all the options.
+"""
+
+LIST = """{H}VIDEO PROFILES{Z}  (-p NAME)
+  {Y}mpeg4_q3{Z} *  small .mov, good quality, fast to make + edit    (default)
+  av1         smallest .mp4, but slow to make + heavier to scrub
+  dnxhr_lb    big .mov, but supposedly the smoothest to scrub/edit
+  dnxhr_sq    largest .mov, near-lossless, slow
+
+{H}AUDIO OPTIONS{Z}   (-a NAME)   {D}# Resolve free rejects AAC{Z}
+  {Y}pcm16{Z} *  lossless PCM, universal                            (default)
   alac     lossless but ~half the size (great for long clips)
   mp3      lossy, smallest
   none     drop the audio
 
-  * = default.   e.g.  manodavinci -p dnxhr_lb -a alac clip.mp4
+  * = default.   e.g.  {C}manodavinci -p dnxhr_lb -a alac clip.mp4{Z}
 """
 
 
@@ -102,7 +172,9 @@ def have(cmd):
 
 
 def die(msg):
-    sys.stderr.write("error: %s\n" % msg)
+    red = "\033[1;31m" if sys.stderr.isatty() and not os.environ.get("NO_COLOR") else ""
+    off = "\033[0m" if red else ""
+    sys.stderr.write("%serror:%s %s\n" % (red, off, msg))
     sys.exit(1)
 
 
@@ -117,27 +189,43 @@ def ffmpeg_missing():
     return not (have("ffmpeg") and have("ffprobe"))
 
 
+def has_encoder(name):
+    """True if this ffmpeg build ships the given encoder (e.g. libx264)."""
+    try:
+        out = subprocess.check_output(["ffmpeg", "-hide_banner", "-encoders"],
+                                      stderr=subprocess.DEVNULL).decode()
+    except Exception:
+        return False
+    return any(line.split()[1:2] == [name]
+               for line in out.splitlines() if line[:1] == " ")
+
+
 def probe(path):
-    """Return dict: has_video, has_audio, duration_us."""
+    """Return dict: has_video, has_audio, audio_codec, duration_us."""
     try:
         out = subprocess.check_output(
             ["ffprobe", "-v", "error", "-show_streams", "-show_format",
              "-of", "json", path], stderr=subprocess.DEVNULL)
         data = json.loads(out.decode("utf-8", "replace"))
     except Exception:
-        return {"has_video": False, "has_audio": False, "duration_us": 0}
+        return {"has_video": False, "has_audio": False,
+                "audio_codec": None, "duration_us": 0}
     hv = ha = False
+    acodec = None
     for s in data.get("streams", []):
         t = s.get("codec_type")
         if t == "video" and s.get("disposition", {}).get("attached_pic", 0) == 0:
             hv = True
         elif t == "audio":
             ha = True
+            if acodec is None:
+                acodec = s.get("codec_name")
     try:
         dur = float(data.get("format", {}).get("duration", 0)) * 1_000_000
     except (TypeError, ValueError):
         dur = 0
-    return {"has_video": hv, "has_audio": ha, "duration_us": int(dur)}
+    return {"has_video": hv, "has_audio": ha,
+            "audio_codec": acodec, "duration_us": int(dur)}
 
 
 # ================================================================ gpu detection ==
@@ -183,13 +271,46 @@ def default_output(inp, profile, audio):
         return base + "." + ext, tail, info["duration_us"]
 
     vargs, pix, ext = PROFILES[profile]
-    a = audio if ext in AUDIO[audio][1] else "pcm16"
+    # keep the requested audio if the container allows it, else fall back to a
+    # container-valid, Resolve-decodable codec (prefer lossless).
+    if ext in AUDIO[audio][1]:
+        a = audio
+    else:
+        a = next((c for c in ("pcm16", "alac", "mp3") if ext in AUDIO[c][1]), "none")
     tail = list(vargs) + ["-pix_fmt", pix, "-map", "0:v:0"]
     if a != "none":
         tail += ["-map", "0:a:0?"]
     tail += ["-color_primaries", "bt709", "-color_trc", "bt709",
              "-colorspace", "bt709"] + AUDIO[a][0]
     return base + "." + ext, tail, info["duration_us"]
+
+
+def deliver_output(inp, crf, codec):
+    """Return (out_path.mp4, ffmpeg_tail, duration_us) for a universal upload file."""
+    info = probe(inp)
+    base = os.path.splitext(inp)[0]
+    q = str(DELIVER_DEFAULT_CRF[codec] if crf is None else crf)
+
+    # if the source audio is already AAC, copy it as-is (no needless lossy re-encode);
+    # otherwise (e.g. a PCM DNxHR master) encode to AAC 192k.
+    atail = (["-c:a", "copy"] if info["audio_codec"] == "aac"
+             else ["-c:a", "aac", "-b:a", "192k"])
+
+    if not info["has_video"] and info["has_audio"]:
+        # audio-only input -> plain .m4a
+        return base + ".m4a", ["-vn"] + atail, info["duration_us"]
+
+    if codec == "av1":
+        vtail = ["-c:v", "libsvtav1", "-crf", q, "-preset", "6"]
+    elif codec == "hevc":
+        # -tag:v hvc1 so QuickTime/Apple/Instagram recognise the H.265 stream
+        vtail = ["-c:v", "libx265", "-crf", q, "-preset", "medium", "-tag:v", "hvc1"]
+    else:
+        vtail = ["-c:v", "libx264", "-crf", q, "-preset", "medium"]
+    tail = vtail + ["-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                    "-map", "0:v:0", "-map", "0:a:0?", "-dn", "-sn",
+                    "-write_tmcd", "0"] + atail  # drop Resolve's timecode data track
+    return base + ".mp4", tail, info["duration_us"]
 
 
 def resolve_target(inp, default_out, out_file, out_dir):
@@ -247,16 +368,29 @@ def convert(inp, out, tail, dur_us, hw, on_pct):
 
 
 def gather_inputs(paths):
-    files = []
+    """-> (files, problems).  A path that does not exist is reported, never
+    skipped: a typo like `manodavinci deliverr clip.mp4` must not silently
+    look like a normal run."""
+    files, problems = [], []
     for p in paths:
         if os.path.isdir(p):
-            for n in sorted(os.listdir(p)):
-                fp = os.path.join(p, n)
-                if os.path.isfile(fp) and n.rsplit(".", 1)[-1].lower() in VIDEO_EXTS:
-                    files.append(fp)
+            try:
+                names = sorted(os.listdir(p))
+            except OSError as e:
+                problems.append("cannot read folder: %s (%s)" % (p, e.strerror))
+                continue
+            found = [os.path.join(p, n) for n in names
+                     if os.path.isfile(os.path.join(p, n))
+                     and n.rsplit(".", 1)[-1].lower() in VIDEO_EXTS]
+            if found:
+                files.extend(found)
+            else:
+                problems.append("no video/audio files in folder: %s" % p)
         elif os.path.isfile(p):
             files.append(p)
-    return files
+        else:
+            problems.append("not found: %s" % p)
+    return files, problems
 
 
 # ================================================================ GUI dialogs ==
@@ -331,7 +465,7 @@ class Dialogs:
             except (BrokenPipeError, ValueError):
                 pass
         else:
-            sys.stdout.write("\r%3d%%  %s   " % (pct, label))
+            sys.stdout.write("\r\033[K%3d%%  %s" % (pct, label))  # \033[K clears to EOL
             sys.stdout.flush()
 
     def progress_close(self):
@@ -349,13 +483,8 @@ class Dialogs:
 
 
 # ================================================================ batch runner ==
-def run_batch(inputs, profile, audio, force, dlg, out_file=None, out_dir=None):
-    plans = []
-    for inp in inputs:
-        default_out, tail, dur = default_output(inp, profile, audio)
-        out = resolve_target(inp, default_out, out_file, out_dir)
-        plans.append((inp, out, tail, dur))
-
+def _run_plans(plans, force, dlg):
+    """Given [(inp, out, tail, dur)], confirm overwrites then encode with progress."""
     existing = [o for (_, o, _, _) in plans if os.path.exists(o)]
     if existing and not force:
         msg = ("%d output file(s) already exist and will be overwritten:\n\n%s\n\n"
@@ -368,6 +497,7 @@ def run_batch(inputs, profile, audio, force, dlg, out_file=None, out_dir=None):
     dlg.progress_start("Preparing %d file(s)..." % total)
     ok = fail = 0
     last_out_dir = None
+    written = []
     for i, (inp, out, tail, dur) in enumerate(plans):
         label = "(%d/%d) %s" % (i + 1, total, os.path.basename(inp))
 
@@ -375,14 +505,69 @@ def run_batch(inputs, profile, audio, force, dlg, out_file=None, out_dir=None):
             dlg.progress_update((_i * 100 + p) // total, _l)
 
         dlg.progress_update(i * 100 // total, label)
+        d = os.path.dirname(out)
+        if d and not os.path.isdir(d):
+            try:                          # created only once we really encode,
+                os.makedirs(d)            # so a cancelled run leaves no folder
+            except OSError as e:
+                sys.stderr.write("cannot create %s: %s\n" % (d, e))
+                fail += 1
+                continue
         if convert(inp, out, tail, dur, HW_METHOD, on_pct):
             ok += 1
             last_out_dir = os.path.dirname(out) or "."
+            written.append(os.path.abspath(out))
         else:
             fail += 1
     dlg.progress_update(100, "Done")
     dlg.progress_close()
+    if written and dlg.kind == "term":
+        print_written(written)
     return ok, fail, last_out_dir
+
+
+def print_written(written):
+    """Say where the new file(s) landed - the terminal otherwise only shows a
+    count, leaving the user hunting for what was just made."""
+    c = palette()
+    if len(written) == 1:
+        print("Saved: {G}%s{Z}".format(**c) % written[0])
+        return
+    dirs = set(os.path.dirname(w) for w in written)
+    if len(dirs) == 1:
+        print("Saved {G}%d files{Z} in {G}%s{Z}:".format(**c)
+              % (len(written), dirs.pop()))
+        for w in written[:8]:
+            print("  %s" % os.path.basename(w))
+        if len(written) > 8:
+            print("  ... and %d more" % (len(written) - 8))
+    else:
+        print("{G}Saved:{Z}".format(**c))
+        for w in written:
+            print("  %s" % w)
+
+
+def run_batch(inputs, profile, audio, force, dlg, out_file=None, out_dir=None,
+              subdir=None):
+    """subdir: put each output in that folder next to its own input (Resolve flow)."""
+    plans = []
+    for inp in inputs:
+        default_out, tail, dur = default_output(inp, profile, audio)
+        d = out_dir
+        if subdir and not out_file and not out_dir:
+            d = os.path.join(os.path.dirname(os.path.abspath(inp)), subdir)
+        out = resolve_target(inp, default_out, out_file, d)
+        plans.append((inp, out, tail, dur))
+    return _run_plans(plans, force, dlg)
+
+
+def run_deliver(inputs, crf, codec, force, dlg, out_file=None, out_dir=None):
+    plans = []
+    for inp in inputs:
+        default_out, tail, dur = deliver_output(inp, crf, codec)
+        out = resolve_target(inp, default_out, out_file, out_dir)
+        plans.append((inp, out, tail, dur))
+    return _run_plans(plans, force, dlg)
 
 
 # ===================================================== DaVinci Resolve support ==
@@ -417,7 +602,9 @@ def resolve_flow(resolve):
              "2. Then drag the 'broken' clips (the ones with incompatible codec)\n"
              "into the MEDIA POOL (the BOTTOM part of the screen).\n"
              "3. In the MEDIA POOL, select all the clips you want, and then\n"
-             "press your shortcut again to convert it.")
+             "press your shortcut again to convert it.\n\n"
+             "Run \"manodavinci --help\" in a terminal: the GETTING STARTED\n"
+             "section at the end has important advice for beginners.")
     try:
         proj = resolve.GetProjectManager().GetCurrentProject()
         mp = proj.GetMediaPool()
@@ -444,29 +631,32 @@ def resolve_flow(resolve):
         return
 
     # figure out whether we converted video clips, audio files, or a mix,
-    # so the message names the right thing and the right output extension.
+    # so the message names the right thing.
     kinds = set()
     for p in paths:
         info = probe(p)
         kinds.add("video" if info["has_video"] else "audio")
     if kinds == {"audio"}:
-        noun, ext, orig = "audio file(s)", ".wav", "the original file that was not working"
+        noun = "audio file(s)"
     elif kinds == {"video"}:
-        noun, ext, orig = "clip(s)", ".mov", "the original clip that was not working"
+        noun = "clip(s)"
     else:
-        noun, ext, orig = "file(s)", ".mov / .wav", "the original file that wasn't working"
+        noun = "file(s)"
 
-    ok, fail, out_dir = run_batch(paths, DEFAULT_PROFILE, "pcm16", force=False, dlg=dlg)
+    ok, fail, out_dir = run_batch(paths, DEFAULT_PROFILE, "pcm16", force=False,
+                                  dlg=dlg, subdir=RESOLVE_SUBDIR)
     if ok and out_dir:
         if have("xdg-open"):
             subprocess.Popen(["xdg-open", out_dir],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         dlg.notice(
-            "Converted %d %s. The output folder just opened (check for %s files).\n\n"
-            "To use: drag it into the Media Pool "
-            "(or File ▸ Import ▸ Media (CTRL+I)).\n"
-            "Now you can delete, from the project, %s.%s"
-            % (ok, noun, ext, orig, "" if not fail else "\n\n%d failed." % fail))
+            "Converted %d %s into the folder \"%s\", which just opened\n"
+            "(it sits next to your original files).\n\n"
+            "To use: drag it into the Media Pool.\n"
+            "Now you can remove the original \"broken\" %s from your\n"
+            "project's Media Pool.%s"
+            % (ok, noun, RESOLVE_SUBDIR, noun,
+               "" if not fail else "\n\n%d failed." % fail))
     elif fail:
         dlg.error("Conversion failed for %d file(s)." % fail)
 
@@ -483,18 +673,20 @@ def do_install():
     import shutil
     shutil.copyfile(src, dst)
     os.chmod(dst, 0o755)
-    print("Copied:\n  %s\n->\n  %s\n" % (src, dst))
-    print("%s successfully.\n" % ("Upgraded" if existed else "Installed"))
-    print("Now, configure a keyboard shortcut to use it:")
-    print("  1. Restart DaVinci Resolve for it to detect the new script")
-    print("  2. Press Ctrl+Alt+K, or alternatively open")
-    print("     DaVinci Resolve > Keyboard Customization")
-    print("  3. In the small search box, type:  mano")
-    print("  4. Inside '>  Scripts', click on the keystroke field of 'manodavinci',")
-    print("     then press your keys combination (my suggestion: Ctrl+Alt+E)")
-    print("  5. Save it. If asked to create a new preset, do it.")
-    print("  6. Select a clip and press your shortcut.")
-    print("  7. Enjoy!")
+    c = palette()
+    print("{D}Copied:\n  %s\n->\n  %s{Z}\n".format(**c) % (src, dst))
+    print("{G}%s successfully.{Z}\n".format(**c)
+          % ("Upgraded" if existed else "Installed"))
+    print(paint("""{H}Now, configure a keyboard shortcut to use it:{Z}
+  1. Restart DaVinci Resolve for it to detect the new script
+  2. Press {Y}Ctrl+Alt+K{Z}, or alternatively open
+     DaVinci Resolve > Keyboard Customization
+  3. In the small search box, type:  {Y}mano{Z}
+  4. Inside '>  Scripts', click on the keystroke field of '{Y}manodavinci{Z}',
+     then press your keys combination (my suggestion: {Y}Ctrl+Alt+E{Z})
+  5. Save it. If asked to create a new preset, do it.
+  6. Select a clip and press your shortcut.
+  7. Enjoy!"""))
 
 
 def do_uninstall():
@@ -504,6 +696,35 @@ def do_uninstall():
         print("Removed:\n  %s" % dst)
     else:
         print("Nothing to remove (not installed at %s)." % dst)
+
+
+def gui_pick_files(dlg):
+    """Pop a file-chooser for --gui mode; return a list of paths (may be empty)."""
+    if dlg.kind == "kdialog":
+        cmd = ["kdialog", "--getopenfilename", os.path.expanduser("~"),
+               "Videos (*.mp4 *.mov *.mkv *.m4v *.avi *.mts *.m2ts *.webm)",
+               "--multiple", "--separate-output"]
+    elif dlg.kind == "zenity":
+        cmd = ["zenity", "--file-selection", "--multiple", "--separator=\n"]
+    else:
+        return []
+    try:
+        sel = subprocess.check_output(cmd).decode().splitlines()
+    except subprocess.CalledProcessError:
+        return []
+    return [s for s in sel if s]
+
+
+def split_output(output, inputs):
+    """Interpret -o as a single output file or an output directory."""
+    out_file = out_dir = None
+    if output:
+        if len(inputs) > 1 or os.path.isdir(output) or output.endswith(os.sep):
+            out_dir = output
+            os.makedirs(out_dir, exist_ok=True)
+        else:
+            out_file = output
+    return out_file, out_dir
 
 
 def cli(argv):
@@ -549,39 +770,18 @@ def cli(argv):
         sys.stderr.write("GPU: %s\n" % alert)
 
     if use_gui and not rest:
-        if dlg.kind == "kdialog":
-            try:
-                sel = subprocess.check_output(
-                    ["kdialog", "--getopenfilename", os.path.expanduser("~"),
-                     "Videos (*.mp4 *.mov *.mkv *.m4v *.avi *.mts *.m2ts *.webm)",
-                     "--multiple", "--separate-output"]).decode().splitlines()
-            except subprocess.CalledProcessError:
-                return
-            rest = [s for s in sel if s]
-        elif dlg.kind == "zenity":
-            try:
-                sel = subprocess.check_output(
-                    ["zenity", "--file-selection", "--multiple", "--separator=\n"]
-                ).decode().splitlines()
-            except subprocess.CalledProcessError:
-                return
-            rest = [s for s in sel if s]
+        rest = gui_pick_files(dlg)
 
     if not rest:
-        print(HELP); return
+        print(paint(SHORT)); return
 
-    inputs = gather_inputs(rest)
-    if not inputs:
-        die("no video/audio files found in the given path(s)")
+    inputs, problems = gather_inputs(rest)
+    if problems:
+        msg = "\n".join(problems) + "\nNothing was converted."
+        dlg.error(msg) if use_gui else die(msg)
+        return
 
-    # interpret -o as a file (single input) or a directory
-    out_file = out_dir = None
-    if output:
-        if len(inputs) > 1 or os.path.isdir(output) or output.endswith(os.sep):
-            out_dir = output
-            os.makedirs(out_dir, exist_ok=True)
-        else:
-            out_file = output
+    out_file, out_dir = split_output(output, inputs)
 
     if use_gui:
         ok, fail, _ = run_batch(inputs, profile, audio, force, dlg, out_file, out_dir)
@@ -591,10 +791,115 @@ def cli(argv):
     else:
         term = Dialogs(); term.kind = "term"
         ok, fail, _ = run_batch(inputs, profile, audio, force, term, out_file, out_dir)
-        print("Done. converted=%d failed=%d" % (ok, fail))
+        c = palette()
+        print("%sDone. converted=%d failed=%d%s"
+              % (c["G"] if not fail else c["Y"], ok, fail, c["Z"]))
+
+
+def deliver_cli(argv):
+    """`deliver`: any video -> small universal MP4 (H.264/AAC) for upload sites."""
+    crf, codec, hwpref, force, use_gui, output = None, "h264", "auto", False, False, None
+    rest = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--crf":
+            crf = int(argv[i + 1]); i += 2
+        elif a == "--av1":
+            codec = "av1"; i += 1
+        elif a == "--hevc":
+            codec = "hevc"; i += 1
+        elif a in ("-o", "--output"):
+            output = argv[i + 1]; i += 2
+        elif a == "--hwaccel":
+            hwpref = argv[i + 1]; i += 2
+        elif a in ("-f", "--force"):
+            force = True; i += 1
+        elif a == "--gui":
+            use_gui = True; i += 1
+        elif a.startswith("-"):
+            die("unknown option: %s (try --help)" % a)
+        else:
+            rest.append(a); i += 1
+
+    dlg = Dialogs()
+    if not use_gui:
+        dlg.kind = "term"
+
+    if ffmpeg_missing():
+        dlg.error(FFMPEG_MSG) if use_gui else sys.stderr.write(FFMPEG_MSG + "\n")
+        return
+
+    encoder = DELIVER_ENCODER[codec]
+    if not has_encoder(encoder):
+        msg = ("this ffmpeg build has no %s encoder.\n"
+               "Install a full ffmpeg (Arch: sudo pacman -S ffmpeg; "
+               "Debian/Ubuntu: sudo apt install ffmpeg)." % encoder)
+        dlg.error(msg) if use_gui else die(msg)
+        return
+
+    global HW_METHOD
+    HW_METHOD, alert = gpu_method(hwpref)
+    if alert:
+        sys.stderr.write("GPU: %s\n" % alert)
+
+    if use_gui and not rest:
+        rest = gui_pick_files(dlg)
+    if not rest:
+        print(paint(SHORT)); return
+
+    inputs, problems = gather_inputs(rest)
+    if problems:
+        msg = "\n".join(problems) + "\nNothing was delivered."
+        dlg.error(msg) if use_gui else die(msg)
+        return
+
+    out_file, out_dir = split_output(output, inputs)
+    ok, fail, out_dir_done = run_deliver(inputs, crf, codec, force, dlg,
+                                         out_file, out_dir)
+    what = DELIVER_LABEL[codec] + " mp4"
+    if use_gui:
+        dlg.notice("Delivered %d of %d file(s) as %s.%s"
+                   % (ok, len(inputs), what,
+                      "" if not fail else "  Failed: %d." % fail))
+    else:
+        c = palette()
+        print("%sDone. delivered=%d failed=%d (%s)%s"
+              % (c["G"] if not fail else c["Y"], ok, fail, what, c["Z"]))
 
 
 HW_METHOD = None
+
+
+def open_help_in_terminal():
+    """Double-clicked in a file manager (no terminal)? Pop an interactive shell
+    that shows the intro, then stays open so the user can run e.g. `manodavinci
+    install` next (a `manodavinci` command is defined for the session)."""
+    py = shlex.quote(sys.executable)
+    script = shlex.quote(os.path.realpath(__file__))
+    d = shlex.quote(os.path.dirname(os.path.realpath(__file__)))
+    # define `manodavinci`, print the intro, then drop into a normal interactive
+    # bash.  NO_SPAWN stops that intro from opening yet another terminal.
+    inner = ('cd %s; manodavinci() { %s %s "$@"; }; export -f manodavinci; '
+             'export MANODAVINCI_NO_SPAWN=1; manodavinci; echo; exec bash'
+             % (d, py, script))
+    launchers = [
+        ["konsole", "-e", "bash", "-c", inner],
+        ["gnome-terminal", "--", "bash", "-c", inner],
+        ["xfce4-terminal", "-e", "bash -c " + shlex.quote(inner)],
+        ["kitty", "bash", "-c", inner],
+        ["alacritty", "-e", "bash", "-c", inner],
+        ["xterm", "-e", "bash", "-c", inner],
+        ["x-terminal-emulator", "-e", "bash", "-c", inner],
+    ]
+    for cmd in launchers:
+        if have(cmd[0]):
+            try:
+                subprocess.Popen(cmd)
+                return True
+            except Exception:
+                continue
+    return False
 
 
 def main():
@@ -604,7 +909,15 @@ def main():
         if r is not None:
             resolve_flow(r)
             return
-        print(HELP)
+        # launched from a file manager (GUI session, no terminal attached)?
+        gui = os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+        if (gui and not sys.stdout.isatty()
+                and not os.environ.get("MANODAVINCI_NO_SPAWN")):
+            if open_help_in_terminal():
+                return
+            Dialogs().notice(paint(SHORT, color=False))    # fallback if no terminal emulator found
+            return
+        print(paint(SHORT))
         return
 
     cmd = argv[0]
@@ -612,10 +925,22 @@ def main():
         do_install(); return
     if cmd == "uninstall":
         do_uninstall(); return
+    if cmd == "deliver":
+        deliver_cli(argv[1:]); return
     if cmd in ("-h", "--help", "help"):
-        print(HELP); return
+        print(paint(HELP)); return
     if cmd in ("-l", "--list", "list"):
-        print(LIST); return
+        print(paint(LIST)); return
+    if cmd in ("-V", "--version", "version"):
+        print("manodavinci %s" % VERSION); return
+
+    # a misspelled command would otherwise be read as a file name; the missing
+    # file is caught later, but naming the command the user meant is friendlier.
+    if not cmd.startswith("-") and not os.path.exists(cmd):
+        near = difflib.get_close_matches(
+            cmd.lower(), ("deliver", "install", "uninstall", "list", "help"), 1, 0.6)
+        if near:
+            die("unknown command '%s' - did you mean '%s'?" % (cmd, near[0]))
 
     cli(argv)
 
