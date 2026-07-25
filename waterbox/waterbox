@@ -27,9 +27,11 @@ CONTAINER_WORKSPACE="/home/$USER_NAME/workspace"
 # Canonical release of this script. The session picker refreshes UPDATE_CHECK_FILE
 # in the background (throttled) and shows a one-line WARN when upstream is newer;
 # `waterbox update` fetches this and overwrites SELF_PATH.
-UPDATE_URL="https://raw.githubusercontent.com/morkin1792/mylinux/master/waterbox"
+UPDATE_URL="https://raw.githubusercontent.com/morkin1792/mylinux/master/waterbox/waterbox"
+PROJECT_URL="https://github.com/morkin1792/mylinux"
 UPDATE_CHECK_FILE="$CONFIG_DIR/latest_version"   # cached upstream version (bg-refreshed)
 UPDATE_CHECK_INTERVAL=86400                       # seconds between background checks (24h)
+UPDATE_CHECK_ERROR="download-error"
 
 # Root helper (req: safe privilege model). All privileged RUNTIME ops go through
 # this root-owned, uid-1000-immutable binary so the sudoers rule can be NOPASSWD
@@ -2186,8 +2188,9 @@ _version_gt() {
 
 # Fire-and-forget upstream version probe, throttled to once per UPDATE_CHECK_INTERVAL.
 # Touches the cache up front so a failed/offline probe doesn't re-run every launch;
-# a successful probe overwrites it with the upstream version. Fully detached — never
-# blocks the picker, all output discarded. The notice below reads last run's result.
+# a successful probe overwrites it with the upstream version; a failed one records a
+# short error marker. Fully detached — never blocks the picker, all output discarded.
+# The notice below reports the result on the next launch.
 _spawn_update_check() {
     local now mtime
     if [ -f "$UPDATE_CHECK_FILE" ]; then
@@ -2201,7 +2204,11 @@ _spawn_update_check() {
         local remote
         remote=$(curl -fsSL --max-time 8 "$UPDATE_URL" 2>/dev/null \
                  | grep -m1 '^WATERBOX_VERSION=' | cut -d'"' -f2)
-        [ -n "$remote" ] && printf '%s\n' "$remote" > "$UPDATE_CHECK_FILE"
+        if [ -n "$remote" ]; then
+            printf '%s\n' "$remote" > "$UPDATE_CHECK_FILE"
+        else
+            printf '%s\n' "$UPDATE_CHECK_ERROR" > "$UPDATE_CHECK_FILE"
+        fi
     ) >/dev/null 2>&1 &
     disown 2>/dev/null || true
 }
@@ -2212,21 +2219,29 @@ _update_notice() {
     [ -f "$UPDATE_CHECK_FILE" ] || return 1
     remote=$(cat "$UPDATE_CHECK_FILE" 2>/dev/null)
     [ -n "$remote" ] || return 1
+    if [ "$remote" = "$UPDATE_CHECK_ERROR" ]; then
+        printf '%s' "$UPDATE_CHECK_ERROR"
+        return 0
+    fi
     _version_gt "$remote" "$WATERBOX_VERSION" || return 1
     printf '%s' "$remote"
 }
 
-# `waterbox update`: fetch the canonical script and overwrite ourselves in place.
+# `waterbox update`: fetch the canonical script and atomically replace ourselves.
+# Never truncate SELF_PATH in place: Bash may still be reading it, and continuing
+# at the old byte offset in a differently-sized new script can execute random text.
 self_update() {
-    local tmp remote
+    local tmp remote update_dir stage mode owner group
     log_info "Checking $UPDATE_URL ..."
     tmp=$(mktemp)
     if ! curl -fsSL --max-time 20 "$UPDATE_URL" -o "$tmp" 2>/dev/null || [ ! -s "$tmp" ]; then
-        rm -f "$tmp"; log_error "Couldn't download the latest waterbox (network?). Try again later."
+        rm -f "$tmp"
+        log_error "Couldn't download Waterbox. The script URL may have changed; open $PROJECT_URL to investigate."
     fi
     # Sanity-check it's actually a waterbox script before overwriting ourselves.
     if ! head -n1 "$tmp" | grep -q '^#!/usr/bin/env bash' || ! grep -q '^WATERBOX_VERSION=' "$tmp"; then
-        rm -f "$tmp"; log_error "That download doesn't look like waterbox — refusing to install it."
+        rm -f "$tmp"
+        log_error "The update URL did not return a Waterbox script. Open $PROJECT_URL to investigate."
     fi
     remote=$(grep -m1 '^WATERBOX_VERSION=' "$tmp" | cut -d'"' -f2)
     printf '%s\n' "${remote:-$WATERBOX_VERSION}" > "$UPDATE_CHECK_FILE" 2>/dev/null || true
@@ -2236,12 +2251,31 @@ self_update() {
     if ! _version_gt "$remote" "$WATERBOX_VERSION"; then
         rm -f "$tmp"; log_warn "Your waterbox (v$WATERBOX_VERSION) is ahead of upstream (v$remote) — leaving it as is."; return 0
     fi
-    # Overwrite in place (keeps the file's mode/owner). Fall back to sudo when the
-    # install path isn't user-writable (e.g. /usr/local/bin).
-    if cp -f "$tmp" "$SELF_PATH" 2>/dev/null; then :
-    elif sudo cp -f "$tmp" "$SELF_PATH"; then :
-    else rm -f "$tmp"; log_error "Couldn't write $SELF_PATH — check permissions or update it manually."; fi
-    chmod +x "$SELF_PATH" 2>/dev/null || sudo chmod +x "$SELF_PATH" 2>/dev/null || true
+    # Build the replacement beside SELF_PATH, then rename it over the old inode.
+    # The running Bash keeps reading the intact old inode; future invocations open
+    # the complete new one. Preserve ownership/mode, including root-owned installs.
+    update_dir=$(dirname -- "$SELF_PATH")
+    mode=$(stat -c %a "$SELF_PATH")
+    owner=$(stat -c %u "$SELF_PATH")
+    group=$(stat -c %g "$SELF_PATH")
+    stage=""
+    if [ -w "$update_dir" ] && [ "$owner" = "$(id -u)" ]; then
+        stage=$(mktemp "$update_dir/.waterbox-update.XXXXXX") \
+            || { rm -f "$tmp"; log_error "Couldn't prepare an update beside $SELF_PATH."; }
+        if ! install -m "$mode" "$tmp" "$stage" || ! mv -f -- "$stage" "$SELF_PATH"; then
+            rm -f "$stage" "$tmp"
+            log_error "Couldn't write $SELF_PATH — check permissions or update it manually."
+        fi
+    else
+        stage=$(sudo mktemp "$update_dir/.waterbox-update.XXXXXX") \
+            || { rm -f "$tmp"; log_error "Couldn't prepare an update beside $SELF_PATH."; }
+        if ! sudo install -m "$mode" -o "$owner" -g "$group" "$tmp" "$stage" \
+           || ! sudo mv -f -- "$stage" "$SELF_PATH"; then
+            sudo rm -f -- "$stage" 2>/dev/null || true
+            rm -f "$tmp"
+            log_error "Couldn't write $SELF_PATH — check permissions or update it manually."
+        fi
+    fi
     rm -f "$tmp"
     log_success "Updated waterbox: v$WATERBOX_VERSION → v$remote. The next 'waterbox start' syncs the box to it."
 }
@@ -2279,7 +2313,11 @@ attach_session() {
     _spawn_update_check
     local _newver
     if _newver="$(_update_notice)"; then
-        log_warn "waterbox v$_newver is available (you have v$WATERBOX_VERSION) — run 'waterbox update'." > /dev/tty
+        if [ "$_newver" = "$UPDATE_CHECK_ERROR" ]; then
+            log_warn "Couldn't check for updates. The script URL may have changed; open $PROJECT_URL to investigate." > /dev/tty
+        else
+            log_warn "waterbox v$_newver is available (you have v$WATERBOX_VERSION) — run 'waterbox update'." > /dev/tty
+        fi
     fi
     while true; do
         sessions=()
