@@ -13,7 +13,7 @@
 
 ## 🛠️ mylinux tools
 - 💦 [waterbox: script for sandboxing CLI agents, specially claude-code](waterbox)
-- 🎬 [manodavinci: helps you deal with DaVinci Resolve free's codec limitations on Linux by transcoding footage it can't edit](manodavinci)
+- 🎬 [manodavinci: helps you deal with DaVinci Resolve free's codec limitations on Linux by transcoding footage it can't edit](manodavinci/manodavinci)
 - 🛡️ [pvpn: ProtonVPN CLI wrapper to make it a bit decent](pvpn)
 
 

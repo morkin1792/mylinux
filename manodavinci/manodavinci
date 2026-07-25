@@ -81,8 +81,11 @@ DELIVER_DEFAULT_CRF = {"h264": 20, "hevc": 24, "av1": 30}
 DELIVER_ENCODER = {"h264": "libx264", "hevc": "libx265", "av1": "libsvtav1"}
 DELIVER_LABEL = {"h264": "H.264", "hevc": "H.265", "av1": "AV1"}
 
-VIDEO_EXTS = ("mp4", "m4v", "mov", "mkv", "avi", "mts", "m2ts", "webm",
-              "m2v", "mpg", "mpeg", "wmv", "flv", "3gp")
+# what a folder scan picks up.  Audio-only files count: Resolve free rejects
+# AAC too, so a stray .m4a is just as broken as a .mp4.
+MEDIA_EXTS = ("mp4", "m4v", "mov", "mkv", "avi", "mts", "m2ts", "webm",
+              "m2v", "mpg", "mpeg", "wmv", "flv", "3gp",
+              "m4a", "aac", "mp3", "wav", "flac", "ogg", "opus", "aiff", "wma")
 
 RESOLVE_UTILITY = os.path.expanduser(
     "~/.local/share/DaVinciResolve/Fusion/Scripts/Utility")
@@ -100,8 +103,9 @@ GETTING_STARTED = """{G}GETTING STARTED{Z}
   Resolve free can't open H.264 / H.265 / AAC files.  manodavinci fixes both ends:
     1. Install it into Resolve:   {C}manodavinci install{Z}
        {D}(then just follow the short instructions it prints){Z}
-    2. In Resolve, select a clip that shows black and run manodavinci - it
-       saves a converted copy in a folder next to it.  Import that and edit.
+    2. In Resolve, select a clip that came in empty (no picture, no sound)
+       and run manodavinci - it saves a converted copy in a folder next to
+       it.  Import that copy and edit.
     3. Done editing?  Render it using the following specs:
          Format  {Y}QuickTime{Z}
          Codec   {Y}Avid DNxHR{Z}
@@ -381,7 +385,7 @@ def gather_inputs(paths):
                 continue
             found = [os.path.join(p, n) for n in names
                      if os.path.isfile(os.path.join(p, n))
-                     and n.rsplit(".", 1)[-1].lower() in VIDEO_EXTS]
+                     and n.rsplit(".", 1)[-1].lower() in MEDIA_EXTS]
             if found:
                 files.extend(found)
             else:
