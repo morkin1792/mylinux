@@ -257,6 +257,16 @@ The agents run in bypass/danger-full-access modes intentionally because Waterbox
 is their sandbox. Do not “harden” the in-agent settings in a way that makes normal
 work fail while leaving the actual container boundary unchanged.
 
+Claude Code starts with its fullscreen renderer and focus view enabled through
+the user settings keys `"tui": "fullscreen"` and `"viewMode": "focus"`. Focus
+shows the latest prompt, compact tool summaries/diffstats, and the final response.
+Apply these keys as defaults to existing profiles only when absent, so an explicit
+per-account preference remains respected.
+
+Claude Code also defaults to the Opus model with `"effortLevel": "high"`. Existing
+profiles matching Waterbox’s former exact default of Opus + `xhigh` are migrated
+to Opus + `high`; other explicit model/effort combinations are preserved.
+
 Deleting the active/default profile must:
 
 - succeed even if `.default` is already absent;

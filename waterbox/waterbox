@@ -128,8 +128,10 @@ _agent_settings_template() {   # $1 = agent key; writes the settings file body
     "defaultMode": "bypassPermissions"
   },
   "model": "opus",
-  "effortLevel": "xhigh",
+  "effortLevel": "high",
   "autoMemoryEnabled": true,
+  "tui": "fullscreen",
+  "viewMode": "focus",
   "skipDangerousModePermissionPrompt": true,
   "statusLine": {
     "type": "command",
@@ -958,28 +960,25 @@ _agent_env_seed() {   # $1 = agent key, $2 = slot dir
     return 0
 }
 
-# Point this account's Claude settings at the shared statusline script, so every
-# account shows the same line and one /statusline changes all of them.
+# Apply Waterbox's newer Claude defaults to an existing account and point it at the
+# shared statusline script, so every account shows the same line and one /statusline
+# changes all of them. New preference keys are ADD-ONLY, except that the former
+# exact Waterbox default (Opus + xhigh) migrates to the new Opus + high default.
+# Other explicit account choices remain untouched.
 #
-# ADD-ONLY: if a statusLine key already exists we never touch it, so per-account
-# choices stick. Set "statusLine": null in an account to drop the line there.
-# (Path must match STATUSLINE_PATH on the host side — both heredocs are quoted.)
-_agent_env_ensure_statusline() {   # $1 = the claude slot dir
+# PRESERVE OVERRIDES: a custom/null statusLine is never touched; only Waterbox's
+# own current/retired entry may be refreshed. Set "statusLine": null in an account
+# to drop the line there. (Path must match STATUSLINE_PATH on the host side — both
+# heredocs are quoted.)
+_agent_env_ensure_claude_defaults() {   # $1 = the claude slot dir
     local s="$1/settings.json"
-    [[ -x "$HOME/.claude/statusline-command.sh" ]] || return 0
+    local have_statusline=0
     [[ -f "$s" ]] || return 0
-    # Fast path only when there is provably nothing to do. Two reasons to fall
-    # through even though a statusLine exists: it still points at the pre-1.9.1 path
-    # (gone now — repoint it or the line just disappears), or it carries an older
-    # refreshInterval. Python has the final say on whether the entry is ours to touch.
-    if grep -q '"statusLine"'     "$s" 2>/dev/null \
-    && grep -q '"refreshInterval"[[:space:]]*:[[:space:]]*30' "$s" 2>/dev/null \
-    && ! grep -q '/usr/local/bin/waterbox-statusline' "$s" 2>/dev/null; then
-        return 0
-    fi
+    [[ -x "$HOME/.claude/statusline-command.sh" ]] && have_statusline=1
     python3 -c '
 import json, sys
 p = sys.argv[1]
+have_statusline = sys.argv[2] == "1"
 cmd = "~/.claude/statusline-command.sh"
 # refreshInterval is seconds: without it the line only repaints on an assistant
 # message, so the quota % and the reset countdown sit stale while you read /usage.
@@ -991,18 +990,39 @@ except Exception:
     sys.exit(0)                      # unreadable/invalid: leave it entirely alone
 if not isinstance(d, dict):
     sys.exit(0)
-cur = d.get("statusLine")
-if "statusLine" in d:
-    # Only ever rewrite an entry that is still OURS — a retired path to migrate, or
-    # our own path missing newer keys. Anything else is a deliberate choice: left be.
-    if not (isinstance(cur, dict) and cur.get("command") in ours):
-        sys.exit(0)
-    if cur == new:
-        sys.exit(0)
-d["statusLine"] = new
+changed = False
+# Default to Opus with high effort. Migrate the exact former Waterbox pair while
+# preserving any other explicit model/effort combination.
+if "model" not in d:
+    d["model"] = "opus"
+    changed = True
+if "effortLevel" not in d:
+    d["effortLevel"] = "high"
+    changed = True
+elif d.get("model") == "opus" and d["effortLevel"] == "xhigh":
+    d["effortLevel"] = "high"
+    changed = True
+# /focus is available only in Claude Code fullscreen rendering. These are defaults,
+# not policy: preserve an explicit per-account choice if either key already exists.
+for key, value in (("tui", "fullscreen"), ("viewMode", "focus")):
+    if key not in d:
+        d[key] = value
+        changed = True
+if have_statusline:
+    cur = d.get("statusLine")
+    if "statusLine" not in d:
+        d["statusLine"] = new
+        changed = True
+    # Only rewrite an entry that is still OURS — a retired path to migrate, or our
+    # own path missing newer keys. Anything else is a deliberate choice: left be.
+    elif isinstance(cur, dict) and cur.get("command") in ours and cur != new:
+        d["statusLine"] = new
+        changed = True
+if not changed:
+    sys.exit(0)
 with open(p, "w") as f:
     json.dump(d, f, indent=2); f.write("\n")
-' "$s" 2>/dev/null
+' "$s" "$have_statusline" 2>/dev/null
     return 0
 }
 
@@ -1061,7 +1081,7 @@ _agent_env_select() {   # $1 = account name
         mkdir -p "$dir"
         _agent_env_seed "$k" "$dir"
         _agent_env_share_history "$k" "$dir"
-        [[ "$k" == claude ]] && _agent_env_ensure_statusline "$dir"
+        [[ "$k" == claude ]] && _agent_env_ensure_claude_defaults "$dir"
         export "$(_agent_f $k 4)=$dir"
     done
     export AGENT_ENV_PROFILE="$1"
