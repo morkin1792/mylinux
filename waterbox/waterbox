@@ -4,7 +4,7 @@
 
 set -e
 
-WATERBOX_VERSION="1.9"
+WATERBOX_VERSION="1.15"
 
 # Absolute path to this script, recorded so the shell-completion snippet can fall
 # back to it when 'waterbox' isn't on $PATH (e.g. run by ./waterbox, or moved).
@@ -14,10 +14,12 @@ SELF_PATH="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo "$0")"
 JAIL_ROOT="$HOME/.waterbox/root"
 CONFIG_DIR="$HOME/.waterbox"
 SHARE_LIST="$CONFIG_DIR/shared_paths"
-GUI_ENV_FILE="$CONFIG_DIR/gui_env"       # export VAR="val" lines; helper copies into the rootfs
+PENDING_SHARE_LIST="$CONFIG_DIR/shared_paths.pending"
+GUI_ENV_FILE="$CONFIG_DIR/gui_env"       # user-side diagnostic copy; helper derives its own trusted env
 GUI_BINDS_FILE="$CONFIG_DIR/gui_binds"   # --bind spec lines the helper validates at boot
-USER_NAME="water"               # user inside the container (uid 1000 == host user)
+USER_NAME="water"               # fixed guest user (uid 1000; ID-mapped to host user securely)
 RUN_USER="$(id -un)"            # the host user invoking this script
+HOST_RUNTIME_DIR="/run/user/$(id -u)"
 MACHINE_NAME="waterbox"         # external name: systemd unit, machinectl, ve-* iface
 INSIDE_HOSTNAME="box"           # hostname shown inside the container
 TMUX_SESSION="box"              # tmux session that wraps the interactive shell
@@ -32,6 +34,7 @@ PROJECT_URL="https://github.com/morkin1792/mylinux"
 UPDATE_CHECK_FILE="$CONFIG_DIR/latest_version"   # cached upstream version (bg-refreshed)
 UPDATE_CHECK_INTERVAL=86400                       # seconds between background checks (24h)
 UPDATE_CHECK_ERROR="download-error"
+BOOTSTRAP_IN_PROGRESS="$CONFIG_DIR/bootstrap-in-progress"
 
 # Root helper (req: safe privilege model). All privileged RUNTIME ops go through
 # this root-owned, uid-1000-immutable binary so the sudoers rule can be NOPASSWD
@@ -54,9 +57,9 @@ VE_IFACE="ve-$MACHINE_NAME"     # systemd-nspawn names the host side ve-<machine
 # when the host has a restrictive INPUT policy (ufw, firewalld, etc.).
 ALLOW_CONTAINER_TO_HOST_PORTS=true
 
-# DNS servers used inside the container. A VPN client inside is free to replace
-# /etc/resolv.conf at runtime.
-DNS_SERVERS=("8.8.8.8" "1.1.1.1")
+# Public fallbacks used after the host's primary resolver. A VPN client inside is
+# still free to replace /etc/resolv.conf later during the running session.
+DNS_SERVERS=("1.1.1.1" "8.8.8.8")
 
 # --- Arch bootstrap image (req 6: no host pacstrap, works on any distro) ------
 # We fetch the official signed Arch bootstrap tarball and install packages
@@ -168,7 +171,7 @@ EOF
 # GPU (/dev/dri) is shared, not exclusive, so it's bound by default; --no-gpu off.
 WATERBOX_GUI="${WATERBOX_GUI:-auto}"
 WATERBOX_NO_GPU="${WATERBOX_NO_GPU:-0}"
-WATERBOX_HERE="${WATERBOX_HERE:-0}"   # `start --here`: share cwd + open a session in it
+WATERBOX_HERE=0                       # CLI-only: `start --here` shares cwd + opens there
 WATERBOX_X11="${WATERBOX_X11:-0}"     # explicit opt-in to X11/Xwayland on a Wayland host
 # Deliberately NOT configurable through the environment or a saved config file.
 # Only the hidden, explicit CLI flag may enable this for the current invocation.
@@ -186,14 +189,30 @@ WATERBOX_TASKS_MAX="2048"
 WATERBOX_CPU_WEIGHT="50"
 WATERBOX_IO_WEIGHT="50"
 
-mkdir -p "$CONFIG_DIR"
-touch "$SHARE_LIST"
+_ensure_user_config() {
+    mkdir -p "$CONFIG_DIR"
+    touch "$SHARE_LIST"
+}
 
 # --- Logging ---
-log_info()    { echo -e "\e[34m[INFO]\e[0m $1"; }
-log_success() { echo -e "\e[32m[ OK ]\e[0m $1"; }
-log_warn()    { echo -e "\e[33m[WARN]\e[0m $1"; }
-log_error()   { echo -e "\e[31m[ERR ]\e[0m $1"; exit 1; }
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    L_BLUE=$'\e[34m'; L_GREEN=$'\e[32m'; L_YELLOW=$'\e[33m'; L_RED=$'\e[31m'; L_OFF=$'\e[0m'
+else
+    L_BLUE=''; L_GREEN=''; L_YELLOW=''; L_RED=''; L_OFF=''
+fi
+log_info()    { printf '%s[INFO]%s %s\n' "$L_BLUE" "$L_OFF" "$1"; }
+log_success() { printf '%s[ OK ]%s %s\n' "$L_GREEN" "$L_OFF" "$1"; }
+log_warn()    { printf '%s[WARN]%s %s\n' "$L_YELLOW" "$L_OFF" "$1"; }
+log_error()   { printf '%s[ERR ]%s %s\n' "$L_RED" "$L_OFF" "$1"; exit 1; }
+
+_valid_session_name() {
+    [ "${#1}" -le 128 ] || return 1
+    case "$1" in ''|.|..|-*|*[!A-Za-z0-9._-]*) return 1 ;; *) return 0 ;; esac
+}
+_valid_profile_name() {
+    [ "${#1}" -le 128 ] || return 1
+    case "$1" in ''|.|..|-*|*[!A-Za-z0-9._-]*) return 1 ;; *) return 0 ;; esac
+}
 
 # --- Symlink-safe writes into the rootfs ---------------------------------------
 # Container root owns everything under $JAIL_ROOT, so it can point any managed file
@@ -205,11 +224,85 @@ log_error()   { echo -e "\e[31m[ERR ]\e[0m $1"; exit 1; }
 # write. No temp file and no rm: nothing to leak, nothing to delete by accident.
 _in_jail() {   # $1 = intended destination path under $JAIL_ROOT
     local rp; rp=$(realpath -m "$1" 2>/dev/null) || return 1
+    # JAIL_ROOT deliberately remains literal. A bind mount at ~/.waterbox keeps
+    # this path and is supported; a symlink would let the unprivileged caller
+    # redirect the passwordless root helper into an arbitrary host directory.
     case "$rp" in "$JAIL_ROOT"/*) return 0 ;; *) return 1 ;; esac
 }
-wb_tee() {     # usage: … | wb_tee <dest>   (root-owned write, symlink-safe)
+_guard_jail_path() {
     _in_jail "$1" \
-        || log_error "Refusing to write '$1': it resolves outside $JAIL_ROOT, so the box has tampered with that path. Run 'waterbox reset' to rebuild the rootfs."
+        || log_error "Refusing host-root access to '$1': it resolves outside $JAIL_ROOT. Run 'waterbox reset' to rebuild the rootfs."
+}
+
+# Read a small regular file from the attacker-controlled rootfs without following
+# any in-rootfs symlink, blocking on a FIFO/device, or accepting unbounded data.
+# This runs as the ordinary host user; directory fds make the no-symlink check apply
+# to every component instead of only the leaf. stdout is emitted only on success.
+_read_jail_regular() {   # $1 = path below JAIL_ROOT, $2 = maximum bytes
+    _in_jail "$1" || return 1
+    python3 - "$JAIL_ROOT" "$1" "$2" <<'PY'
+import os
+import stat
+import sys
+
+root, path, limit_arg = sys.argv[1:]
+try:
+    limit = int(limit_arg)
+except ValueError:
+    raise SystemExit(1)
+if limit < 0 or limit > 16 * 1024 * 1024:
+    raise SystemExit(1)
+
+root = os.path.abspath(root)
+path = os.path.abspath(path)
+rel = os.path.relpath(path, root)
+if rel == ".." or rel.startswith("../") or os.path.isabs(rel):
+    raise SystemExit(1)
+
+dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+file_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+fds = []
+try:
+    current = os.open(root, dir_flags)
+    fds.append(current)
+    parts = rel.split("/")
+    for part in parts[:-1]:
+        if part in ("", ".", ".."):
+            raise OSError("invalid path component")
+        current = os.open(part, dir_flags, dir_fd=current)
+        fds.append(current)
+    leaf = parts[-1]
+    if leaf in ("", ".", ".."):
+        raise OSError("invalid path leaf")
+    fd = os.open(leaf, file_flags, dir_fd=current)
+    fds.append(fd)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        raise OSError("not a regular file")
+    chunks = []
+    remaining = limit + 1
+    while remaining:
+        chunk = os.read(fd, remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    data = b"".join(chunks)
+    if len(data) > limit:
+        raise OSError("file exceeds limit")
+    os.write(sys.stdout.fileno(), data)
+except (OSError, ValueError):
+    raise SystemExit(1)
+finally:
+    for fd in reversed(fds):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+PY
+}
+
+wb_tee() {     # usage: … | wb_tee <dest>   (root-owned write, symlink-safe)
+    _guard_jail_path "$1"
     sudo tee "$1" > /dev/null
 }
 
@@ -245,7 +338,7 @@ ${C_HEAD}Box${C_OFF}
   ${C_CMD}start --here${C_OFF}                Name the session after the current directory and open
                               it inside, sharing that directory into the box first.
   ${C_CMD}stop${C_OFF}                        Power the box off.
-  ${C_CMD}restart${C_OFF} [--gui]             stop + start (e.g. for --gui / GPU changes).
+  ${C_CMD}restart${C_OFF} [GUI/GPU options]   stop + start (e.g. for display / GPU changes).
   ${C_CMD}status${C_OFF}                      Show if the box is running and its resource limits.
   ${C_CMD}reset${C_OFF}                       Wipe the rootfs and rebuild.
   ${C_CMD}update${C_OFF}                      Self-update waterbox to the latest release from GitHub.
@@ -325,6 +418,9 @@ is depends entirely on your display server.
 Pass ${C_CMD}--gui${C_OFF} on an X11 desktop only when you accept that trade. On Wayland,
 ${C_CMD}--x11${C_OFF} explicitly adds the unsafe Xwayland fallback; plain ${C_CMD}--gui${C_OFF} remains Wayland-only.
 Use ${C_CMD}--no-gui${C_OFF} when you want nothing forwarded.
+
+Options may appear before or after the command. Use ${C_CMD}--${C_OFF} before a literal path
+or scheduled command value that is itself named like an option. Session names cannot start with -.
 EOF
 }
 help_wake() {
@@ -354,6 +450,7 @@ ${C_HEAD}Usage:${C_OFF} ${C_CMD}waterbox schedule-command${C_OFF} [<session> <HH
 At <HH:MM>, type <command> + Enter into an existing tmux session (e.g. fire a
 prompt the moment your quota resets). The session must exist when you add it.
 An empty command ("") just sends Enter — listed as <enter>.
+If the command is literally named like an option, put ${C_CMD}--${C_OFF} before it.
 
   ${C_DIM}(no args)${C_OFF}                                    Open the live manager (a add · d del · q quit).
   ${C_CMD}<session>${C_OFF}                                    Pick the session, then just ask time, when + command.
@@ -373,6 +470,7 @@ to the host directory's owner, while container root remains unmapped. Adding or
 detaching a share takes effect immediately while the box is running and persists
 for future starts.
 A leading ~ is expanded to your home. 'detach' only unmounts — it never deletes files.
+If a path is literally named like an option, put ${C_CMD}--${C_OFF} before it.
 
   ${C_DIM}(no args)${C_OFF}      Open the live manager (a add · d detach · q quit).
   ${C_CMD}add <path>${C_OFF}     Share a directory.
@@ -422,17 +520,16 @@ verify_tarball() {
 # inside (loopback is the container's own), so it's remapped to HOST_IP — which the
 # container->host DNAT forwards to the host's 127.0.0.1:53. Other loopback stubs (e.g.
 # systemd-resolved's 127.0.0.53) are skipped in favour of its real upstreams in
-# /run/systemd/resolve/resolv.conf. Public DNS_SERVERS are appended as a fallback so
-# there's always something that works. Deduped, order preserved.
+# /run/systemd/resolve/resolv.conf. Keep only the first usable host resolver, then
+# append both public fallbacks. glibc considers at most three nameservers, so letting
+# every host/VPN resolver come first could silently push the fallbacks out of use.
 #
 # The remapped HOST_IP resolver is reachable even when the host binds DNS to 127.0.0.1
 # only (not 0.0.0.0): the DNAT to 127.0.0.1 + route_localnet (both set by net_up) hand
-# the query to the loopback-bound listener. If that resolver has a source ACL and drops
-# or refuses the container's query, glibc moves to the next nameserver — so the public
-# fallback still answers. 'options timeout:2 attempts:2' keeps that fall-through quick
-# (≈2s) instead of the default 5s-per-query stall.
+# the query to the loopback-bound listener. A one-second timeout makes an obsolete
+# Wi-Fi/VPN resolver fall through quickly, while two attempts tolerate packet loss.
 _container_nameservers() {
-    local kw val seen=" " src
+    local kw val primary="" seen=" " src
     for src in /etc/resolv.conf /run/systemd/resolve/resolv.conf; do
         [ -r "$src" ] || continue
         while read -r kw val _; do
@@ -441,15 +538,20 @@ _container_nameservers() {
                 127.0.0.1)    val="$HOST_IP" ;;   # host-local resolver: reach via DNAT
                 127.*|::1|::) continue ;;         # other loopback stubs: unreachable
             esac
-            case "$seen" in *" $val "*) continue ;; esac
-            seen="$seen$val "; echo "nameserver $val"
+            primary="$val"
+            break
         done < "$src"
+        [ -n "$primary" ] && break
     done
+    if [ -n "$primary" ]; then
+        seen="$seen$primary "
+        echo "nameserver $primary"
+    fi
     for val in "${DNS_SERVERS[@]}"; do
         case "$seen" in *" $val "*) continue ;; esac
         seen="$seen$val "; echo "nameserver $val"
     done
-    echo "options timeout:2 attempts:2"   # fall through to the fallback quickly
+    echo "options timeout:1 attempts:2"
 }
 
 # Probe --restrict-address-families rather than inferring it from a version number:
@@ -547,6 +649,9 @@ bootstrap_sandbox() {
     # a network hiccup during the pacman/yay steps — is retried cleanly instead
     # of leaving a half-configured rootfs that the next run mistakes for ready.
     if [ -f "$JAIL_ROOT/.waterbox-ready" ]; then
+        # A crash after the ready marker but before clearing the host-side retry
+        # marker is harmless; the completed rootfs always wins.
+        rm -f "$BOOTSTRAP_IN_PROGRESS"
         # Also gates an existing v1.8/unsafe tree. Cold starts are cheap enough to
         # test the real filesystem capability; an explicitly unsafe request is
         # accepted only when this exact probe fails.
@@ -558,10 +663,19 @@ bootstrap_sandbox() {
     if is_running; then
         log_error "The sandbox is running but its readiness marker is missing. Refusing to rebuild a live rootfs; stop it and run 'waterbox reset'."
     fi
+    # A box can delete its own in-rootfs ready marker. Never interpret that alone
+    # as permission to erase a stopped box and its home. Only retry automatically
+    # when our host-side marker proves that Waterbox itself began an earlier
+    # bootstrap which did not complete.
+    if [ -e "$JAIL_ROOT" ] && [ ! -f "$BOOTSTRAP_IN_PROGRESS" ]; then
+        log_error "The rootfs exists but its readiness marker is missing. Waterbox will not erase it automatically; run 'waterbox reset' to inspect the keep-home choices and rebuild."
+    fi
     # Check before downloading or replacing anything. start/reset normally preflight
     # this already; keeping the guard here makes the destructive function safe when
     # called from a future code path too.
     _require_secure_nspawn
+    _ensure_user_config
+    : > "$BOOTSTRAP_IN_PROGRESS"
 
     log_info "Bootstrapping Arch rootfs at $JAIL_ROOT (this takes a few minutes)..."
     # WB_TMP is script-scope (not local) so the EXIT trap can remove it even when
@@ -591,6 +705,7 @@ bootstrap_sandbox() {
     echo 'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch' \
         | wb_tee "$JAIL_ROOT/etc/pacman.d/mirrorlist"
     # CheckSpace mis-reports on overlay/df; disable while we install.
+    _guard_jail_path "$JAIL_ROOT/etc/pacman.conf"
     sudo sed -i 's/^CheckSpace/#CheckSpace/' "$JAIL_ROOT/etc/pacman.conf"
 
     log_info "Initializing pacman keyring inside the rootfs..."
@@ -608,6 +723,7 @@ bootstrap_sandbox() {
     if ! _nspawn_build \
             pacman -Syu --noconfirm --needed "${PKGS[@]}"; then
         log_warn "pacman couldn't use its download sandbox (kernel Landlock unavailable) — disabling it and retrying."
+        _guard_jail_path "$JAIL_ROOT/etc/pacman.conf"
         sudo sed -i '/^\[options\]/a DisableSandbox' "$JAIL_ROOT/etc/pacman.conf"
         _nspawn_build \
             pacman -Syu --noconfirm --needed "${PKGS[@]}"
@@ -623,6 +739,7 @@ bootstrap_sandbox() {
     # resolv.conf derived from the host's DNS (see _container_nameservers) — nspawn
     # won't touch it (--resolv-conf=off), systemd-resolved is masked below so it can't
     # reclaim it, and a VPN client inside is free to overwrite it.
+    _guard_jail_path "$JAIL_ROOT/etc/resolv.conf"
     sudo rm -f "$JAIL_ROOT/etc/resolv.conf"
     _container_nameservers | wb_tee "$JAIL_ROOT/etc/resolv.conf"
 
@@ -641,6 +758,7 @@ bootstrap_sandbox() {
         useradd -m -s /usr/bin/zsh -u 1000 "$USER_NAME" 2>/dev/null || true
     echo "$USER_NAME ALL=(ALL) NOPASSWD: ALL" \
         | wb_tee "$JAIL_ROOT/etc/sudoers.d/10-$USER_NAME"
+    _guard_jail_path "$JAIL_ROOT/etc/sudoers.d/10-$USER_NAME"
     sudo chmod 0440 "$JAIL_ROOT/etc/sudoers.d/10-$USER_NAME"
 
     # GPU access for the user (best-effort: groups may not match host gids, in
@@ -650,10 +768,12 @@ bootstrap_sandbox() {
         getent group video  >/dev/null || groupadd -r video
         usermod -aG video,render '"$USER_NAME"'' 2>/dev/null || true
 
+    _guard_jail_path "$JAIL_ROOT$CONTAINER_WORKSPACE"
     sudo mkdir -p "$JAIL_ROOT$CONTAINER_WORKSPACE"
     sudo chown -R 1000:1000 "$JAIL_ROOT$CONTAINER_WORKSPACE"
 
     # Static network config for host0 (container side of the veth pair).
+    _guard_jail_path "$JAIL_ROOT/etc/systemd/network"
     sudo mkdir -p "$JAIL_ROOT/etc/systemd/network"
     {
         echo "[Match]"
@@ -694,6 +814,7 @@ bootstrap_sandbox() {
     # AUR openai-codex-bin is the one to avoid — it has shipped without the
     # codex-code-mode-host companion binary, needed by code-capable models.)
 
+    _guard_jail_path "$JAIL_ROOT/etc/pacman.conf"
     sudo sed -i 's/#CheckSpace/CheckSpace/' "$JAIL_ROOT/etc/pacman.conf"
 
     configure_dotfiles
@@ -703,7 +824,9 @@ bootstrap_sandbox() {
 
     # Mark the build complete (see the sentinel check at the top) and drop the
     # tmp-cleanup trap now that bootstrap succeeded.
+    _guard_jail_path "$JAIL_ROOT/.waterbox-ready"
     sudo touch "$JAIL_ROOT/.waterbox-ready"
+    rm -f "$BOOTSTRAP_IN_PROGRESS"
     trap - EXIT
     log_success "Rootfs ready at $JAIL_ROOT"
 }
@@ -1178,10 +1301,14 @@ _agent_env_load() {   # $1 = name of an EXISTING account
     print "Active account: $name  (run 'claude' or 'codex')"
 }
 
+_agent_env_valid_new_name() {
+    [[ -n "$1" && ${#1} -le 128 && "$1" != .* && "$1" != -* && "$1" != *[^A-Za-z0-9._-]* ]]
+}
+
 _agent_env_create() {   # $1 = account name; created if missing, then selected
     local name="$1"; local -a ps
-    if [[ -z "$name" || "$name" == */* || "$name" == .* ]]; then
-        print "Invalid account name: '$name'"; return 1
+    if ! _agent_env_valid_new_name "$name"; then
+        print "Invalid account name: '$name' (use letters, digits, ., _ or -; do not start with . or -)"; return 1
     fi
     ps=(${(f)"$(_agent_env_list)"})
     if (( ${ps[(I)$name]} )); then
@@ -1516,6 +1643,7 @@ install_agent_env() {
 # (pre-migration); never clobber that, migrate_agent_env owns it.
 _link_legacy_claude_env() {
     local legacy="$JAIL_ROOT/home/$USER_NAME/.claude-env"
+    _guard_jail_path "$legacy"
     [ -d "$legacy" ] && [ ! -L "$legacy" ] && return 0
     sudo ln -sfn ".agent-env/claude" "$legacy"
 }
@@ -1546,8 +1674,8 @@ migrate_agent_env() {
     # ~/.agent-env/claude at a HOST directory. mkdir -p follows that symlink and `mv`
     # then deposits box-authored files — names, contents and ownership all chosen by
     # container root — outside the rootfs. Resolve the destinations first and refuse.
-    _in_jail "$new/claude" \
-        || log_error "Refusing to migrate accounts: '$new/claude' resolves outside $JAIL_ROOT, so the box has tampered with it. Run 'waterbox reset' to rebuild the rootfs."
+    _guard_jail_path "$legacy"
+    _guard_jail_path "$new/claude"
     sudo mkdir -p "$new/claude"
     # Move everything across wholesale: profile dirs, .shared and .default alike.
     # '|| true' so a failed move doesn't abort the whole start (set -e): the rmdir
@@ -1602,10 +1730,9 @@ is_running() {
 # dir) and writes two spec files the root helper consumes at boot:
 #   GUI_BINDS_FILE  — one "<src>[:<dst>]" per line; the helper validates each (only
 #                     the display sockets + our own xauth file) before binding.
-#   GUI_ENV_FILE    — "export VAR=..." lines; the helper copies these into the
-#                     rootfs /etc/waterbox/gui-env, which the login shell sources
-#                     (the reliable path — DISPLAY reaching a session must not
-#                     depend on tmux/machinectl env propagation).
+#   GUI_ENV_FILE    — an ordinary-user diagnostic copy of the intended exports.
+#                     The helper never trusts/copies it; it derives the guest
+#                     environment from the display mounts it validated itself.
 # Both files are cleared first, so a boot WITHOUT --gui leaves nothing stale.
 #
 # It auto-detects the host's display server from which socket actually binds, then
@@ -1615,14 +1742,18 @@ is_running() {
 build_gui_bind_args() {
     : > "$GUI_ENV_FILE"; : > "$GUI_BINDS_FILE"
     [ "$WATERBOX_GUI" = "1" ] || return 0
-    local env_lines=() l have_x=0 have_wl=0
+    local env_lines=() l have_x=0 have_wl=0 wlbase=""
+    local wl_runtime="$HOST_RUNTIME_DIR"
 
     # Wayland first. On a Wayland host, plain --gui (and the automatic default)
     # must never quietly add Xwayland too: X11 has no client isolation. --x11 is
     # the explicit opt-in for users who knowingly need that compatibility path.
     local wlsock="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/${WAYLAND_DISPLAY:-}"
     [ -S "$wlsock" ] || wlsock="${WAYLAND_DISPLAY:-}"
-    if [ -n "${WAYLAND_DISPLAY:-}" ] && [ -S "$wlsock" ]; then
+    wlbase=$(basename -- "$wlsock")
+    if [ -n "${WAYLAND_DISPLAY:-}" ] && [ "$wlsock" = "$wl_runtime/$wlbase" ] \
+       && [[ "$wlbase" =~ ^wayland-[0-9]+$ ]] \
+       && [ -S "$wlsock" ] && [ ! -L "$wlsock" ]; then
         echo "$wlsock:/tmp/.waterbox-wayland" >> "$GUI_BINDS_FILE"
         env_lines+=("WAYLAND_DISPLAY=/tmp/.waterbox-wayland")
         have_wl=1
@@ -1678,6 +1809,10 @@ build_gui_bind_args() {
     { for l in "${env_lines[@]}"; do
           printf 'export %s="%s"\n' "${l%%=*}" "${l#*=}"
       done; } > "$GUI_ENV_FILE"
+    if [ "$have_wl" != 1 ] && [ "$have_x" != 1 ]; then
+        log_warn "GUI was requested, but no usable Wayland or X11 display socket was found."
+        return 1
+    fi
     return 0
 }
 
@@ -1688,10 +1823,21 @@ container_tmux() {
     sudo "$HELPER_PATH" tmux "$@"
 }
 
+_sanitize_session_names() {
+    local s count=0
+    while IFS= read -r s || [ -n "$s" ]; do
+        _valid_session_name "$s" || continue
+        printf '%s\n' "$s"
+        count=$((count + 1))
+        [ "$count" -lt 512 ] || break
+    done
+}
+
 # Best-effort session listing for shell completion: `sudo -n` on the NOPASSWD helper
 # never prompts. Prints nothing when the box is down — completion just offers none.
 list_sessions_quiet() {
-    sudo -n "$HELPER_PATH" tmux list-sessions -F '#{session_name}' 2>/dev/null || return 0
+    sudo -n "$HELPER_PATH" tmux list-sessions -F '#{session_name}' 2>/dev/null \
+        | head -c 65536 | _sanitize_session_names || return 0
 }
 
 # Swallow any buffered keystrokes on /dev/tty (e.g. auto-repeat from a held arrow
@@ -2016,38 +2162,65 @@ task_manager() {
 # --- Sessions & their scheduled commands (req: session lifecycle) --------------
 # Live tmux session names inside the box (sorted).
 _live_sessions() {
-    container_tmux list-sessions -F '#{session_name}' 2>/dev/null | sort
+    container_tmux list-sessions -F '#{session_name}' 2>/dev/null \
+        | head -c 65536 | _sanitize_session_names | sort -u
 }
 
 # Print the schedule-command ids whose target session == $1 (the session is the
 # first token of the timer's "# waterbox: <session> @ <time> <mode>" info line).
+#
+# Records come from the immutable helper as five tab-separated, control-escaped
+# fields: id, v+info, v+calendar, v+message, message-state. The leading "v" keeps
+# empty values nonempty so Bash's whitespace IFS cannot collapse adjacent fields.
+# The helper opens the live, box-controlled rootfs with directory fds + O_NOFOLLOW;
+# never restore direct host-side grep/cat of these paths.
+_schedule_records() {
+    _helper_current || return 2
+    run_priv sched-list 2>/dev/null
+}
+
+_schedule_has_id() {
+    local want="$1" records id info expr msg state extra
+    records=$(_schedule_records) || return 2
+    while IFS=$'\t' read -r id info expr msg state extra; do
+        [[ "$id" =~ ^schd-com-[0-9]+$ && -z "$extra" ]] || continue
+        [ "$id" = "$want" ] && return 0
+    done <<< "$records"
+    return 1
+}
+
 _schedules_for_session() {
-    local want="$1" f b id info
-    for f in "$JAIL_ROOT$TASK_ETC/waterbox-schd-com-"*.timer; do
-        [ -e "$f" ] || continue
-        b=$(basename "$f" .timer); id="${b#waterbox-}"
-        info=$(grep -m1 '^# waterbox:' "$f" 2>/dev/null | sed 's/^# waterbox: //')
+    local want="$1" records id info expr msg state extra
+    records=$(_schedule_records) || return 2
+    while IFS=$'\t' read -r id info expr msg state extra; do
+        [[ "$id" =~ ^schd-com-[0-9]+$ && "$info" == v* && -z "$extra" ]] || continue
+        info="${info#v}"
         [ "${info%% @ *}" = "$want" ] && echo "$id"
-    done
+    done <<< "$records"
 }
 
 # Remove every schedule-command targeting session $1 (req 14).
 _remove_session_schedules() {
-    local sess="$1" id
-    while IFS= read -r id; do
-        [ -n "$id" ] || continue
-        _sched_remove "$id"
-    done < <(_schedules_for_session "$sess")
+    local sess="$1" records id info expr msg state extra failed=0
+    records=$(_schedule_records) || return 1
+    while IFS=$'\t' read -r id info expr msg state extra; do
+        [[ "$id" =~ ^schd-com-[0-9]+$ && "$info" == v* && -z "$extra" ]] || continue
+        info="${info#v}"
+        [ "${info%% @ *}" = "$sess" ] || continue
+        _sched_remove "$id" || failed=1
+    done <<< "$records"
+    return "$failed"
 }
 
 # Remove ALL schedule-commands (used when every session dies: stop/reset).
 _remove_all_schedules() {
-    local f b id
+    local f b id failed=0
     for f in "$JAIL_ROOT$TASK_ETC/waterbox-schd-com-"*.timer; do
         [ -e "$f" ] || continue
         b=$(basename "$f" .timer); id="${b#waterbox-}"
-        _sched_remove "$id"
+        _sched_remove "$id" || failed=1
     done
+    return "$failed"
 }
 
 # List live sessions and the count of scheduled commands each would take down.
@@ -2171,7 +2344,7 @@ _prompt_new_session() {
 # new name on success, the old one on any no-op) so the picker doesn't jump away.
 KEEP_SESSION=""
 _rename_session() {
-    local old="$1" new
+    local old="$1" new schedules_repointed=0 old_schedules=""
     KEEP_SESSION="$old"
     # -i pre-fills the field with the current name so you EDIT it instead of retyping
     # (readline's Ctrl-w / Ctrl-u clear a word / the whole line); Enter unchanged = no-op.
@@ -2188,9 +2361,17 @@ _rename_session() {
     fi
     container_tmux rename-session -t "=$old" "$new" 2>/dev/null \
         || { log_warn "Rename failed (is '$old' still live?)."; return 0; }
-    _helper_current && run_priv sched-rename "$old" "$new" >/dev/null 2>&1 || true
+    if _helper_current && run_priv sched-rename "$old" "$new" >/dev/null 2>&1; then
+        schedules_repointed=1
+    fi
     KEEP_SESSION="$new"
-    log_info "Renamed session '$old' → '$new' (its scheduled commands were repointed)."
+    if [ "$schedules_repointed" = 1 ]; then
+        log_info "Renamed session '$old' → '$new' (its scheduled commands were repointed)."
+    elif old_schedules=$(_schedules_for_session "$old") && [ -z "$old_schedules" ]; then
+        log_info "Renamed session '$old' → '$new'."
+    else
+        log_warn "Renamed session '$old' → '$new', but scheduled commands could not be repointed. Review 'waterbox schedule-command list'."
+    fi
 }
 
 # Pick a tmux session inside the running container, then exec an attached shell.
@@ -2320,7 +2501,7 @@ attach_session() {
         # No leading '-': such a name would be indistinguishable from a flag here and
         # would reach grep/tmux/systemd as one (an unrecognised `waterbox start --foo`
         # should be rejected, not turned into a session).
-        [[ "$want" =~ ^[A-Za-z0-9._][A-Za-z0-9._-]*$ ]] \
+        _valid_session_name "$want" \
             || log_error "Invalid session name '$want' (letters, digits, . _ - only, not starting with '-'). See 'waterbox start --help'."
         # `--`: belt-and-braces so the name is never parsed as a grep option.
         if _live_sessions | grep -qxF -- "$want"; then log_info "Attaching to '$want'."
@@ -2402,10 +2583,15 @@ attach_session() {
             printf "Kill session '%s' and its scheduled commands? [y/N] " "$victim" > /dev/tty
             IFS= read -r ans < /dev/tty || true
             if [[ "$ans" == [Yy]* ]]; then
-                container_tmux kill-session -t "=$victim" 2>/dev/null || true
-                _remove_session_schedules "$victim"
-                log_info "Killed session '$victim'."
-                keep_name="$neighbor"
+                if container_tmux kill-session -t "=$victim" 2>/dev/null; then
+                    _remove_session_schedules "$victim" \
+                        || log_warn "Session '$victim' ended, but one or more of its scheduled commands could not be removed."
+                    log_info "Killed session '$victim'."
+                    keep_name="$neighbor"
+                else
+                    log_warn "Could not kill session '$victim'; it is still running."
+                    keep_name="$victim"
+                fi
             else
                 keep_name="$victim"
             fi
@@ -2438,7 +2624,7 @@ teardown_host_network() {
 # Are all required host tools present? Fills MISSING_DEPS with any that aren't.
 MISSING_DEPS=()
 _check_host_deps() {
-    local need=(systemd-nspawn machinectl systemd-run iptables nsenter ip curl tar zstd python3) c
+    local need=(systemd-nspawn machinectl systemd-run iptables nsenter timeout ip curl tar zstd python3) c
     MISSING_DEPS=()
     for c in "${need[@]}"; do
         command -v "$c" >/dev/null 2>&1 || MISSING_DEPS+=("$c")
@@ -2473,13 +2659,13 @@ require_host_deps() {
     if command -v apt-get >/dev/null 2>&1; then
         # ';' not '&&': a failed update (e.g. a broken source in sources.list.d) must
         # not stop the install, which usually still works from the cached lists.
-        cmd="sudo apt-get update; sudo apt-get install -y systemd-container iptables iproute2 curl tar zstd gnupg python3"
+        cmd="sudo apt-get update; sudo apt-get install -y systemd-container iptables iproute2 coreutils curl tar zstd gnupg python3"
     elif command -v pacman >/dev/null 2>&1; then
-        cmd="sudo pacman -S --needed systemd iptables-nft iproute2 util-linux curl tar zstd gnupg python"
+        cmd="sudo pacman -S --needed systemd iptables-nft iproute2 util-linux coreutils curl tar zstd gnupg python"
     elif command -v dnf >/dev/null 2>&1; then
-        cmd="sudo dnf install -y systemd-container iptables iproute curl tar zstd gnupg2 python3"
+        cmd="sudo dnf install -y systemd-container iptables iproute coreutils curl tar zstd gnupg2 python3"
     elif command -v zypper >/dev/null 2>&1; then
-        cmd="sudo zypper install -y systemd-container iptables iproute2 curl tar zstd gpg2 python3"
+        cmd="sudo zypper install -y systemd-container iptables iproute2 coreutils curl tar zstd gpg2 python3"
     fi
 
     if [ -z "$cmd" ]; then
@@ -2508,35 +2694,82 @@ warn_unsafe_host_root() {
     echo -e "         An unattended wake cannot cold-boot this mode after you stop it.\e[0m"
 }
 
+# Stop an outdated running box automatically only when tmux confirms there are no
+# live sessions. The stop happens before any host-root config write, so background
+# box processes cannot race refresh_config. tmux exit 1 means no server/sessions;
+# any helper/namespace failure is fail-closed and leaves the box running.
+_stop_idle_box_for_config_refresh() {
+    is_running || return 0
+    _config_current && return 0
+
+    local sessions="" raw="" rc=0
+    raw=$( { container_tmux list-sessions -F '#{session_name}' 2>/dev/null \
+              | head -c 65536
+             exit "${PIPESTATUS[0]}"; } ) || rc=$?
+    case "$rc" in
+        0)
+            sessions=$(printf '%s\n' "$raw" | _sanitize_session_names)
+            [ -z "$sessions" ] || return 0
+            ;;
+        1) ;;   # tmux has no server, therefore no sessions
+        *)
+            log_warn "Could not verify whether the running box has live sessions; leaving it running."
+            return 0
+            ;;
+    esac
+
+    log_info "No live sessions; restarting the idle sandbox to apply updated config..."
+    run_priv down \
+        || log_error "The idle sandbox did not stop cleanly; refusing to refresh its live rootfs."
+    _remove_all_schedules \
+        || log_warn "The idle box stopped, but one or more stale scheduled commands could not be removed."
+}
+
+# Refuse a requested secure/unsafe mode that does not match an already-running
+# box. Restart/reset call this before stopping anything, so a mistaken hidden flag
+# cannot take down a working secure box and only then report that it was refused.
+_require_running_mode_match() {
+    is_running || return 0
+    local security_state
+    security_state=$(run_priv security-state 2>/dev/null || echo legacy)
+    case "$security_state" in
+        secure)
+            [ "$WATERBOX_UNSAFE_HOST_ROOT" != 1 ] \
+                || log_error "--unsafe-host-root was refused because the running box is securely user-namespaced."
+            ;;
+        unsafe-explicit)
+            [ "$WATERBOX_UNSAFE_HOST_ROOT" = 1 ] \
+                || log_error "This box is running in explicit host-root mode. Rerun the same command with --unsafe-host-root."
+            ;;
+        *)
+            log_error "This running box lacks the private-user boundary and was not launched through the explicit unsafe mode. Stop it before continuing."
+            ;;
+    esac
+}
+
 start_sandbox() {
     local want="${1:-}"        # optional target session (`waterbox start <name>`)
     # Reject a bad name (notably a mistyped flag: the global parser only consumes the
     # ones it knows, so `waterbox start --foo` arrives here as a session name) BEFORE
     # bootstrapping or booting — attach_session re-checks, but only at the very end.
-    if [ -n "$want" ] && ! [[ "$want" =~ ^[A-Za-z0-9._][A-Za-z0-9._-]*$ ]]; then
+    if [ -n "$want" ] && ! _valid_session_name "$want"; then
         log_error "Invalid session name '$want' (letters, digits, . _ - only, not starting with '-'). See 'waterbox start --help'."
     fi
     require_host_deps
     bootstrap_sandbox
     ensure_host_privs    # immutable helper (narrow sudoers) + completion; no manual 'setup'
     if is_running; then
-        local security_state
-        security_state=$(run_priv security-state 2>/dev/null || echo legacy)
-        case "$security_state" in
-            secure)
-                [ "$WATERBOX_UNSAFE_HOST_ROOT" != 1 ] \
-                    || log_error "--unsafe-host-root was refused because the running box is securely user-namespaced."
-                ;;
-            unsafe-explicit)
-                [ "$WATERBOX_UNSAFE_HOST_ROOT" = 1 ] \
-                    || log_error "This box is running in explicit host-root mode. Rerun the same command with --unsafe-host-root to attach."
-                ;;
-            *)
-                log_error "This running box lacks the private-user boundary and was not launched through the explicit unsafe mode. Stop it before continuing."
-                ;;
-        esac
+        _require_running_mode_match
+        if [ "${CLI_BOOT_FLAG_USED:-0}" = 1 ]; then
+            log_warn "Display/GPU flags are boot-time settings; this running box keeps its current settings. Use 'waterbox restart' with the desired flags to change them."
+        fi
     fi
     [ "$WATERBOX_UNSAFE_HOST_ROOT" = 1 ] && warn_unsafe_host_root
+
+    # A start/attach is permission to bring up a usable session. If an already
+    # running box has no tmux sessions, transparently cycle it now so upgrades do
+    # not leave the user with manual refresh work.
+    _stop_idle_box_for_config_refresh
 
     # One-time pre-1.9 -> multi-agent profile move. Host-root maintenance of the
     # rootfs is allowed only while the box is down; "no tmux sessions" does not prove
@@ -2585,7 +2818,8 @@ start_sandbox() {
             done < "$SHARE_LIST"
             if [ "$existing" != collision ]; then
                 mkdir -p "$CONFIG_DIR"
-                echo "$here_rp" >> "$SHARE_LIST"
+                printf '%s\n' "$here_rp" >> "$SHARE_LIST" \
+                    || log_error "Could not save the --here share."
                 WB_START_SUBDIR="$(basename "$here_rp")"; here_added=1
                 log_info "--here: sharing '$here_rp' → $CONTAINER_WORKSPACE/$WB_START_SUBDIR."
             fi
@@ -2598,12 +2832,28 @@ start_sandbox() {
         log_info "Sandbox already running, attaching..."
         [ "$WATERBOX_GUI" = "1" ] && [ ! -s "$GUI_BINDS_FILE" ] \
             && log_warn "GUI binds are set at boot — 'waterbox restart --gui' to enable them."
+        # Re-assert the fixed veth/firewall setup as well as DNS on every attach.
+        # Firewall managers can reload while the box stays up; reporting a usable
+        # session while its forwarding rules are gone is a misleading success.
+        if ! run_priv up; then
+            if [ "$here_added" = 1 ]; then
+                _remove_share_record "$SHARE_LIST" "$here_rp" \
+                    || log_warn "Could not roll back the saved --here entry '$here_rp'; detach it before the next start."
+            fi
+            log_error "The box is running, but Waterbox could not repair its host networking."
+        fi
     else
         log_info "Booting sandbox as transient systemd unit '$MACHINE_NAME.service'..."
 
         # Detect the display server + write the GUI bind/env spec files as YOU
         # (needs your DISPLAY/XAUTHORITY). Clears them when --gui is absent.
-        build_gui_bind_args
+        if ! build_gui_bind_args; then
+            if [ "$here_added" = 1 ]; then
+                _remove_share_record "$SHARE_LIST" "$here_rp" \
+                    || log_warn "Could not roll back the saved --here entry '$here_rp'; detach it before the next start."
+            fi
+            log_error "Cannot start with GUI forwarding. Check DISPLAY/WAYLAND_DISPLAY, or start without --gui."
+        fi
 
         # The root helper does the privileged boot: it validates the shares in
         # $SHARE_LIST and the GUI spec, binds the GPU when present, launches the
@@ -2614,24 +2864,80 @@ start_sandbox() {
         [ "$WATERBOX_GUI" = "1" ] && boot_args+=(--gui)
         [ "$WATERBOX_NO_GPU" = "1" ] && boot_args+=(--no-gpu)
         [ "$WATERBOX_UNSAFE_HOST_ROOT" = "1" ] && boot_args+=(--unsafe-host-root)
-        if ! run_priv "${boot_args[@]}" || ! is_running; then
-            # A cold --here persists its new share before boot so the helper can
-            # collect it. If that secure mount (or the boot) fails, do not leave a
-            # poison entry that makes every later start fail too.
+        local boot_output="" boot_rc=0 failed_b64="" failed_share=""
+        local share_retries=0
+        while true; do
+            boot_rc=0
+            boot_output=$(run_priv "${boot_args[@]}" 2>&1) || boot_rc=$?
+            failed_b64=$(printf '%s\n' "$boot_output" \
+                | sed -n 's/^WATERBOX_FAILED_SHARE_B64=//p' | tail -n1)
+            if [ -n "$boot_output" ]; then
+                printf '%s\n' "$boot_output" \
+                    | sed '/^WATERBOX_FAILED_SHARE_B64=/d' >&2
+            fi
+            if [ "$boot_rc" -eq 0 ] && is_running; then
+                # Every pending entry survived a real secure mount. It is now an
+                # ordinary configured share and no longer needs rollback tracking.
+                [ ! -f "$PENDING_SHARE_LIST" ] || : > "$PENDING_SHARE_LIST" \
+                    || log_warn "The box started, but pending-share bookkeeping could not be cleared."
+                break
+            fi
+
+            failed_share=""
+            if [ -n "$failed_b64" ]; then
+                failed_share=$(python3 -c \
+                    'import base64,os,sys; print(os.fsdecode(base64.b64decode(sys.argv[1], validate=True)))' \
+                    "$failed_b64" 2>/dev/null || true)
+            fi
+
+            # `share add` while stopped cannot exercise the picked user namespace.
+            # When the helper identifies that exact newly-added source as the boot
+            # failure, remove only that entry and retry automatically. Older,
+            # previously-working shares remain fail-closed and are never discarded.
+            if [ -n "$failed_share" ] && _pending_share_has "$failed_share" \
+               && ! is_running && [ "$share_retries" -lt 32 ]; then
+                _remove_share_record "$SHARE_LIST" "$failed_share" \
+                    || log_error "The new share failed and Waterbox could not roll it back. Fix permissions/free space in $CONFIG_DIR, then detach '$failed_share'."
+                _remove_share_record "$PENDING_SHARE_LIST" "$failed_share"
+                share_retries=$((share_retries + 1))
+                log_warn "The newly added share '$failed_share' could not be mounted securely; it was rolled back. Retrying without it."
+                continue
+            fi
+
+            # A cold --here entry belongs to this invocation, so it is equally safe
+            # to roll back and continue into a normal workspace session.
+            if [ "$here_added" = 1 ] && [ "$failed_share" = "$here_rp" ] \
+               && ! is_running && [ "$share_retries" -lt 32 ]; then
+                _remove_share_record "$SHARE_LIST" "$here_rp" \
+                    || log_error "The --here share failed and Waterbox could not roll it back. Fix permissions/free space in $CONFIG_DIR, then detach '$here_rp'."
+                here_added=0
+                WB_START_SUBDIR=""
+                share_retries=$((share_retries + 1))
+                log_warn "Couldn't mount the --here directory securely; retrying without that share."
+                continue
+            fi
+
+            # If some unrelated stage failed, retain the original conservative
+            # rollback for a --here entry that this invocation persisted.
             if [ "$here_added" = 1 ]; then
-                grep -vFx "$here_rp" "$SHARE_LIST" > "${SHARE_LIST}.tmp" || true
-                mv "${SHARE_LIST}.tmp" "$SHARE_LIST"
+                _remove_share_record "$SHARE_LIST" "$here_rp" \
+                    || log_warn "Could not roll back the saved --here entry '$here_rp'; detach it before the next start."
             fi
             log_error "Sandbox failed to boot. Check: journalctl -u $MACHINE_NAME -e"
-        fi
+        done
         log_success "Sandbox up. Host reachable inside as '$HOST_ALIAS' ($HOST_IP)."
     fi
 
-    # Guarantee working DNS: the container's boot may leave /etc/resolv.conf pointing
-    # at an unreachable stub (127.0.0.53). Feed the helper the host-derived servers +
-    # public fallback; it only rewrites if the box currently can't resolve. Runs every
-    # start, so a boot-time hijack is corrected before you attach.
-    _container_nameservers | run_priv ensure-dns || true
+    # Repair schedule messages created by the old root:0600 bug. This runs inside
+    # the box namespaces through the narrow helper, so no live rootfs path is
+    # followed by host root.
+    run_priv sched-repair >/dev/null \
+        || log_warn "Could not repair legacy schedule-command message ownership."
+
+    # Re-assert host-primary + both public fallbacks on every start/attach. This
+    # handles a later host Wi-Fi/VPN change without requiring a box restart.
+    _container_nameservers | run_priv ensure-dns \
+        || log_warn "Could not verify DNS inside the box; networking may need 'waterbox restart'."
 
     # A running rootfs is attacker-controlled, even if tmux has no visible sessions.
     # Never bridge it to host-root file writes; a cold start/restart refreshes safely.
@@ -2644,8 +2950,8 @@ start_sandbox() {
     # the first mount. On failure, roll back the persisted entry too.
     if [ "$WB_HERE" = 1 ] && [ "$here_added" = 1 ] && [ "$box_was_running" = 1 ]; then
         if ! run_priv bind-share "$here_rp"; then
-            grep -vFx "$here_rp" "$SHARE_LIST" > "${SHARE_LIST}.tmp" || true
-            mv "${SHARE_LIST}.tmp" "$SHARE_LIST"
+            _remove_share_record "$SHARE_LIST" "$here_rp" \
+                || log_error "The --here mount failed and its saved entry could not be removed. Fix permissions/free space in $CONFIG_DIR, then detach '$here_rp'."
             log_warn "Couldn't mount '$WB_START_SUBDIR' securely; the share was not added."
             WB_START_SUBDIR=""
         fi
@@ -2658,6 +2964,10 @@ restart_sandbox() {
     # Fail before taking a working box down if this host cannot boot the hardened
     # private-user configuration.
     require_host_deps
+    if is_running; then
+        ensure_helper
+        _require_running_mode_match
+    fi
     stop_sandbox
     [ "$WB_CANCELLED" = 1 ] && { log_info "Restart cancelled."; return 0; }
     start_sandbox
@@ -2679,7 +2989,8 @@ stop_sandbox() {
         # Do this after the verified stop. Besides avoiding writes against a live
         # rootfs, it also cleans schedules from a legacy pre-userns box without ever
         # entering that unsafe namespace as host root.
-        _remove_all_schedules            # every session died → drop their schedules (req 14)
+        _remove_all_schedules \
+            || log_warn "The box stopped, but one or more stale scheduled commands could not be removed."
     else
         log_info "Sandbox not running."
         teardown_host_network            # clear any stray rules
@@ -2693,7 +3004,8 @@ status_sandbox() {
         log_success "Sandbox is running."
         local status_args=()
         [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && status_args+=(--color)
-        run_priv status "${status_args[@]}" 2>/dev/null || true
+        run_priv status "${status_args[@]}" \
+            || log_warn "The sandbox is running, but its detailed status could not be read."
     else
         log_info "Sandbox is stopped."
     fi
@@ -2704,6 +3016,19 @@ reset_sandbox() {
     # A reset becomes destructive only after this succeeds. In particular, do not
     # erase a legacy box on a host that cannot boot its private-user replacement.
     require_host_deps
+    if is_running; then
+        ensure_helper
+        _require_running_mode_match
+    elif [ -e "$JAIL_ROOT" ]; then
+        # Preserve an existing tree unless this exact backing filesystem can boot
+        # the requested secure/explicit-unsafe mode.
+        _require_rootfs_idmap
+    else
+        # There is no data to protect and no extracted /usr/bin/true to probe yet.
+        # Validate nspawn's baseline feature now; bootstrap performs the real
+        # backing-filesystem probe immediately after extraction.
+        _require_secure_nspawn
+    fi
     log_info "About to wipe the waterbox environment."
     if is_running && _print_session_impact > /dev/tty 2>&1; then
         log_warn "The live session(s) above will be ended."
@@ -2752,22 +3077,38 @@ reset_sandbox() {
     # needs no second copy's worth of free disk, and leaves a recoverable backup if
     # bootstrap fails. Never proceed to the wipe when preservation itself fails.
     local kept=""
-    if [ "$keep_home" = 1 ] && [ -d "$JAIL_ROOT/home/$USER_NAME" ]; then
-        kept=$(mktemp -d "$CONFIG_DIR/reset-home.XXXXXX")
-        if ! sudo mv "$JAIL_ROOT/home/$USER_NAME" "$kept/home"; then
-            sudo rmdir "$kept" 2>/dev/null || true
-            log_error "Reset aborted: could not preserve the home directory; the original rootfs was not deleted."
+    if [ "$keep_home" = 1 ]; then
+        _guard_jail_path "$JAIL_ROOT/home/$USER_NAME"
+        if [ -d "$JAIL_ROOT/home/$USER_NAME" ]; then
+            kept=$(mktemp -d "$CONFIG_DIR/reset-home.XXXXXX")
+            if ! sudo mv "$JAIL_ROOT/home/$USER_NAME" "$kept/home"; then
+                sudo rmdir "$kept" 2>/dev/null || true
+                log_error "Reset aborted: could not preserve the home directory; the original rootfs was not deleted."
+            fi
+            log_info "Preserved the home directory at $kept/home until the rebuild completes."
         fi
-        log_info "Preserved the home directory at $kept/home until the rebuild completes."
     fi
 
     sudo rm -rf "$JAIL_ROOT"
-    bootstrap_sandbox
+    # Catch the rebuild in a subshell so a bootstrap log_error/errexit does not
+    # bypass this recovery message. In particular, never leave the automatic-retry
+    # marker armed after a reset that has a preserved home parked outside the
+    # rootfs: a later ordinary start must not silently retry another wipe while
+    # that backup is waiting.
+    if ! ( bootstrap_sandbox ); then
+        rm -f "$BOOTSTRAP_IN_PROGRESS"
+        if [ -n "$kept" ] && [ -d "$kept/home" ]; then
+            log_error "Rebuild failed. Your original home is safe at $kept/home; fix the reported problem, then run 'waterbox reset' again or restore it manually."
+        fi
+        log_error "Rebuild failed. The incomplete rootfs was left in place for inspection; run 'waterbox reset' to retry."
+    fi
 
     # Restore the stashed home over the freshly-seeded one, then re-apply the
     # managed config on top so tweaks (prompt, tmux bar, switcher) still land.
     if [ -n "$kept" ] && [ -d "$kept/home" ]; then
+        _guard_jail_path "$JAIL_ROOT/home/$USER_NAME"
         sudo rm -rf "$JAIL_ROOT/home/$USER_NAME"
+        _guard_jail_path "$JAIL_ROOT/home/$USER_NAME"
         sudo mv "$kept/home" "$JAIL_ROOT/home/$USER_NAME" \
             || log_error "Rebuild completed but home restore failed. Your preserved home remains at $kept/home."
         sudo rmdir "$kept" 2>/dev/null || true
@@ -2778,31 +3119,39 @@ reset_sandbox() {
         log_success "Restored the home directory (managed config refreshed)."
     fi
 
+    ensure_host_privs        # helper is needed for reliable host-wake cleanup below
+
     if [ "$keep_wake" != 1 ]; then
-        _remove_all_hostwakes
-        log_info "Removed wake-claude schedules."
+        if _remove_all_hostwakes; then
+            log_info "Removed wake-claude schedules."
+        else
+            log_warn "One or more wake-claude schedules could not be removed; check 'waterbox wake-claude list'."
+        fi
     fi
 
     if [ "$keep_shares" != 1 ]; then
-        : > "$SHARE_LIST"
+        : > "$SHARE_LIST" \
+            || log_error "Rebuilt, but the shared-directory list could not be cleared."
+        : > "$PENDING_SHARE_LIST" \
+            || log_error "Rebuilt, but pending-share bookkeeping could not be cleared."
         log_info "Cleared the shared-directory list."
     else
         log_info "Kept the shared-directory list."
     fi
 
-    ensure_host_privs        # host setup holds no custom data; always re-apply
     log_success "Rebuilt. Run 'waterbox' to boot and attach."
 }
 
 # Remove every host wake timer (req 15: when not keeping wake-claude schedules).
 _remove_all_hostwakes() {
-    local f n
+    local f n failed=0
     for f in "$HOSTWAKE_GLOB"*.timer; do
         [ -e "$f" ] || continue
         n=$(basename "$f" .timer); n="${n##*-}"
         case "$n" in ''|*[!0-9]*) continue ;; esac
-        _helper_current && run_priv remove-host-wake "$n" >/dev/null 2>&1 || true
+        run_priv remove-host-wake "$n" >/dev/null 2>&1 || failed=1
     done
+    return "$failed"
 }
 
 # --- In-box config version -----------------------------------------------------
@@ -2813,8 +3162,10 @@ _remove_all_hostwakes() {
 CONFIG_VERSION_FILE="$JAIL_ROOT/etc/waterbox/config-version"
 _config_marker()  { cksum < "$SELF_PATH" 2>/dev/null | cut -d' ' -f1; }
 _config_current() {
-    [ -f "$JAIL_ROOT/.waterbox-ready" ] \
-        && [ "$(cat "$CONFIG_VERSION_FILE" 2>/dev/null)" = "$(_config_marker)" ]
+    local installed
+    [ -f "$JAIL_ROOT/.waterbox-ready" ] || return 1
+    installed=$(_read_jail_regular "$CONFIG_VERSION_FILE" 64 2>/dev/null) || return 1
+    [ "$installed" = "$(_config_marker)" ]
 }
 _write_config_version() {
     _in_jail "$CONFIG_VERSION_FILE" \
@@ -2945,11 +3296,11 @@ JAIL_ROOT="$wb_home/.waterbox/root"
 WB_CFG="$wb_home/.waterbox"
 
 # Charset-limited AND never "." / ".." (so a name can't traverse out of its dir).
-_valid_profile() { case "$1" in ''|.|..|*[!A-Za-z0-9._-]*) return 1 ;; *) return 0 ;; esac; }
+_valid_profile() { [ "${#1}" -le 128 ] || return 1; case "$1" in ''|.|..|-*|*[!A-Za-z0-9._-]*) return 1 ;; *) return 0 ;; esac; }
 _valid_id()      { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 _valid_time()    { [[ "$1" =~ ^([01]?[0-9]|2[0-3]):[0-5][0-9]$ ]]; }
 # Leading '-' rejected too: such a name would reach tmux/grep/systemd as an option.
-_valid_session() { case "$1" in ''|.|..|-*|*[!A-Za-z0-9._-]*) return 1 ;; *) return 0 ;; esac; }
+_valid_session() { [ "${#1}" -le 128 ] || return 1; case "$1" in ''|.|..|-*|*[!A-Za-z0-9._-]*) return 1 ;; *) return 0 ;; esac; }
 _valid_schedid() { case "$1" in schd-com-*) _valid_id "${1#schd-com-}" ;; *) return 1 ;; esac; }
 
 # Container root owns the rootfs, so it can point any file we write — or a parent
@@ -2994,7 +3345,11 @@ run_in_approved_box() {
         || { echo "helper: refusing to enter an unapproved legacy host-root box" >&2; return 3; }
     leader=$(machinectl show "$MACHINE_NAME" -p Leader --value 2>/dev/null)
     [ -n "$leader" ] && [ "$leader" != 0 ] || return 3
-    nsenter --target "$leader" --all --setuid 0 --setgid 0 "$@"
+    # Every executable in the rootfs is guest-controlled. Namespace entry prevents
+    # escape, but without a deadline a replaced /bin/sh could still hang start,
+    # schedule cleanup, DNS repair, or share operations forever.
+    timeout --signal=TERM --kill-after=2s 30s \
+        nsenter --target "$leader" --all --setuid 0 --setgid 0 "$@"
 }
 
 # systemd 249 (Ubuntu 22.04/Mint 21 era) accepts percentage MemoryHigh/Max
@@ -3375,22 +3730,31 @@ net_up() {
         sleep 0.2; tries=$((tries - 1))
     done
     ip link show "$VE_IFACE" >/dev/null 2>&1 || return 1
-    ip addr add "$HOST_IP/$NET_CIDR" dev "$VE_IFACE" 2>/dev/null || true
-    ip link set "$VE_IFACE" up
-    sysctl -wq net.ipv4.ip_forward=1
-    sysctl -wq "net.ipv4.conf.$VE_IFACE.route_localnet=1" 2>/dev/null || true
+    ip -4 addr show dev "$VE_IFACE" 2>/dev/null \
+        | grep -Fq "inet $HOST_IP/$NET_CIDR" \
+        || ip addr add "$HOST_IP/$NET_CIDR" dev "$VE_IFACE" \
+        || return 1
+    ip link set "$VE_IFACE" up || return 1
+    sysctl -wq net.ipv4.ip_forward=1 || return 1
+    sysctl -wq "net.ipv4.conf.$VE_IFACE.route_localnet=1" 2>/dev/null || return 1
     iptables -t nat -C PREROUTING -i "$VE_IFACE" -d "$HOST_IP" -j DNAT --to-destination 127.0.0.1 2>/dev/null \
-        || iptables -t nat -A PREROUTING -i "$VE_IFACE" -d "$HOST_IP" -j DNAT --to-destination 127.0.0.1
+        || iptables -t nat -A PREROUTING -i "$VE_IFACE" -d "$HOST_IP" -j DNAT --to-destination 127.0.0.1 \
+        || return 1
     iptables -t nat -C POSTROUTING -s "$HOST_IP/$NET_CIDR" ! -o "$VE_IFACE" -j MASQUERADE 2>/dev/null \
-        || iptables -t nat -A POSTROUTING -s "$HOST_IP/$NET_CIDR" ! -o "$VE_IFACE" -j MASQUERADE
+        || iptables -t nat -A POSTROUTING -s "$HOST_IP/$NET_CIDR" ! -o "$VE_IFACE" -j MASQUERADE \
+        || return 1
     iptables -C FORWARD -i "$VE_IFACE" -j ACCEPT 2>/dev/null \
-        || iptables -I FORWARD 1 -i "$VE_IFACE" -j ACCEPT
+        || iptables -I FORWARD 1 -i "$VE_IFACE" -j ACCEPT \
+        || return 1
     iptables -C FORWARD -o "$VE_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null \
-        || iptables -I FORWARD 1 -o "$VE_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+        || iptables -I FORWARD 1 -o "$VE_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT \
+        || return 1
     if [ "$ALLOW_CONTAINER_TO_HOST_PORTS" = "true" ]; then
         iptables -C INPUT -i "$VE_IFACE" -s "$HOST_IP/$NET_CIDR" -j ACCEPT 2>/dev/null \
-            || iptables -I INPUT 1 -i "$VE_IFACE" -s "$HOST_IP/$NET_CIDR" -j ACCEPT
+            || iptables -I INPUT 1 -i "$VE_IFACE" -s "$HOST_IP/$NET_CIDR" -j ACCEPT \
+            || return 1
     fi
+    return 0
 }
 net_down() {
     iptables -t nat -D PREROUTING -i "$VE_IFACE" -d "$HOST_IP" -j DNAT --to-destination 127.0.0.1 2>/dev/null || true
@@ -3406,6 +3770,8 @@ boot_min() {
     if running; then
         approved_box \
             || { echo "helper: refusing to use an unapproved legacy host-root box" >&2; return 3; }
+        net_up \
+            || { echo "helper: could not configure Waterbox networking" >&2; return 3; }
         return 0
     fi
     [ -f "$JAIL_ROOT/.waterbox-ready" ] || { echo "helper: rootfs not built at $JAIL_ROOT"; exit 3; }
@@ -3435,7 +3801,11 @@ boot_min() {
             "${raf[@]}" \
         >/dev/null 2>&1
     running || { echo "helper: boot failed"; exit 3; }
-    net_up || true
+    if ! net_up; then
+        echo "helper: could not configure Waterbox networking; stopping the box" >&2
+        power_off || true
+        return 3
+    fi
     sleep 3   # let networkd bring host0 up inside before we hit the network
 }
 power_off() {
@@ -3503,25 +3873,51 @@ mount_one_share() {
     mount_into_box "$rp" "$target" "$map_uid"
 }
 mount_collected_shares() {
-    local rp
+    local rp encoded
     for rp in "${SHARE_SOURCES[@]}"; do
-        mount_one_share "$rp" || return 1
+        if ! mount_one_share "$rp"; then
+            # Machine-readable, single-line identity for the ordinary-user caller.
+            # It may roll back this exact entry only when it was newly persisted
+            # while the box was stopped, then retry the remaining boot safely.
+            encoded=$(python3 -c \
+                'import base64,os,sys; print(base64.b64encode(os.fsencode(sys.argv[1])).decode())' \
+                "$rp")
+            printf 'WATERBOX_FAILED_SHARE_B64=%s\n' "$encoded" >&2
+            return 1
+        fi
     done
 }
 # GUI binds: only the display sockets + our own xauth file, to fixed in-container
 # targets. Sockets must actually be sockets; the xauth must be exactly our file.
 collect_gui_mounts() {
-    local spec="$WB_CFG/gui_binds" line src dst map_uid
+    local spec="$WB_CFG/gui_binds" line src dst map_uid src_base
     GUI_SOURCES=(); GUI_TARGETS=(); GUI_MAP_UIDS=()
     [ -f "$spec" ] || return 0
+    # The NOPASSWD helper's caller is not trusted. Refuse a redirected/root-owned
+    # manifest rather than letting root parse an arbitrary host file.
+    [ ! -L "$spec" ] && [ "$(stat -c %u "$spec" 2>/dev/null)" = "$wb_uid" ] \
+        || { echo "helper: refusing unsafe GUI bind manifest" >&2; return 1; }
     while IFS= read -r line || [ -n "$line" ]; do
         [ -n "$line" ] || continue
         case "$line" in *:*) src="${line%%:*}"; dst="${line#*:}" ;; *) src="$line"; dst="$line" ;; esac
         case "$dst" in
-            /tmp/.X11-unix/X[0-9]|/tmp/.X11-unix/X[0-9][0-9]|/tmp/.waterbox-wayland)
-                [ -S "$src" ] || continue ;;
+            /tmp/.X11-unix/X[0-9]|/tmp/.X11-unix/X[0-9][0-9])
+                # X sockets have a canonical host path. Accepting an arbitrary
+                # world-writable Unix socket here would turn GUI forwarding into
+                # a general host-socket bridge.
+                [ "$src" = "$dst" ] && [ -S "$src" ] && [ ! -L "$src" ] || continue ;;
+            /tmp/.waterbox-wayland)
+                # Constrain Wayland to the standard per-user runtime directory,
+                # not merely a socket named wayland-N at an arbitrary caller-
+                # supplied path. Otherwise the NOPASSWD helper could expose an SSH
+                # agent, rootless container API, or password-manager socket.
+                src_base=$(basename "$src")
+                [ "$src" = "/run/user/$wb_uid/$src_base" ] \
+                    && [[ "$src_base" =~ ^wayland-[0-9]+$ ]] \
+                    && [ -S "$src" ] && [ ! -L "$src" ] || continue ;;
             /tmp/.waterbox-xauth)
-                { [ "$src" = "$WB_CFG/xauth" ] && [ -f "$src" ]; } || continue ;;
+                { [ "$src" = "$WB_CFG/xauth" ] && [ -f "$src" ] && [ ! -L "$src" ]; } \
+                    || continue ;;
             *) continue ;;
         esac
         # Wayland + xauth are host-user-owned (usually mode 0600/0700): map target
@@ -3552,17 +3948,59 @@ mount_collected_gui() {
         mount_into_box "$src" "$dst" "$map_uid" || return 1
     done
 }
-# Copy the user's export-VAR gui-env into the rootfs (sourced by the login shell).
+# Derive the guest GUI environment exclusively from the helper-validated mount
+# targets. Never copy the mutable host-user gui_env file as root: a symlink there
+# could otherwise disclose an arbitrary root-readable host file inside the box.
 write_gui_env() {
-    local target="$JAIL_ROOT/etc/waterbox/gui-env"
+    local target="$JAIL_ROOT/etc/waterbox/gui-env" tmp i dst
+    local have_wl=0 have_x=0 have_xauth=0 xnum=""
     _in_jail "$target" \
-        || { echo "helper: refusing to write gui-env — it resolves outside the rootfs" >&2; return 0; }
-    mkdir -p "$JAIL_ROOT/etc/waterbox"
-    if [ -s "$WB_CFG/gui_env" ]; then
-        install -m 0644 "$WB_CFG/gui_env" "$target"
-    else
-        rm -f "$target"
+        || { echo "helper: refusing to write gui-env — it resolves outside the rootfs" >&2; return 1; }
+    for i in "${!GUI_TARGETS[@]}"; do
+        dst="${GUI_TARGETS[$i]}"
+        case "$dst" in
+            /tmp/.waterbox-wayland) have_wl=1 ;;
+            /tmp/.waterbox-xauth)   have_xauth=1 ;;
+            /tmp/.X11-unix/X*)      have_x=1; xnum="${dst##*X}" ;;
+        esac
+    done
+    if [ "$have_wl" != 1 ] && [ "$have_x" != 1 ]; then
+        echo "helper: GUI was requested, but no valid Wayland or X11 socket was found" >&2
+        return 1
     fi
+    mkdir -p "$JAIL_ROOT/etc/waterbox"
+    tmp=$(mktemp)
+    if [ "$have_wl" = 1 ]; then
+        echo 'export WAYLAND_DISPLAY="/tmp/.waterbox-wayland"' >> "$tmp"
+        if [ "$have_x" = 1 ]; then
+            echo 'export GDK_BACKEND="wayland,x11"' >> "$tmp"
+            echo 'export QT_QPA_PLATFORM="wayland;xcb"' >> "$tmp"
+        else
+            echo 'export GDK_BACKEND="wayland"' >> "$tmp"
+            echo 'export QT_QPA_PLATFORM="wayland"' >> "$tmp"
+        fi
+        printf '%s\n' \
+            'export XDG_SESSION_TYPE="wayland"' \
+            'export OZONE_PLATFORM="wayland"' \
+            'export MOZ_ENABLE_WAYLAND="1"' \
+            'export ELECTRON_OZONE_PLATFORM_HINT="auto"' >> "$tmp"
+    else
+        printf '%s\n' \
+            'export XDG_SESSION_TYPE="x11"' \
+            'export OZONE_PLATFORM="x11"' \
+            'export GDK_BACKEND="x11"' \
+            'export QT_QPA_PLATFORM="xcb"' >> "$tmp"
+    fi
+    if [ "$have_x" = 1 ]; then
+        printf 'export DISPLAY=":%s"\n' "$xnum" >> "$tmp"
+        [ "$have_xauth" = 1 ] \
+            && echo 'export XAUTHORITY="/tmp/.waterbox-xauth"' >> "$tmp"
+    fi
+    if ! install -m 0644 "$tmp" "$target"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    rm -f "$tmp"
 }
 clear_gui_env() {
     local target="$JAIL_ROOT/etc/waterbox/gui-env"
@@ -3580,13 +4018,19 @@ boot_full() {
             secure_userns \
                 || { echo "helper: explicit --unsafe-host-root is required for this running box" >&2; return 3; }
         fi
-        net_up || true
+        net_up \
+            || { echo "helper: could not repair Waterbox networking" >&2; return 3; }
         return 0
     fi
     [ -f "$JAIL_ROOT/.waterbox-ready" ] || { echo "helper: rootfs not built at $JAIL_ROOT"; exit 3; }
     [ "$unsafe" != 1 ] || require_unsafe_rootfs
     collect_share_mounts
-    if [ "$gui" = 1 ]; then collect_gui_mounts; write_gui_env; else clear_gui_env; fi
+    if [ "$gui" = 1 ]; then
+        collect_gui_mounts
+        write_gui_env || return 3
+    else
+        clear_gui_env || return 3
+    fi
     # SECURITY: normally private users make container root an unprivileged host uid.
     # The explicit compatibility flag omits that primary boundary; every remaining
     # restriction below stays enabled as defense in depth in both modes.
@@ -3644,7 +4088,11 @@ boot_full() {
         power_off || true
         return 3
     fi
-    net_up || true
+    if ! net_up; then
+        echo "helper: could not configure Waterbox networking; stopping the box" >&2
+        power_off || true
+        return 3
+    fi
 }
 
 # Run tmux inside the running container as uid 1000 (leader-PID + nsenter). The
@@ -3663,14 +4111,251 @@ run_tmux() {
     local leader
     leader=$(machinectl show "$MACHINE_NAME" -p Leader --value 2>/dev/null)
     [ -n "$leader" ] && [ "$leader" != 0 ] || return 3
-    nsenter --target "$leader" --all --setuid 1000 --setgid 1000 \
-        env TMUX_TMPDIR=/tmp HOME="/home/$USER_NAME" /usr/bin/tmux "$@"
+    timeout --signal=TERM --kill-after=2s 15s \
+        nsenter --target "$leader" --all --setuid 1000 --setgid 1000 \
+            env TMUX_TMPDIR=/tmp HOME="/home/$USER_NAME" /usr/bin/tmux "$@"
+}
+
+# Return 0 when an exact mountpoint is still present in the container mount
+# namespace, 1 when absent, and 2 when it could not be inspected. This reads the
+# kernel's host-side mountinfo; it does not execute or trust a binary from the box.
+_mount_present() {
+    local target="$1" leader
+    leader=$(machinectl show "$MACHINE_NAME" -p Leader --value 2>/dev/null) \
+        || return 2
+    [ -n "$leader" ] && [ "$leader" != 0 ] || return 2
+    python3 - "$leader" "$target" <<'PY'
+import re
+import sys
+
+leader, wanted = sys.argv[1:]
+try:
+    with open(f"/proc/{leader}/mountinfo", "r", encoding="utf-8",
+              errors="surrogateescape") as mountinfo:
+        for line in mountinfo:
+            fields = line.split()
+            if len(fields) < 5:
+                continue
+            mountpoint = re.sub(
+                r"\\([0-7]{3})",
+                lambda match: chr(int(match.group(1), 8)),
+                fields[4],
+            )
+            if mountpoint == wanted:
+                raise SystemExit(0)
+except OSError:
+    raise SystemExit(2)
+raise SystemExit(1)
+PY
 }
 
 # schedule-command timers live in the container's OWN systemd (run as the water
 # user), so a sandboxed agent can't ride one to escape. The helper only writes the
 # root-owned unit files + reloads; it FIXES User= and the ExecStart shape, so the
 # caller can't smuggle a different command or user in.
+_sched_repair_messages() {
+    running && approved_box \
+        || { echo "helper: refusing to repair schedules in an unapproved legacy box" >&2; return 3; }
+    # Older Waterbox versions created these as root:0600 even though
+    # waterbox-fire runs as the guest user and must be able to read them. They also
+    # gave interactive command timers a 30s coalescing window. Repair only regular
+    # files at the fixed paths, from inside all box namespaces.
+    run_in_approved_box /bin/sh -c '
+        for f in "$1"/schd-com-*.msg; do
+            [ -f "$f" ] && [ ! -L "$f" ] || continue
+            chown "$2:$2" "$f" && chmod 0600 "$f" || exit 1
+        done
+        for f in "$3"/waterbox-schd-com-*.timer; do
+            [ -f "$f" ] && [ ! -L "$f" ] || continue
+            sed -i "s/^AccuracySec=30sec$/AccuracySec=1sec/" "$f" || exit 1
+        done
+    ' sh "$TASK_MSG_DIR" "$USER_NAME" "$TASK_ETC" \
+        && systemctl -M "$MACHINE_NAME" daemon-reload 2>/dev/null
+}
+
+# Emit bounded, terminal-safe schedule records without ever following a path from
+# the attacker-controlled rootfs. This is deliberately a HOST Python process:
+# executing a box-provided `cat`, `grep`, or `base64` would hand parsing back to the
+# attacker. Directory fds pin every parent against rename races; O_NOFOLLOW rejects
+# symlink leaves; O_NONBLOCK + the regular-file check reject FIFOs/devices.
+#
+# Output fields (TSV): id, v+info, v+calendar, v+display-message, message-state.
+# C0/C1 controls, bidi/format controls, and Unicode line separators are rendered as
+# visible escapes before they can reach the host terminal. Only display is capped;
+# waterbox-fire still receives the complete stored command.
+_sched_dump_records() {
+    python3 - "$JAIL_ROOT" <<'PY'
+import os
+import re
+import stat
+import sys
+import unicodedata
+
+ROOT = sys.argv[1]
+MAX_RECORDS = 512
+MAX_TIMER_BYTES = 65536
+MAX_MESSAGE_BYTES = 4096
+NAME_RE = re.compile(r"waterbox-schd-com-([0-9]+)\.timer\Z")
+INFO_RE = re.compile(
+    r"([A-Za-z0-9._][A-Za-z0-9._-]*) @ "
+    r"((?:[01][0-9]|2[0-3]):[0-5][0-9]) (once|daily)\Z"
+)
+ONCE_RE = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2} ((?:[01][0-9]|2[0-3]):[0-5][0-9]):00\Z"
+)
+DAILY_RE = re.compile(
+    r"\*-\*-\* ((?:[01][0-9]|2[0-3]):[0-5][0-9]):00\Z"
+)
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+
+
+def open_dir(parent, name):
+    return os.open(name, DIR_FLAGS, dir_fd=parent)
+
+
+def read_regular(parent, name, limit):
+    try:
+        fd = os.open(name, FILE_FLAGS, dir_fd=parent)
+    except OSError:
+        return None, "unsafe"
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None, "unsafe"
+        chunks = []
+        left = limit + 1
+        while left:
+            chunk = os.read(fd, min(65536, left))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            left -= len(chunk)
+        data = b"".join(chunks)
+        return data[:limit], "truncated" if len(data) > limit else "ok"
+    except OSError:
+        return None, "unsafe"
+    finally:
+        os.close(fd)
+
+
+def safe_text(data, limit=None):
+    if data is None:
+        return ""
+    if limit is not None:
+        data = data[:limit]
+    text = data.decode("utf-8", "replace")
+    out = []
+    for ch in text:
+        code = ord(ch)
+        category = unicodedata.category(ch)
+        if ch == "\n":
+            out.append(r"\n")
+        elif ch == "\r":
+            out.append(r"\r")
+        elif ch == "\t":
+            out.append(r"\t")
+        elif category in ("Cc", "Cf", "Zl", "Zp"):
+            out.append((r"\x%02x" if code <= 0xFF else
+                        r"\u%04x" if code <= 0xFFFF else r"\U%08x") % code)
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def timer_fields(data):
+    info_raw = None
+    expr_raw = None
+    for line in data.splitlines():
+        if info_raw is None and line.startswith(b"# waterbox: "):
+            info_raw = line[len(b"# waterbox: "):]
+        elif expr_raw is None and line.startswith(b"OnCalendar="):
+            expr_raw = line[len(b"OnCalendar="):]
+        if info_raw is not None and expr_raw is not None:
+            break
+
+    info = safe_text(info_raw, 512)
+    expr = safe_text(expr_raw, 512)
+    match = INFO_RE.fullmatch(info)
+    if not match:
+        return "<invalid schedule metadata>", ""
+
+    expected_time, mode = match.group(2), match.group(3)
+    cal_match = DAILY_RE.fullmatch(expr) if mode == "daily" else ONCE_RE.fullmatch(expr)
+    if not cal_match or cal_match.group(1) != expected_time:
+        return info, ""
+    return info, expr
+
+
+fds = []
+try:
+    root_fd = os.open(ROOT, DIR_FLAGS)
+    fds.append(root_fd)
+    etc_fd = open_dir(root_fd, "etc")
+    fds.append(etc_fd)
+    systemd_fd = open_dir(etc_fd, "systemd")
+    fds.append(systemd_fd)
+    timer_fd = open_dir(systemd_fd, "system")
+    fds.append(timer_fd)
+    try:
+        message_fd = open_dir(etc_fd, "waterbox")
+        fds.append(message_fd)
+    except OSError:
+        message_fd = None
+
+    emitted = 0
+    with os.scandir(timer_fd) as entries:
+        for entry in entries:
+            match = NAME_RE.fullmatch(entry.name)
+            if not match:
+                continue
+            if emitted >= MAX_RECORDS:
+                raise RuntimeError("too many schedule records")
+
+            timer_data, timer_state = read_regular(
+                timer_fd, entry.name, MAX_TIMER_BYTES
+            )
+            if timer_data is None:
+                info, expr = "<unsafe schedule metadata>", ""
+            else:
+                info, expr = timer_fields(timer_data)
+
+            msg_name = "schd-com-%s.msg" % match.group(1)
+            if message_fd is None:
+                msg_data, msg_state = None, "missing"
+            else:
+                msg_data, msg_state = read_regular(
+                    message_fd, msg_name, MAX_MESSAGE_BYTES
+                )
+                if msg_data is None and msg_state == "unsafe":
+                    # ENOENT and a rejected symlink/non-regular file are intentionally
+                    # presented alike here: neither is safe content to display.
+                    try:
+                        os.stat(msg_name, dir_fd=message_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        msg_state = "missing"
+                    except OSError:
+                        pass
+
+            message = safe_text(msg_data)
+            sched_id = "schd-com-%s" % match.group(1)
+            print(
+                sched_id,
+                "v" + info,
+                "v" + expr,
+                "v" + message,
+                msg_state,
+                sep="\t",
+            )
+            emitted += 1
+finally:
+    for fd in reversed(fds):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+PY
+}
+
 _sched_install() {
     local id="$1" sess="$2" time="$3" mode="$4" base="waterbox-$1"
     local hh=${time%:*} mm=${time#*:} cal ts msg="$TASK_MSG_DIR/${1}.msg"
@@ -3683,18 +4368,27 @@ _sched_install() {
         [ "$ts" -le "$(date +%s)" ] && ts=$(date -d "tomorrow ${time}" +%s)
         cal=$(date -d "@$ts" '+%Y-%m-%d %H:%M:00')
     fi
-    printf '%s\n' \
-        "[Unit]" "Description=Waterbox scheduled command (-> $sess @ $time $mode)" "" \
-        "[Service]" "Type=oneshot" "User=$USER_NAME" \
-        "Environment=HOME=/home/$USER_NAME" \
-        "Environment=PATH=/usr/local/bin:/usr/bin:/home/$USER_NAME/.local/bin" \
-        "Environment=TMUX_TMPDIR=/tmp" \
-        "ExecStart=/usr/local/bin/waterbox-fire send $sess $msg" \
-        | run_in_approved_box /bin/sh -c 'umask 022; cat > "$1"' sh "$TASK_ETC/$base.service"
+    {
+        printf '%s\n' \
+            "[Unit]" "Description=Waterbox scheduled command (-> $sess @ $time $mode)" "" \
+            "[Service]" "Type=oneshot" "User=$USER_NAME" \
+            "Environment=HOME=/home/$USER_NAME" \
+            "Environment=PATH=/usr/local/bin:/usr/bin:/home/$USER_NAME/.local/bin" \
+            "Environment=TMUX_TMPDIR=/tmp" \
+            "ExecStart=/usr/local/bin/waterbox-fire send $sess $msg"
+        # Successful one-shots remove their fixed record immediately. A failed
+        # send deliberately leaves it for the manager's guarded stale cleanup.
+        if [ "$mode" = once ]; then
+            printf '%s\n' "ExecStartPost=/usr/local/bin/waterbox-fire cleanup-once $id"
+        fi
+    } | run_in_approved_box /bin/sh -c 'umask 022; cat > "$1"' sh "$TASK_ETC/$base.service"
+    # Interactive commands should arrive close to the displayed wall-clock time.
+    # A 30s accuracy window let systemd coalesce them (often by ~16s), which is
+    # useful for power-saving timers but surprising here.
     printf '%s\n' \
         "[Unit]" "Description=Waterbox scheduled command (-> $sess @ $time $mode)" \
         "# waterbox: $sess @ $time $mode" "" \
-        "[Timer]" "OnCalendar=$cal" "AccuracySec=30sec" "" \
+        "[Timer]" "OnCalendar=$cal" "AccuracySec=1sec" "" \
         "[Install]" "WantedBy=timers.target" \
         | run_in_approved_box /bin/sh -c 'umask 022; cat > "$1"' sh "$TASK_ETC/$base.timer"
     run_in_approved_box /bin/mkdir -p "$TASK_ETC/timers.target.wants"
@@ -3769,7 +4463,12 @@ _write_host_wake() {
         "[Install]" "WantedBy=timers.target" \
         > "$HW_ETC/$base.timer"
     systemctl daemon-reload
-    systemctl enable --now "$base.timer" >/dev/null 2>&1 || true
+    if ! systemctl enable --now "$base.timer" >/dev/null 2>&1; then
+        rm -f "$HW_ETC/$base.timer" "$HW_ETC/$base.service"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        echo "helper: could not enable $base.timer" >&2
+        return 1
+    fi
 }
 
 # req 11: if the wake's output says the quota is capped ("… resets 9:10am
@@ -3840,17 +4539,26 @@ case "$verb" in
                 echo
             fi
         fi
-        machinectl status "$MACHINE_NAME" --no-pager 2>/dev/null | head -n 12 || true
+        # Do not print `machinectl status`'s guest process tree: a malicious process
+        # controls argv/comm and could inject terminal control sequences into the
+        # host's status output. These fixed, validated properties carry the useful
+        # lifecycle information without rendering guest-controlled text.
+        mstate=$(machinectl show "$MACHINE_NAME" -p State --value 2>/dev/null || true)
+        leader=$(machinectl show "$MACHINE_NAME" -p Leader --value 2>/dev/null || true)
+        case "$mstate" in ''|*[!A-Za-z-]*) mstate=unknown ;; esac
+        case "$leader" in ''|*[!0-9]*) leader=unknown ;; esac
+        printf 'Machine: %s\nState: %s\nLeader PID: %s\n' \
+            "$MACHINE_NAME" "$mstate" "$leader"
         echo
         resource_status "$status_color"
         ;;
     ensure-dns)
-        # Guarantee the box can resolve names. Some hosts (or the container's own
-        # systemd-resolved) leave /etc/resolv.conf pointing at an unreachable stub
-        # (127.0.0.53). Read the desired resolv.conf on stdin (validated), test the
-        # box, and only rewrite if it currently can't resolve — so a working host
-        # split-DNS setup is left untouched. The rewrite removes any symlink first,
-        # so a container resolver can't keep hijacking the file.
+        # Enforce host-primary + two public fallbacks on every start/attach. Merely
+        # testing DNS first is insufficient: an old Wi-Fi/VPN resolver may work now,
+        # causing us to preserve a file with no fallback that breaks after the host
+        # changes networks. Input is generated by the host and strictly validated.
+        # The rewrite occurs inside the approved mount namespace, so even a planted
+        # absolute symlink can reach only a path inside the box.
         running || exit 0
         _rtmp=$(mktemp)
         while IFS= read -r line; do
@@ -3863,19 +4571,20 @@ case "$verb" in
                     echo "options $opt" >> "$_rtmp" ;;
             esac
         done
-        if systemd-run -M "$MACHINE_NAME" -q --wait --pipe getent ahostsv4 example.com >/dev/null 2>&1; then
-            rm -f "$_rtmp"; exit 0
-        fi
         [ -s "$_rtmp" ] || { rm -f "$_rtmp"; exit 0; }
-        # Write from inside the approved box's mount namespace. This removes the
-        # check-then-open race a malicious box could otherwise win by swapping an
-        # /etc symlink between a host-side realpath() check and a root write.
         run_in_approved_box /bin/sh -c \
-            'rm -f /etc/resolv.conf && umask 022 && cat > /etc/resolv.conf' \
+            'umask 022
+             t="/etc/.waterbox-resolv.$$"
+             cat > "$t" && chmod 0644 "$t" && mv -f "$t" /etc/resolv.conf \
+                 || { rm -f "$t"; exit 1; }' \
             < "$_rtmp" || { rm -f "$_rtmp"; exit 2; }
         rm -f "$_rtmp"
-        systemd-run -M "$MACHINE_NAME" -q --wait --pipe getent ahostsv4 example.com >/dev/null 2>&1 \
-            && echo "helper: repaired container DNS" || echo "helper: DNS still failing after resolv.conf rewrite"
+        if ! timeout --signal=TERM --kill-after=2s 20s \
+             systemd-run -M "$MACHINE_NAME" -q --wait --pipe \
+                 getent ahostsv4 example.com >/dev/null 2>&1; then
+            echo "helper: DNS still failing after resolv.conf rewrite" >&2
+            exit 1
+        fi
         ;;
     tmux)  run_tmux "$@" ;;
     shell)
@@ -3914,10 +4623,22 @@ case "$verb" in
         ;;
     sched-msg)
         id="$1"; _valid_schedid "$id" || { echo "helper: bad id"; exit 2; }
-        # Command text is data only. Write it from inside the box namespace so
-        # box-controlled symlinks can resolve only within the box.
+        # Command text is data only. Build a private regular file atomically from
+        # inside the box namespace; it belongs to the same guest user that the timer
+        # runs as. The temp+rename avoids following a box-planted destination symlink.
         run_in_approved_box /bin/sh -c \
-            'mkdir -p "$1"; umask 077; cat > "$1/$2.msg"' sh "$TASK_MSG_DIR" "$id"
+            'mkdir -p "$1"; umask 077
+             t="$1/.$2.msg.$$"
+             cat > "$t" || { rm -f "$t"; exit 1; }
+             chown "$3:$3" "$t" && chmod 0600 "$t" && mv -f "$t" "$1/$2.msg" \
+                 || { rm -f "$t"; exit 1; }' \
+            sh "$TASK_MSG_DIR" "$id" "$USER_NAME"
+        ;;
+    sched-repair)
+        _sched_repair_messages
+        ;;
+    sched-list)
+        _sched_dump_records
         ;;
     sched-remove)
         id="$1"; _valid_schedid "$id" || { echo "helper: bad id"; exit 2; }
@@ -3931,29 +4652,38 @@ case "$verb" in
         old="$1"; new="$2"
         _valid_session "$old" || { echo "helper: bad session"; exit 2; }
         _valid_session "$new" || { echo "helper: bad session"; exit 2; }
-        for f in "$JAIL_ROOT$TASK_ETC"/waterbox-schd-com-*.timer; do
-            [ -e "$f" ] || continue
-            info=$(grep -m1 '^# waterbox:' "$f" 2>/dev/null | sed 's/^# waterbox: //')
+        records=$(_sched_dump_records) || exit 1
+        while IFS=$'\t' read -r id info expr msg state extra; do
+            _valid_schedid "$id" || continue
+            case "$info" in v*) info="${info#v}" ;; *) continue ;; esac
+            [ -z "$extra" ] || continue
             [ "${info%% @ *}" = "$old" ] || continue
             rest="${info#* @ }"                     # "<time> <mode>"
             time="${rest%% *}"; mode="${rest##* }"
             _valid_time "$time" || continue
             [ "$mode" = once ] || [ "$mode" = daily ] || continue
-            base=$(basename "$f" .timer); id="${base#waterbox-}"
-            # The id comes from a filename the box can create, so validate it like
-            # every other id we take, rather than trusting the glob alone.
-            _valid_schedid "$id" || continue
             _sched_install "$id" "$new" "$time" "$mode"
-        done
+        done <<< "$records"
         ;;
     unshare)
         name="$1"
         case "$name" in ''|.|..|*/*) echo "helper: bad name"; exit 2 ;; esac
         target="$CONTAINER_WORKSPACE/$name"
         if running; then
+            # The box controls /bin/sh and /bin/umount, so their exit status is not
+            # proof that host data was actually revoked. Attempt the ordinary lazy
+            # unmount, then verify the kernel mount table from the trusted host.
             run_in_approved_box /bin/sh -c \
-                'umount -l "$1" 2>/dev/null || true; rmdir "$1" 2>/dev/null || true' \
-                sh "$target"
+                'umount -l "$1" 2>/dev/null || true' sh "$target" || true
+            if _mount_present "$target"; then
+                echo "helper: share is still mounted after the detach attempt" >&2
+                exit 1
+            else
+                mount_rc=$?
+                [ "$mount_rc" -eq 1 ] \
+                    || { echo "helper: could not verify that the share was detached" >&2; exit 1; }
+            fi
+            run_in_approved_box /bin/rmdir "$target" 2>/dev/null || true
         else
             _in_jail "$JAIL_ROOT$target" \
                 && rmdir "$JAIL_ROOT$target" 2>/dev/null || true
@@ -3973,13 +4703,27 @@ case "$verb" in
             boot_min
             started=1
         fi
-        out=$(systemd-run -M "$MACHINE_NAME" --quiet --wait --pipe \
-            -p User="$USER_NAME" \
-            -p Environment=HOME="/home/$USER_NAME" \
-            -p Environment=PATH="/usr/local/bin:/usr/bin:/home/$USER_NAME/.local/bin" \
-            -p Environment=TMUX_TMPDIR=/tmp \
-            /usr/local/bin/waterbox-fire wake "$prof" 2>/dev/null || true)
-        [ "$started" = 1 ] && power_off
+        wake_rc=0
+        out=$(timeout --signal=TERM --kill-after=5s 330s \
+            systemd-run -M "$MACHINE_NAME" --quiet --wait --pipe \
+                -p User="$USER_NAME" \
+                -p RuntimeMaxSec=5min \
+                -p Environment=HOME="/home/$USER_NAME" \
+                -p Environment=PATH="/usr/local/bin:/usr/bin:/home/$USER_NAME/.local/bin" \
+                -p Environment=TMUX_TMPDIR=/tmp \
+                /usr/local/bin/waterbox-fire wake "$prof" 2>/dev/null) || wake_rc=$?
+        shutdown_rc=0
+        if [ "$started" = 1 ]; then
+            power_off || shutdown_rc=$?
+        fi
+        if [ "$wake_rc" -ne 0 ]; then
+            echo "helper: wake action failed for profile '$prof' (status $wake_rc)" >&2
+            exit "$wake_rc"
+        fi
+        if [ "$shutdown_rc" -ne 0 ]; then
+            echo "helper: wake completed, but the temporarily started box did not stop" >&2
+            exit "$shutdown_rc"
+        fi
         _reschedule_on_limit "$prof" "$out"
         ;;
     install-host-wake)
@@ -4034,6 +4778,7 @@ case "$verb" in
         leader=$(machinectl show "$MACHINE_NAME" -p Leader --value 2>/dev/null)
         [ -n "$leader" ] && [ "$leader" != 0 ] || exit 0
         target="$CONTAINER_WORKSPACE/$name"
+        timeout --signal=TERM --kill-after=2s 10s \
         nsenter --target "$leader" --all -- /bin/sh -c '
             cd / 2>/dev/null || true
             t=$1
@@ -4106,6 +4851,25 @@ _host_share_allowed() {
     esac
     return 1
 }
+
+# Rewrite one of the ordinary-user share bookkeeping files atomically. `grep -v`
+# exits 1 when removing its final line, so the empty output is still a success.
+_remove_share_record() {
+    local file="$1" value="$2" tmp
+    [ -f "$file" ] || return 0
+    tmp=$(mktemp "$CONFIG_DIR/.share-list.XXXXXX") || return 1
+    grep -vFx -- "$value" "$file" > "$tmp" || true
+    if ! mv -f -- "$tmp" "$file"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+}
+
+_pending_share_has() {
+    [ -f "$PENDING_SHARE_LIST" ] \
+        && grep -Fxq -- "$1" "$PENDING_SHARE_LIST"
+}
+
 manage_share() {
     local action="$1"
     local target_path="$2"
@@ -4120,6 +4884,9 @@ manage_share() {
 
     local absolute_path
     absolute_path=$(realpath "$target_path" 2>/dev/null || echo "$target_path")
+    case "$absolute_path" in
+        *$'\n'*|*$'\r'*) log_error "Share paths cannot contain newline characters." ;;
+    esac
     local folder_name
     folder_name=$(basename "$absolute_path")
     local mount_target="$CONTAINER_WORKSPACE/$folder_name"
@@ -4148,17 +4915,33 @@ manage_share() {
                     log_error "Cannot share '$absolute_path': '$existing' already uses $mount_target. Rename one directory first."
                 fi
             done < "$SHARE_LIST"
-            echo "$absolute_path" >> "$SHARE_LIST"
             if is_running; then
+                ensure_helper
+                printf '%s\n' "$absolute_path" >> "$SHARE_LIST" \
+                    || log_error "Could not save the new share."
                 if ! run_priv bind-share "$absolute_path"; then
                     # A filesystem may not support ID-mapped mounts. Do not leave a
                     # broken persistent entry that would make the next boot fail too.
-                    grep -vFx "$absolute_path" "$SHARE_LIST" > "${SHARE_LIST}.tmp" || true
-                    mv "${SHARE_LIST}.tmp" "$SHARE_LIST"
+                    _remove_share_record "$SHARE_LIST" "$absolute_path" \
+                        || log_error "The live mount failed and its saved entry could not be removed. Fix permissions/free space in $CONFIG_DIR, then detach '$absolute_path'."
                     log_error "Could not mount '$absolute_path' securely. The share was not added (the source filesystem may not support ID-mapped mounts)."
                 fi
                 log_success "Added '$absolute_path' and mounted it live at $mount_target."
             else
+                # The filesystem cannot be conclusively tested without the box's
+                # picked user namespace. Mark it pending: if the next cold boot
+                # identifies this exact mount as unsupported, start rolls it back
+                # and retries instead of permanently poisoning every future boot.
+                : >> "$PENDING_SHARE_LIST" \
+                    || log_error "Could not prepare rollback tracking for the new share."
+                if ! grep -Fxq -- "$absolute_path" "$PENDING_SHARE_LIST"; then
+                    printf '%s\n' "$absolute_path" >> "$PENDING_SHARE_LIST" \
+                        || log_error "Could not prepare rollback tracking for the new share."
+                fi
+                if ! printf '%s\n' "$absolute_path" >> "$SHARE_LIST"; then
+                    _remove_share_record "$PENDING_SHARE_LIST" "$absolute_path" || true
+                    log_error "Could not save the new share."
+                fi
                 log_success "Added '$absolute_path' (will mount at $mount_target on next start)."
             fi
             ;;
@@ -4166,6 +4949,11 @@ manage_share() {
             if ! grep -Fxq "$absolute_path" "$SHARE_LIST"; then
                 log_error "Path '$absolute_path' is not currently shared."
             fi
+            # A live detach is a security-sensitive promise that the host path is
+            # no longer exposed. Install the current fixed helper before changing
+            # persistent state; the old code silently skipped an outdated helper,
+            # removed the list entry, and reported success while the mount remained.
+            is_running && ensure_helper
             # Warn (and confirm) if the box is still using it — a lazy-unmount would
             # strand those processes. Only prompts when actually in use, so a clean
             # detach stays non-interactive/scriptable.
@@ -4176,12 +4964,21 @@ manage_share() {
             fi
             # grep -v exits 1 when it removes the *last* line (zero output), so
             # don't gate the mv on it — otherwise detaching the only share no-ops.
-            grep -vFx "$absolute_path" "$SHARE_LIST" > "${SHARE_LIST}.tmp" || true
-            mv "${SHARE_LIST}.tmp" "$SHARE_LIST"
+            _remove_share_record "$SHARE_LIST" "$absolute_path" \
+                || log_error "Could not update the shared-directory list; '$absolute_path' remains shared."
 
             # Live lazy-unmount in the container's mount namespace + drop the empty
             # mountpoint, all inside the helper (no broad sudo).
-            _helper_current && run_priv unshare "$folder_name" 2>/dev/null || true
+            if is_running && ! run_priv unshare "$folder_name"; then
+                # Keep the persistent truth aligned with the still-live exposure.
+                # Since the exact line was present before this operation, restoring
+                # it cannot introduce a duplicate.
+                if ! printf '%s\n' "$absolute_path" >> "$SHARE_LIST"; then
+                    log_error "Could not detach '$absolute_path', and its saved entry could not be restored. It may remain mounted; stop the box before editing $SHARE_LIST."
+                fi
+                log_error "Could not detach '$absolute_path'; it remains shared."
+            fi
+            _remove_share_record "$PENDING_SHARE_LIST" "$absolute_path"
             log_success "Detached '$absolute_path' (unmounted; no files deleted)."
             ;;
     esac
@@ -4348,11 +5145,16 @@ _statusline_marker() { _statusline_body | cksum | tr -d ' '; }
 # /statusline rewrite, by a future waterbox — is self-evident. This is what makes
 # "reseed until touched, then hands off" safe without tracking state anywhere else.
 _statusline_untouched() {
-    local f="$JAIL_ROOT$STATUSLINE_PATH" stamp body
-    [ -f "$f" ] || return 1
-    stamp=$(sed -n '2s/^# WB_STATUSLINE_MARK=//p' "$f")
-    [ -n "$stamp" ] || return 1
-    body=$(tail -n +3 "$f" | cksum | tr -d ' ')
+    local f="$JAIL_ROOT$STATUSLINE_PATH" stamp body tmp
+    tmp=$(mktemp)
+    if ! _read_jail_regular "$f" 1048576 > "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        return 1
+    fi
+    stamp=$(sed -n '2s/^# WB_STATUSLINE_MARK=//p' "$tmp")
+    [ -n "$stamp" ] || { rm -f "$tmp"; return 1; }
+    body=$(tail -n +3 "$tmp" | cksum | tr -d ' ')
+    rm -f "$tmp"
     [ "$stamp" = "$body" ]
 }
 
@@ -4377,11 +5179,13 @@ write_statusline() {
 # True when there is nothing for write_statusline to do — either the file is already
 # the current default, or you've made it your own.
 _statusline_current() {
-    local f="$JAIL_ROOT$STATUSLINE_PATH"
+    local f="$JAIL_ROOT$STATUSLINE_PATH" stamp
     [ -f "$f" ] || return 1
     [ -e "$JAIL_ROOT$STATUSLINE_OLD" ] && return 1   # stale copy still to remove
     _statusline_untouched || return 0
-    grep -q "^# WB_STATUSLINE_MARK=$(_statusline_marker)\$" "$f" 2>/dev/null
+    stamp=$(_read_jail_regular "$f" 1048576 2>/dev/null \
+        | sed -n '2s/^# WB_STATUSLINE_MARK=//p') || return 1
+    [ "$stamp" = "$(_statusline_marker)" ]
 }
 
 write_task_helper() {
@@ -4413,9 +5217,15 @@ case "$kind" in
         printf '%s\n' "$out" | grep -iE 'session limit|resets ' | head -1 || true
         ;;
     send)
-        sess="$1"; msgfile="$2"
-        [ -n "$sess" ] && [ -f "$msgfile" ] || exit 0
+        sess="${1:-}"; msgfile="${2:-}"
         export TMUX_TMPDIR=/tmp
+        send_failed() {
+            logger -t waterbox-fire "send: $1 for session '$sess'" 2>/dev/null || true
+            exit 1
+        }
+        [ -n "$sess" ] && [ -n "$msgfile" ] \
+            || send_failed "received invalid arguments"
+        [ -f "$msgfile" ] || send_failed "command file is missing"
         # Only type into a session whose name matches EXACTLY, so a command for a
         # since-gone 'box' never lands in 'box-2'. grep -Fx is a whole-line exact
         # match that works on every tmux version — send-keys does NOT accept the '='
@@ -4424,11 +5234,50 @@ case "$kind" in
             logger -t waterbox-fire "send: no live session '$sess' — skipped" 2>/dev/null || true
             exit 0
         fi
-        msg=$(cat "$msgfile")
-        [ -n "$msg" ] && tmux send-keys -t "$sess" -l -- "$msg"   # empty command → just Enter
+
+        # Resolve the active pane once. If the user has scrolled or selected text,
+        # tmux is in copy-mode and would consume Enter itself—the application would
+        # receive nothing while we falsely reported success. Cancel that mode before
+        # injecting either a command or an enter-only action.
+        pane=$(tmux display-message -p -t "$sess" '#{pane_id}' 2>/dev/null) \
+            || send_failed "could not resolve the active pane"
+        [ -n "$pane" ] || send_failed "could not resolve the active pane"
+        pane_mode=$(tmux display-message -p -t "$pane" '#{pane_in_mode}' 2>/dev/null) \
+            || send_failed "could not inspect the active pane"
+        if [ "${pane_mode:-0}" != 0 ]; then
+            tmux send-keys -t "$pane" -X cancel 2>/dev/null \
+                || send_failed "could not leave tmux copy mode"
+        fi
+
+        msg=$(cat "$msgfile") || send_failed "could not read its command file"
+        if [ -n "$msg" ]; then
+            tmux send-keys -t "$pane" -l -- "$msg" \
+                || send_failed "could not type its command"
+        fi
         sleep 0.3
-        tmux send-keys -t "$sess" Enter
-        logger -t waterbox-fire "send: delivered to '$sess' [${msg:-<enter>}]" 2>/dev/null || true
+        tmux send-keys -t "$pane" Enter \
+            || send_failed "could not send Enter"
+        if [ -n "$msg" ]; then
+            logger -t waterbox-fire "send: delivered command to '$sess'" 2>/dev/null || true
+        else
+            logger -t waterbox-fire "send: delivered Enter to '$sess'" 2>/dev/null || true
+        fi
+        ;;
+    cleanup-once)
+        # ExecStartPost reaches this only after a successful once-mode delivery.
+        # Validate the fixed id before using it in root-owned unit/message paths.
+        id="$1"
+        case "$id" in
+            schd-com-*) n=${id#schd-com-}; case "$n" in ''|*[!0-9]*) exit 2 ;; esac ;;
+            *) exit 2 ;;
+        esac
+        base="waterbox-$id"
+        sudo systemctl disable --now "$base.timer" >/dev/null 2>&1 || true
+        sudo rm -f "/etc/systemd/system/$base.timer" \
+                   "/etc/systemd/system/$base.service" \
+                   "/etc/systemd/system/timers.target.wants/$base.timer" \
+                   "/etc/waterbox/$id.msg" 2>/dev/null || exit 1
+        sudo systemctl daemon-reload >/dev/null 2>&1 || true
         ;;
     cleanup-session)
         # Remove schedule-commands that targeted a now-closed session (req 14).
@@ -4444,6 +5293,7 @@ case "$kind" in
             sudo systemctl disable --now "$base.timer" >/dev/null 2>&1 || true
             sudo rm -f "/etc/systemd/system/$base.timer" \
                        "/etc/systemd/system/$base.service" \
+                       "/etc/systemd/system/timers.target.wants/$base.timer" \
                        "/etc/waterbox/${id}.msg" 2>/dev/null || true
             removed=1
         done
@@ -4484,61 +5334,67 @@ FIRE
 
 # True when the installed in-box fire helper matches this waterbox version.
 _fire_current() {
-    [ -x "$JAIL_ROOT/usr/local/bin/waterbox-fire" ] \
-        && grep -q "^# WB_FIRE_VERSION=$WATERBOX_VERSION\$" \
-            "$JAIL_ROOT/usr/local/bin/waterbox-fire" 2>/dev/null
+    local head
+    [ -x "$JAIL_ROOT/usr/local/bin/waterbox-fire" ] || return 1
+    head=$(_read_jail_regular "$JAIL_ROOT/usr/local/bin/waterbox-fire" 1048576 2>/dev/null) \
+        || return 1
+    grep -q "^# WB_FIRE_VERSION=$WATERBOX_VERSION\$" <<< "$head"
 }
 
-# Next free integer suffix for tasks whose unit base starts with <glob-prefix>
-# (e.g. "waterbox-schd-com-"). Ids are simple sequential handles for 'del' — the
-# 'list' output carries the human detail (who, time, mode, command).
+# Next free schedule-command suffix. Ids are simple sequential handles for `del`;
+# the list output carries the human detail (who, time, mode, command).
 _next_task_id() {
-    local f n max=0
-    for f in "$JAIL_ROOT$TASK_ETC/$1"*.timer; do
-        [ -e "$f" ] || continue
-        n=$(basename "$f" .timer); n="${n##*-}"
+    local records id info expr msg state extra n max=0
+    records=$(_schedule_records) || return 1
+    while IFS=$'\t' read -r id info expr msg state extra; do
+        [[ "$id" =~ ^schd-com-[0-9]+$ && -z "$extra" ]] || continue
+        n="${id#schd-com-}"
         case "$n" in ''|*[!0-9]*) continue ;; esac
         [ "$n" -gt "$max" ] && max="$n"
-    done
+    done <<< "$records"
     echo $((max + 1))
 }
 
 # schedule-command timers are written/removed by the root helper (it fixes User=
 # and the ExecStart shape). These wrappers take the bare id (e.g. "schd-com-3").
 _sched_remove() {
-    _helper_current && run_priv sched-remove "$1" >/dev/null 2>&1 || true
+    _helper_current || return 2
+    run_priv sched-remove "$1" >/dev/null 2>&1
 }
 
-# Scan timers whose unit name starts with <glob-prefix> into parallel arrays
-# TL_IDS (delete handles) and TL_ROWS ("<who @ time mode>[   ->  cmd][   [left]]").
-# One-shots whose time has already elapsed (systemd-analyze => "never") are
-# garbage-collected here and not returned. $1 = glob prefix   $2 = 1 if a per-id
-# message file ($TASK_MSG_DIR/<id>.msg) holds the command to show and clean up.
+# Scan schedule-command records into TL_IDS (delete handles) and TL_ROWS
+# ("<who @ time mode> -> <cmd> [left]"). Elapsed one-shots are garbage-collected.
 TL_IDS=(); TL_ROWS=()
+TL_NOTE=""
 _timer_collect() {
-    local prefix="$1" hasmsg="$2" f b id info expr cmd msg now shown
+    local records id info expr cmd state extra now shown
     local -a t_ids=() t_rows=() t_keys=()
     now=$(date +%s)
-    TL_IDS=(); TL_ROWS=()
-    for f in "$JAIL_ROOT$TASK_ETC/${prefix}"*.timer; do
-        [ -e "$f" ] || continue
-        b=$(basename "$f" .timer); id="${b#waterbox-}"
-        info=$(grep -m1 '^# waterbox:' "$f" 2>/dev/null | sed 's/^# waterbox: //')
-        expr=$(grep -m1 '^OnCalendar=' "$f" 2>/dev/null | sed 's/^OnCalendar=//')
-        msg="$JAIL_ROOT$TASK_MSG_DIR/${id}.msg"
+    TL_IDS=(); TL_ROWS=(); TL_NOTE=""
+    # The helper safely opens and bounds every rootfs file. Besides blocking
+    # symlink/FIFO/large-file attacks, this works when host uid != guest uid 1000.
+    if ! records=$(_schedule_records); then
+        TL_NOTE="Schedule details unavailable — run 'waterbox start' once to sync the helper."
+        return 0
+    fi
+    while IFS=$'\t' read -r id info expr cmd state extra; do
+        [[ "$id" =~ ^schd-com-[0-9]+$ && "$info" == v* \
+           && "$expr" == v* && "$cmd" == v* && -z "$extra" ]] || continue
+        info="${info#v}"; expr="${expr#v}"; cmd="${cmd#v}"
         _timer_next "tc-$id" "$expr" "$now"
         [ "$_TIMER_GC" = 1 ] && { _sched_remove "$id"; continue; }   # elapsed one-shot
-        cmd=""; shown=""
-        if [ "$hasmsg" = 1 ] && [ -f "$msg" ]; then
-            cmd=$(cat "$msg")
-            [ -n "$cmd" ] && shown="$cmd" || shown="<enter>"   # empty command = just Enter
-        fi
+        case "$state" in
+            ok)        [ -n "$cmd" ] && shown="$cmd" || shown="<enter>" ;;
+            truncated) shown="${cmd}… <truncated in list>" ;;
+            missing)   shown="<missing command>" ;;
+            *)         shown="<unsafe command file — not displayed>" ;;
+        esac
         t_ids+=("$id")
         t_rows+=("${info}${shown:+   ->  $shown}${_TIMER_LEFT:+   [$_TIMER_LEFT]}")
         # key = <session>\t<epoch>\t<index>; session is the 1st token of the info line.
         # Index is plain %d (a zero-padded "0008" would be misread as octal).
         t_keys+=("$(printf '%s\t%011d\t%d' "${info%% @ *}" "${_TIMER_EPOCH:-99999999999}" "$(( ${#t_ids[@]} - 1 ))")")
-    done
+    done <<< "$records"
     [ "${#t_ids[@]}" -eq 0 ] && return 0
     # Sort by SESSION then time-left (each session's commands grouped, soonest first).
     local idx
@@ -4550,15 +5406,18 @@ _timer_collect() {
 
 # Print the collected timers as a bulleted "  - <id>   <detail>" list.
 _timer_list() {
-    _timer_collect "$1" "$2"
+    _timer_collect
     local i
-    if [ "${#TL_IDS[@]}" -eq 0 ]; then
+    if [ -n "$TL_NOTE" ]; then
+        echo "  (unavailable)"
+    elif [ "${#TL_IDS[@]}" -eq 0 ]; then
         echo "  (none)"
     else
         for i in "${!TL_IDS[@]}"; do
-            echo "  - ${TL_IDS[$i]}   ${TL_ROWS[$i]}"
+            printf '  - %s   %s\n' "${TL_IDS[$i]}" "${TL_ROWS[$i]}"
         done
     fi
+    [ -n "$TL_NOTE" ] && echo "  Note: $TL_NOTE"
     is_running || echo "  Note: tasks fire only while the box is running."
 }
 
@@ -4600,13 +5459,18 @@ _fmt_left() {
 # OnCalendar expression $2, and now=$3 (epoch), it sets:
 #   _TIMER_EPOCH  next-elapse epoch ("" if none / unresolvable)
 #   _TIMER_LEFT   human "time left" via _fmt_left ("" when there's no epoch)
-#   _TIMER_GC     1 when the calendar will never fire again (caller garbage-collects)
+#   _TIMER_GC     1 when the calendar is safely stale (caller garbage-collects)
 # The epoch is cached under $1 in _NEXT_EPOCH so the 1s live refresh doesn't re-spawn
 # systemd-analyze every tick — only when the cached elapse has already passed.
+#
+# An OnCalendar one-shot becomes "never" at its nominal second, but systemd may
+# still be holding it inside AccuracySec (30s for existing/host wake timers). Do
+# not let an open manager screen stop and delete that still-pending timer. Keep a
+# generous grace beyond every accuracy window; during it, show "due".
 declare -A _NEXT_EPOCH
 _TIMER_EPOCH=""; _TIMER_LEFT=""; _TIMER_GC=0
 _timer_next() {
-    local key="$1" expr="$2" now="$3" next nutc epoch
+    local key="$1" expr="$2" now="$3" next nutc epoch due_epoch age
     _TIMER_EPOCH=""; _TIMER_LEFT=""; _TIMER_GC=0
     epoch="${_NEXT_EPOCH[$key]:-}"
     if [ -z "$epoch" ] || [ "$now" -ge "$epoch" ]; then
@@ -4614,7 +5478,22 @@ _timer_next() {
         if command -v systemd-analyze >/dev/null 2>&1 && [ -n "$expr" ]; then
             next=$(systemd-analyze calendar "$expr" 2>/dev/null || true)
             if printf '%s' "$next" | grep -q 'Next elapse: *never'; then
-                unset "_NEXT_EPOCH[$key]"; _TIMER_GC=1; return 0
+                unset "_NEXT_EPOCH[$key]"
+                # Only exact one-shot expressions can be "due". Invalid or other
+                # never-firing expressions retain the old immediate-GC behavior.
+                if [[ "$expr" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}$ ]]; then
+                    due_epoch=$(date -d "$expr" +%s 2>/dev/null || true)
+                    if [ -n "$due_epoch" ] && [ "$now" -ge "$due_epoch" ]; then
+                        age=$(( now - due_epoch ))
+                        if [ "$age" -le 120 ]; then
+                            _TIMER_EPOCH="$due_epoch"
+                            _TIMER_LEFT="due"
+                            return 0
+                        fi
+                    fi
+                fi
+                _TIMER_GC=1
+                return 0
             fi
             nutc=$(printf '%s' "$next" | sed -n 's/.*(in UTC): *//p' | head -n1)
             nutc="${nutc#* }"                       # drop the leading weekday word
@@ -4670,7 +5549,7 @@ manage_wake_claude() {
             local profile="$1" time="$2" mode="${3:-daily}"
             [ -n "$profile" ] && [ -n "$time" ] \
                 || log_error "Usage: waterbox wake-claude <profile> <HH:MM> [once|daily]"
-            [[ "$profile" =~ ^[A-Za-z0-9._-]+$ ]] || log_error "Invalid profile name: '$profile'."
+            _valid_profile_name "$profile" || log_error "Invalid profile name: '$profile'."
             [[ "$time" =~ ^([01]?[0-9]|2[0-3]):[0-5][0-9]$ ]] \
                 || log_error "Time must be HH:MM (24-hour), got '$time'."
             time=$(printf '%02d:%s' "$((10#${time%%:*}))" "${time#*:}")   # 9:30 -> 09:30
@@ -4723,7 +5602,7 @@ manage_schedule() {
             fi
             [ -n "$session" ] && [ -n "$time" ] && [ "$have_cmd" = 1 ] \
                 || log_error "Usage: waterbox schedule-command <session> <HH:MM> [once|daily] \"<command>\"  (\"\" sends just Enter)"
-            [[ "$session" =~ ^[A-Za-z0-9._-]+$ ]] || log_error "Invalid session name: '$session'."
+            _valid_session_name "$session" || log_error "Invalid session name: '$session'."
             [[ "$time" =~ ^([01]?[0-9]|2[0-3]):[0-5][0-9]$ ]] \
                 || log_error "Time must be HH:MM (24-hour), got '$time'."
             time=$(printf '%02d:%s' "$((10#${time%%:*}))" "${time#*:}")   # 9:30 -> 09:30
@@ -4732,25 +5611,38 @@ manage_schedule() {
             is_running || log_error "The box must be running to schedule into a live session ('waterbox start' first)."
             container_tmux has-session -t "=$session" 2>/dev/null \
                 || log_error "No live session '$session'. Start it and check 'waterbox status'."
-            local id
-            id="schd-com-$(_next_task_id waterbox-schd-com-)"
+            local id next_id
+            next_id=$(_next_task_id) \
+                || log_error "Could not read existing schedules safely. Run 'waterbox start' once to sync the helper."
+            id="schd-com-$next_id"
             # The helper writes the message file + the (User-fixed, ExecStart-shaped)
             # timer units into the rootfs and starts them.
             printf '%s' "$command" | run_priv sched-msg "$id"
-            run_priv sched-install "$id" "$session" "$time" "$mode"
+            if ! run_priv sched-install "$id" "$session" "$time" "$mode"; then
+                run_priv sched-remove "$id" >/dev/null 2>&1 || true
+                log_error "Could not install schedule-command '$id'; its command file was rolled back."
+            fi
             log_success "schedule-command '$id' set: '${command:-<enter>}' $mode at $time into session '$session'."
             ;;
         del|rm)
-            local id="$1"
+            local id="$1" sched_rc
             [ -n "$id" ] || log_error "Usage: waterbox schedule-command del <id>  (see 'schedule-command list')."
             [[ "$id" == schd-com-* ]] || log_error "Not a schedule-command id: '$id' (see 'schedule-command list')."
-            [ -f "$JAIL_ROOT$TASK_ETC/waterbox-${id}.timer" ] || log_error "No such scheduled command: '$id'."
-            _sched_remove "$id"
+            if _schedule_has_id "$id"; then
+                :
+            else
+                sched_rc=$?
+                [ "$sched_rc" -eq 2 ] \
+                    && log_error "Could not read schedules safely. Run 'waterbox start' once to sync the helper."
+                log_error "No such scheduled command: '$id'."
+            fi
+            _sched_remove "$id" \
+                || log_error "Could not remove schedule-command '$id'; it remains scheduled."
             log_success "Removed schedule-command '$id'."
             ;;
         list|"")
             log_info "Scheduled commands (schedule-command):"
-            _timer_list "waterbox-schd-com-" 1
+            _timer_list
             ;;
         *) log_error "Usage: waterbox schedule-command <session> <HH:MM> [once|daily] \"<cmd>\" | list | del <id>" ;;
     esac
@@ -4771,10 +5663,14 @@ _claude_profiles_root() {
 
 # Claude accounts, read straight from the host-visible rootfs (no sudo).
 _list_profiles() {
-    local d
+    local d name count=0
     for d in "$(_claude_profiles_root)"/*/; do
         [ -d "$d" ] || continue
-        basename "$d"
+        name="${d%/}"; name="${name##*/}"
+        _valid_profile_name "$name" || continue
+        printf '%s\n' "$name"
+        count=$((count + 1))
+        [ "$count" -lt 512 ] || break
     done
 }
 
@@ -4803,6 +5699,8 @@ wake_add() {
     if [ -n "$profile" ]; then
         # Pre-seeded from the CLI (`waterbox wake-claude <profile>`): skip the picker
         # and jump straight to asking time + when.
+        _valid_profile_name "$profile" \
+            || log_error "Invalid account name: '$profile'."
         [ -d "$(_claude_profiles_root)/$profile" ] \
             || log_error "No such account: '$profile'. Create it with 'agent-env' inside the box."
     else
@@ -4821,7 +5719,7 @@ wake_del() { manage_wake_claude del "$1"; }
 wake_manager() { task_manager "Quota wakes (wake-claude)" wake_load wake_add wake_del delete 1; }
 
 sched_load() {
-    _timer_collect "waterbox-schd-com-" 1
+    _timer_collect
     local i
     for i in "${!TL_IDS[@]}"; do
         M_IDS+=("${TL_IDS[$i]}"); M_ROWS+=("${TL_IDS[$i]}   ${TL_ROWS[$i]}")
@@ -4833,11 +5731,11 @@ sched_add() {
     if [ -n "$session" ]; then
         # Pre-seeded from the CLI (`waterbox schedule-command <session>`): skip the
         # picker and jump straight to time + when + command.
-        container_tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -qxF "$session" \
+        _live_sessions | grep -qxF -- "$session" \
             || log_error "No live session '$session'. Start it and check 'waterbox status'."
     else
         while IFS= read -r s; do [ -n "$s" ] && sessions+=("$s"); done \
-            < <(container_tmux list-sessions -F '#{session_name}' 2>/dev/null | sort)
+            < <(_live_sessions)
         [ "${#sessions[@]}" -gt 0 ] \
             || { log_warn "No live sessions — start one first ('waterbox' → new session)."; return 0; }
         MENU_CANCEL=1
@@ -4853,7 +5751,11 @@ sched_add() {
     manage_schedule add "$session" "$AW_TIME" "$AW_MODE" "$command"
 }
 sched_del() { manage_schedule del "$1"; }
-schedule_manager() { task_manager "Scheduled commands (schedule-command)" sched_load sched_add sched_del delete 1; }
+schedule_manager() {
+    _schedule_records >/dev/null \
+        || log_error "Could not read schedules safely. Run 'waterbox start' once to sync the helper."
+    task_manager "Scheduled commands (schedule-command)" sched_load sched_add sched_del delete 1
+}
 
 share_load() {
     local line
@@ -4877,11 +5779,15 @@ _print_share_in_use() {
     local folder="$1" users pid cmd
     is_running || return 1
     _helper_current || return 1
-    users="$(run_priv share-users "$folder" 2>/dev/null)" || return 1
+    users="$(run_priv share-users "$folder" 2>/dev/null | head -c 65536)" || return 1
     [ -n "$users" ] || return 1
     printf '\e[33m[WARN]\e[0m Still in use inside the box (~/workspace/%s):\n' "$folder" > /dev/tty
     printf '%s\n' "$users" | while IFS=' ' read -r pid cmd; do
-        [ -n "$pid" ] && printf '         • %s (pid %s)\n' "${cmd:-?}" "$pid" > /dev/tty
+        case "$pid" in ''|*[!0-9]*) continue ;; esac
+        # /proc/<pid>/comm is guest-controlled and may contain terminal controls;
+        # render only a compact safe token. The PID remains useful when it does not.
+        case "$cmd" in ''|*[!A-Za-z0-9._:+-]*) cmd="process" ;; esac
+        printf '         • %s (pid %s)\n' "$cmd" "$pid" > /dev/tty
     done
     return 0
 }
@@ -4910,7 +5816,7 @@ _waterbox_time() {
 _waterbox() {
     local root="$HOME/.waterbox/root"
     local -a cmds items
-    cmds=(start stop restart status reset share
+    cmds=(start stop restart status reset update share
           wake-claude schedule-command version help)
 
     if (( CURRENT == 2 )); then
@@ -4923,6 +5829,9 @@ _waterbox() {
             # `waterbox start <session>` boots (if needed) and attaches that session
             # directly — complete existing live session names, plus the flags.
             items=(--here --gui --no-gui --x11 --no-gpu ${(f)"$(command waterbox _sessions 2>/dev/null)"})
+            compadd -a items ;;
+        restart)
+            items=(--gui --no-gui --x11 --no-gpu)
             compadd -a items ;;
         share)
             if (( CURRENT == 3 )); then items=(add detach list); compadd -a items
@@ -4967,16 +5876,32 @@ COMPLETION
 }
 
 # --- Argument parsing ---------------------------------------------------------
-# Pull out the global flags anywhere on the command line; the rest is positional.
+# Pull out global flags anywhere on the command line; the rest is positional.
+# `--` ends flag parsing, so a schedule command or path whose literal value is
+# "--gui" (etc.) remains expressible.
 POSITIONAL=()
+CLI_FLAGS_SEEN=()
+CLI_BOOT_FLAG_USED=0
+CLI_HERE_FLAG_USED=0
+CLI_UNSAFE_FLAG_USED=0
+_parse_flags=1
 while [ $# -gt 0 ]; do
+    if [ "$_parse_flags" = 0 ]; then
+        POSITIONAL+=("$1"); shift
+        continue
+    fi
     case "$1" in
-        --gui)    WATERBOX_GUI=1; shift ;;
-        --no-gui) WATERBOX_GUI=0; shift ;;
-        --x11)    WATERBOX_GUI=1; WATERBOX_X11=1; shift ;;
-        --no-gpu) WATERBOX_NO_GPU=1; shift ;;
-        --here)   WATERBOX_HERE=1; shift ;;
-        --unsafe-host-root) WATERBOX_UNSAFE_HOST_ROOT=1; shift ;;
+        --)       _parse_flags=0; shift ;;
+        --gui)    WATERBOX_GUI=1; CLI_BOOT_FLAG_USED=1; CLI_FLAGS_SEEN+=("$1"); shift ;;
+        --no-gui) WATERBOX_GUI=0; CLI_BOOT_FLAG_USED=1; CLI_FLAGS_SEEN+=("$1"); shift ;;
+        --x11)    WATERBOX_GUI=1; WATERBOX_X11=1; CLI_BOOT_FLAG_USED=1; CLI_FLAGS_SEEN+=("$1"); shift ;;
+        --no-gpu) WATERBOX_NO_GPU=1; CLI_BOOT_FLAG_USED=1; CLI_FLAGS_SEEN+=("$1"); shift ;;
+        --here)   WATERBOX_HERE=1; CLI_HERE_FLAG_USED=1; CLI_FLAGS_SEEN+=("$1"); shift ;;
+        --unsafe-host-root)
+            WATERBOX_UNSAFE_HOST_ROOT=1
+            CLI_UNSAFE_FLAG_USED=1
+            CLI_FLAGS_SEEN+=("$1")
+            shift ;;
         *)        POSITIONAL+=("$1"); shift ;;
     esac
 done
@@ -4997,11 +5922,119 @@ case "${2:-}" in
         esac
         exit 0 ;;
 esac
+case "${1:-}" in
+    help|--help|-h) show_help; exit 0 ;;
+esac
+
+# Reject typos and ambiguous combinations before any command can boot, stop, reset,
+# write config, or ask for sudo. Previously many extra arguments were ignored:
+# `waterbox reset typo` still reset, and `start --here named` silently discarded
+# the requested name.
+_cmd="${1:-start}"
+case "$_cmd" in
+    start|"")
+        [ "$#" -le 2 ] \
+            || log_error "Usage: waterbox start [<session> | --here] [--gui|--no-gui|--x11] [--no-gpu]"
+        [ "$CLI_HERE_FLAG_USED" != 1 ] || [ "$#" -lt 2 ] \
+            || log_error "--here and an explicit session name are mutually exclusive."
+        ;;
+    restart)
+        [ "$#" -eq 1 ] || log_error "Usage: waterbox restart [--gui|--no-gui|--x11] [--no-gpu]"
+        [ "$CLI_HERE_FLAG_USED" != 1 ] || log_error "--here is valid with start, not restart."
+        ;;
+    reset)
+        [ "$#" -eq 1 ] || log_error "Usage: waterbox reset"
+        [ "$CLI_BOOT_FLAG_USED" != 1 ] && [ "$CLI_HERE_FLAG_USED" != 1 ] \
+            || log_error "Display, GPU, and --here options are not valid with reset."
+        ;;
+    stop|status|setup|refresh-config|update|version|--version|-v|help|--help|-h|_sessions)
+        [ "$#" -eq 1 ] || log_error "Unexpected argument '${2:-}' after '$_cmd'. See 'waterbox --help'."
+        [ "${#CLI_FLAGS_SEEN[@]}" -eq 0 ] \
+            || log_error "Option '${CLI_FLAGS_SEEN[0]}' is not valid with '$_cmd'."
+        ;;
+    completion)
+        [ "$#" -le 2 ] || log_error "Usage: waterbox completion [zsh]"
+        [ "${#CLI_FLAGS_SEEN[@]}" -eq 0 ] \
+            || log_error "Option '${CLI_FLAGS_SEEN[0]}' is not valid with completion."
+        ;;
+    _helper)
+        [ "$#" -ge 2 ] || log_error "Usage: waterbox _helper <helper-verb> [args]"
+        [ "${#CLI_FLAGS_SEEN[@]}" -eq 0 ] \
+            || log_error "Global options are not valid with the helper passthrough."
+        ;;
+    share)
+        [ "${#CLI_FLAGS_SEEN[@]}" -eq 0 ] \
+            || log_error "Option '${CLI_FLAGS_SEEN[0]}' is not valid with share. Use '--' before a path that begins with '--'."
+        case "${2:-}" in
+            "")          [ "$#" -eq 1 ] || log_error "Usage: waterbox share [add|detach|list] [path]" ;;
+            list)        [ "$#" -eq 2 ] || log_error "Usage: waterbox share list" ;;
+            add|del|detach)
+                [ "$#" -eq 3 ] || log_error "Usage: waterbox share ${2} <path>" ;;
+            *)           log_error "Usage: waterbox share [add|detach|list] [path]" ;;
+        esac
+        ;;
+    wake-claude)
+        [ "${#CLI_FLAGS_SEEN[@]}" -eq 0 ] \
+            || log_error "Option '${CLI_FLAGS_SEEN[0]}' is not valid with wake-claude."
+        if [ "$#" -eq 1 ]; then
+            :
+        elif [ "$#" -eq 2 ] && [ "$2" = list ]; then
+            :
+        elif [ "$#" -eq 3 ] && { [ "$2" = del ] || [ "$2" = rm ]; } \
+             && [[ "$3" == wake-* ]]; then
+            :
+        else
+            { [ "$#" -eq 2 ] || [ "$#" -eq 3 ] || [ "$#" -eq 4 ]; } \
+                || log_error "Usage: waterbox wake-claude <account> <HH:MM> [once|daily]"
+        fi
+        ;;
+    schedule-command)
+        [ "${#CLI_FLAGS_SEEN[@]}" -eq 0 ] \
+            || log_error "Option '${CLI_FLAGS_SEEN[0]}' is not valid with schedule-command. Use '--' before a command that begins with '--'."
+        if [ "$#" -eq 1 ]; then
+            :
+        elif [ "$#" -eq 2 ] && [ "$2" = list ]; then
+            :
+        elif [ "$#" -eq 3 ] && { [ "$2" = del ] || [ "$2" = rm ]; }; then
+            [[ "$3" == schd-com-* ]] \
+                || log_error "Not a schedule-command id: '$3' (expected schd-com-N)."
+        elif [ "$#" -eq 2 ]; then
+            : # session-only wizard, including sessions named del/rm
+        elif [ "$#" -eq 4 ]; then
+            # Without an explicit mode, argument 4 is the command. Treating
+            # "once"/"daily" as that command is almost certainly a missing
+            # final argument and manage_schedule would otherwise reject it
+            # only after more setup work.
+            [ "$4" != once ] && [ "$4" != daily ] \
+                || log_error "A command is required after '$4' (use \"\" to send only Enter)."
+        elif [ "$#" -eq 5 ]; then
+            # With five tokens, argument 4 must be the mode. Previously an
+            # arbitrary value here made manage_schedule silently ignore the
+            # trailing argument.
+            [ "$4" = once ] || [ "$4" = daily ] \
+                || log_error "Mode must be 'once' or 'daily', got '$4'."
+        else
+            log_error "Usage: waterbox schedule-command <session> <HH:MM> [once|daily] \"<command>\""
+        fi
+        ;;
+    *) ;; # The final dispatcher prints the unknown-command error.
+esac
+
+# Help/version/completion and invalid commands must not create ~/.waterbox merely
+# by being inspected. Initialize only commands that actually need host-side state.
+case "$_cmd" in
+    start|""|restart|reset|setup|refresh-config|update|share) _ensure_user_config ;;
+esac
 
 # Resolve GUI=auto now that flags are parsed: on only when a Wayland socket is live.
 if [ "$WATERBOX_GUI" = auto ]; then
     _wl="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/${WAYLAND_DISPLAY:-}"
-    if [ -n "${WAYLAND_DISPLAY:-}" ] && [ -S "$_wl" ]; then
+    [ -S "$_wl" ] || _wl="${WAYLAND_DISPLAY:-}"
+    _wl_base=$(basename -- "$_wl")
+    if [ -n "${WAYLAND_DISPLAY:-}" ] \
+       && [ "$_wl" = "$HOST_RUNTIME_DIR/$_wl_base" ] \
+       && [[ "$_wl_base" =~ ^wayland-[0-9]+$ ]] \
+       && [ -S "$_wl" ] && [ ! -L "$_wl" ]; then
         WATERBOX_GUI=1
     else
         WATERBOX_GUI=0
@@ -5029,24 +6062,33 @@ case "${1:-start}" in
         esac
         ;;
     wake-claude)
-        case "$2" in
-            "")        wake_manager ;;
-            list)      manage_wake_claude list ;;
-            del|rm)    manage_wake_claude del "$3" ;;
-            # Just a profile (no time yet) → open the wizard on time + when for it.
-            *)         if [ -z "$3" ]; then wake_add "$2"
-                       else manage_wake_claude add "${@:2}"; fi ;;
-        esac
+        if [ "$#" -eq 1 ]; then
+            wake_manager
+        elif [ "$#" -eq 2 ] && [ "$2" = list ]; then
+            manage_wake_claude list
+        elif [ "$#" -eq 3 ] && { [ "$2" = del ] || [ "$2" = rm ]; } \
+             && [[ "$3" == wake-* ]]; then
+            manage_wake_claude del "$3"
+        # Just a profile (no time yet) → open the wizard on time + when for it.
+        elif [ "$#" -eq 2 ]; then
+            wake_add "$2"
+        else
+            manage_wake_claude add "${@:2}"
+        fi
         ;;
     schedule-command)
-        case "$2" in
-            "")        schedule_manager ;;
-            list)      manage_schedule list ;;
-            del|rm)    manage_schedule del "$3" ;;
-            # Just a session (no time yet) → open the wizard on time + when + command.
-            *)         if [ -z "$3" ]; then sched_add "$2"
-                       else manage_schedule add "${@:2}"; fi ;;
-        esac
+        if [ "$#" -eq 1 ]; then
+            schedule_manager
+        elif [ "$#" -eq 2 ] && [ "$2" = list ]; then
+            manage_schedule list
+        elif [ "$#" -eq 3 ] && { [ "$2" = del ] || [ "$2" = rm ]; }; then
+            manage_schedule del "$3"
+        # Just a session (no time yet) → open the wizard on time + when + command.
+        elif [ "$#" -eq 2 ]; then
+            sched_add "$2"
+        else
+            manage_schedule add "${@:2}"
+        fi
         ;;
     update)   self_update ;;
     version|--version|-v) echo "waterbox v$WATERBOX_VERSION" ;;

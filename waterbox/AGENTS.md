@@ -151,6 +151,9 @@ Share invariants:
 - Warn before detaching a share still used by guest processes.
 - If a live mount or boot mount fails, roll back newly persisted share entries so
   future starts are not poisoned.
+- A share added while the box is stopped remains pending until one cold boot
+  mounts it successfully. If the helper identifies that exact pending source as
+  unsupported, remove only that entry and retry the boot automatically.
 
 Writable shares inherently let a malicious box alter project files the host user
 may later execute. ID mapping prevents those files from being created as host
@@ -171,6 +174,9 @@ an escape route.
 
 - On Wayland, GUI forwarding is enabled automatically when a live Wayland socket
   is available.
+- Accept Wayland only from `/run/user/<host-uid>/wayland-N`, and reject symlinked
+  display sockets/auth files. A caller-controlled Unix socket must never become a
+  general host-capability bridge through the passwordless helper.
 - Plain Wayland mode exposes only Wayland. Never silently add Xwayland/X11.
 - X11 is off by default because X11 clients can observe and inject input into
   other X clients.
@@ -312,6 +318,12 @@ confirmation.
 - If preservation fails, do not delete the rootfs.
 - If rebuild or restore fails, leave the preserved backup in place and print its
   recovery location.
+- A rootfs without `.waterbox-ready` is not automatically disposable. Only the
+  separate host-side `bootstrap-in-progress` marker authorizes retrying an
+  interrupted bootstrap; a box can delete its own in-rootfs marker.
+- After a failed reset rebuild, clear the automatic-retry marker so a later
+  ordinary start cannot perform another wipe while a preserved home is parked
+  outside the rootfs.
 - Shares and wake schedules are separately selectable.
 - Detaching a share and resetting the box are distinct operations; never conflate
   them.
@@ -328,8 +340,15 @@ namespaces do not protect their file operations.
 
 - Validate every managed destination with `_in_jail`/`realpath -m`.
 - Use `wb_tee` for generated root-owned writes.
+- Use `_read_jail_regular` for small host-side reads of guest-controlled files.
+  Direct `cat`/`grep` can follow symlinks, block forever on a FIFO, or consume an
+  unbounded file even when no write follows.
 - Use `chown -h` when an attacker-controlled destination might be a symlink.
 - Validate parent paths as well as final files.
+- Keep `JAIL_ROOT` literal in containment checks. A bind mount at
+  `~/.waterbox` safely relocates storage while preserving that path; accepting a
+  symlinked root would let the NOPASSWD helper's caller redirect fixed host-root
+  operations elsewhere.
 - Do not refresh managed rootfs files while the box is running. A running rootfs
   is attacker-controlled even when no tmux sessions are visible.
 - Fail closed and recommend reset when a managed path resolves outside
@@ -365,6 +384,12 @@ Never enter only the mount namespace. A guest-controlled binary running with hos
 PID/network/IPC namespaces could reach host processes or abstract sockets even if
 filesystem mounts look isolated.
 
+Non-interactive namespace entries also need finite `timeout`/kill deadlines. The
+guest controls `/bin/sh`, `tmux`, `getent`, and every other in-rootfs executable;
+correct namespace isolation prevents escape but does not prevent one from hanging
+the host-side command forever. Do not apply this deadline to the intentionally
+interactive attached shell.
+
 ### Device access
 
 Waterbox boots nspawn with `--keep-unit`, so nspawn does not supply its usual
@@ -395,6 +420,11 @@ inside the explicitly approved unsafe compatibility mode and still use
 Treat GUI sockets, host networking, and GPU devices as security-sensitive host
 interfaces. Validate generated bind specifications again in the root helper.
 Never accept arbitrary bind arguments from a user-writable file.
+
+The helper derives `/etc/waterbox/gui-env` from the fixed display targets it
+accepted. It must never copy the ordinary-user `gui_env` diagnostic file into the
+rootfs as root; that file is mutable and could be redirected to disclose host
+data.
 
 ## Architecture and code map
 
@@ -430,13 +460,18 @@ Important areas in `waterbox`:
 | CLI | completion, global flag parsing, final command dispatch |
 
 The config-version marker is a checksum of the entire executable. A changed script
-causes managed guest configuration to refresh on a safe cold start. If the box is
-already running, Waterbox warns that a restart is required instead of performing
-host-root writes into the live rootfs.
+causes managed guest configuration to refresh on a safe cold start. On
+`waterbox`/`waterbox start`, an outdated running box is automatically stopped and
+refreshed when tmux confirms it has no live sessions. If sessions exist—or the
+session query fails—leave it running and warn that a restart is required. Never
+perform host-root config writes into a live rootfs.
 
 `WATERBOX_VERSION` remains the public release version and controls self-update
-ordering. Decide explicitly when a change warrants a release bump; do not use a
-version bump as a substitute for the checksum-based config refresh.
+ordering. Every bug fix intended for publication must bump it before release;
+otherwise existing installations at the same version will refuse to download the
+changed script. User-visible features and behavior changes also require a bump.
+Documentation-only edits may keep the current version. Do not use a version bump
+as a substitute for the checksum-based config refresh.
 
 ## Networking summary
 
@@ -448,8 +483,22 @@ The guest uses a private veth with fixed Waterbox addresses. Host rules provide:
 - the names `host` and, when safe, the host’s hostname;
 - DNS repair when the guest inherits an unreachable loopback resolver.
 
+The live `/etc/resolv.conf` policy is exactly three or fewer entries: the host's
+first usable resolver (for VPN/split-DNS), followed by `1.1.1.1` and `8.8.8.8`
+with duplicates removed. Keep the public fallbacks within glibc's three-server
+limit and use a short timeout so a stale resolver from a previous host network
+does not strand the running box. Every `waterbox start`, including attach to an
+already-running box, reasserts this file even if DNS currently resolves; a VPN
+inside the box may still replace it later during that session.
+
 Networking cleanup must be idempotent. Failed boot/stop/reset paths should not
 leave stale firewall rules behind.
+
+Every critical veth address, forwarding sysctl, and firewall operation must
+propagate failure. A cold boot whose host networking cannot be configured should
+be stopped and reported as failed; attaching to an already-running box should
+reassert the fixed networking rules so a firewall-manager reload does not leave a
+silently disconnected session.
 
 ## Scheduling summary
 
@@ -461,9 +510,47 @@ There are two different scheduling models:
   box is stopped. It may boot a secure box, perform the fixed quota-primer action,
   and return it to the prior stopped state.
 
+Schedule-command message files are private (`0600`) but owned by the guest user,
+not guest root, because the fixed timer service runs as that user. Keep the
+in-namespace legacy repair: older versions created root-owned files that neither
+the timer nor guest user could read.
+
+Scheduled delivery must resolve the session's active pane, cancel tmux copy/scroll
+mode before injecting keys, and check the message read plus every `send-keys`
+operation. Empty messages mean Enter-only and are valid. Never log successful
+delivery after a read/send failure; return nonzero so systemd records the failure.
+
+Creation and deletion are transactional. If a command timer cannot be installed,
+remove its private message and partial units. If removal fails, do not print
+success. Host-wake creation must likewise remove partial unit files when systemd
+cannot enable the timer. Session killing must be verified before its schedules
+are discarded.
+
+Interactive command timers use a short accuracy window so their wall-clock delivery
+is not needlessly coalesced. More importantly, never garbage-collect a one-shot as
+soon as its calendar expression becomes past: systemd may still be holding it
+inside `AccuracySec`. The shared timer display/cleanup path must retain a grace
+period longer than every supported accuracy window and show such timers as due.
+After successful delivery, a one-shot removes its own fixed unit/message record;
+failed sends remain briefly for systemd/journal diagnosis before stale cleanup.
+Refresh must migrate the older command-timer accuracy setting without changing
+their calendar, command, target, or recurrence.
+
+Host-side schedule inspection must go through the immutable helper's bounded
+record reader. That reader walks the rootfs using directory file descriptors,
+rejects symlinks and non-regular files, caps display data, and escapes terminal
+control characters. Do not directly `cat`/`grep` live `.timer` or `.msg` paths:
+the box controls them, can race path checks, and may use them to reach host paths,
+hang a host command, or consume unbounded host memory. The helper reader also
+avoids assuming the invoking host user has guest UID 1000.
+
 Do not generalize host timers into arbitrary host command execution. Timer names,
 profiles, times, users, unit bodies, and invoked commands must remain
 helper-generated and validated.
+
+Session rename is two operations: tmux rename and schedule retargeting. If the
+first succeeds but the helper cannot complete the second, keep the renamed
+session and warn clearly; never claim that schedules were repointed.
 
 ## UX conventions
 
@@ -473,6 +560,10 @@ helper-generated and validated.
 - TUI cancellation is normal and should not resemble a crash.
 - `Ctrl-C` restores the cursor.
 - `--help` must never boot, mutate, or interpret itself as a session name.
+- Validate option scope and exact arity before configuration, sudo, or lifecycle
+  work. Extra arguments are errors; destructive commands must never ignore them.
+- Global options may appear around the command. `--` preserves an option-like
+  share path or scheduled command; session names still cannot begin with `-`.
 - Color is used only on terminals and respects `NO_COLOR`; piped output remains
   clean.
 - Prefer one universal Linux behavior over a growing compatibility matrix.
@@ -495,21 +586,20 @@ helper-generated and validated.
 
 ## Testing expectations
 
-There is no complete automated suite, so validation must be proportional to the
-change. At minimum after every edit:
+Run the repository regression harness after every behavioral edit:
 
 ```bash
-bash -n waterbox
-git diff --check
+waterbox/tests/test-waterbox.sh
 ```
 
-Also syntax-check the generated root helper, not only the outer script. One
-portable approach from this directory is:
+It covers the outer script and generated Bash/POSIX-shell/Zsh/Python/tmux
+artifacts, CLI option grammar, non-mutating inspection, self-update, path
+containment, Wayland/X11 policy, DNS ordering, network failure propagation, timer
+rollback, and static isolation invariants. Also run:
 
 ```bash
-helper_start=$(rg -n "cat <<'HELPER'" waterbox | cut -d: -f1)
-helper_end=$(rg -n '^HELPER$' waterbox | cut -d: -f1)
-sed -n "$((helper_start + 1)),$((helper_end - 1))p" waterbox | bash -n
+bash -n waterbox/waterbox
+git diff --check
 ```
 
 For tmux changes, use an isolated server/socket and confirm options against the
@@ -561,6 +651,11 @@ Before considering a security change complete, inspect these regressions:
 - Writable shares can contain malicious content later executed by the host user.
 - Secure ID-mapped mounts do not work on every filesystem.
 - Unsafe host-root mode is not a secure sandbox.
+- Unsafe host-root mode assumes the host account is UID/GID 1000 for writable
+  share ownership. On hosts using another UID, raw compatibility-mode shares may
+  be unwritable or show mismatched ownership. Do not silently chown user data or
+  change the guest identity as a small compatibility fix; that requires a
+  separately designed migration.
 - A saturated `TasksMax` may block new in-box sessions; recover from the host.
 - Disk usage has no equivalent simple hard quota yet.
 - X11 forwarding fundamentally exposes other X11 clients.
