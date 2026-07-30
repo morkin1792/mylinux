@@ -202,6 +202,14 @@ without launching Resolve.
 - `deliver file.mov` writes `file.mp4` — if the original `file.mp4` is still
   there, it triggers the overwrite prompt. Working as designed, mildly confusing.
 - CineForm and APV as export masters remain unmeasured (see above).
+- Frame rate is deliberately untouched: no `-r`, no `-fps_mode`/`-vsync`, no `fps`
+  filter anywhere, so output inherits the source's rate and timestamps. A VFR
+  source (phone, screen capture) therefore reaches Resolve still VFR, which is
+  where real drift would come from. If normalising is ever added, `-r` /
+  `-fps_mode cfr` must go **after** `-i`: there they dup/drop frames onto the
+  target grid, preserving wall-clock duration. `-r` *before* `-i` instead
+  re-stamps input timestamps and changes playback speed. (`-fps_mode` is
+  output-only — ffmpeg errors out if you put it before `-i`.)
 
 ## Archival policy
 
@@ -212,6 +220,7 @@ re-`deliver`.
 
 ## Hardware acceleration — what is and isn't possible
 
+Not an ffmpeg limitation: ffmpeg exposes every hardware encoder the silicon has.
 GPU media engines are fixed-function blocks that implement only **delivery**
 codecs — H.264, HEVC, AV1, VP9, VP8, MPEG-2, JPEG — which is precisely the set
 Resolve free cannot use. The **editing** codecs it does accept have little or no
