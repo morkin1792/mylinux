@@ -1,0 +1,1283 @@
+#!/usr/bin/env bash
+#
+# simplewire — WireGuard server manager for a fresh VPS.
+#
+# Requires systemd and iptables: Debian, Ubuntu, Arch, and Fedora/RHEL with
+# firewalld off. Anything else is refused at startup rather than half-supported.
+#
+# Install     : installs wireguard-tools and qrencode with whichever of apt-get,
+#               pacman, dnf or zypper is present, generates the server keypair
+#               under /etc/wireguard/keys (0600), writes wg0.conf that
+#               *references* the key file instead of embedding it, sets up NAT +
+#               forwarding in iptables, enables wg-quick@wg0.
+# Add device  : new keypair, next free IP, [Peer] block, ready-to-use client .conf,
+#               QR code printed to the terminal.
+# Remove      : deletes the peer block and its files, live-reloads without dropping
+#               the other peers' sessions.
+# Uninstall   : tears down the interface, the iptables rules and /etc/wireguard.
+#
+# Design notes:
+#   * No secrets live in wg0.conf. The server private key is loaded at interface-up
+#     via `PostUp = wg set %i private-key <file>`; client private keys live only in
+#     their own 0600 files under /etc/wireguard/clients.
+#   * IPv4 tunnel only. Clients also get a ULA IPv6 address and AllowedIPs ::/0, so
+#     IPv6 traffic is pulled into the tunnel and dropped at the server rather than
+#     leaking out over the client's own IPv6 connection.
+#   * Default iptables policies are never touched — this cannot lock you out of SSH.
+#     Every rule it adds carries the comment "simplewire" so you can audit/remove
+#     them by hand:  iptables-save | grep simplewire
+#   * A device's web traffic can be diverted to an intercepting proxy running on
+#     another device on the VPN (menu option 6) — Burp Suite with "invisible
+#     proxying", or mitmproxy. tcp/80 and tcp/443 are DNAT'd to it and udp/443 is
+#     rejected so QUIC cannot slip past. The device itself is configured with
+#     nothing, which is what makes it work on apps that ignore proxy settings.
+#   * Devices share one tunnel subnet, so by default each one can reach the others
+#     — that is what makes a personal VPN useful. "Add device" asks per device, and
+#     answering 'n' stops that one from OPENING connections to the rest, while your
+#     other devices can still reach in to it and its internet access is untouched.
+#     A device that is both isolated and proxied reaches its proxy on the proxy
+#     port only. It does NOT fence it off from this server:
+#     traffic to the server's own address hits INPUT, not FORWARD, so whatever
+#     your host firewall already allows from the internet is also reachable from
+#     the tunnel. Bind private services to localhost, or add INPUT rules for wg0.
+#
+# On port choice:
+#   The default listen port is 443/udp (QUIC / HTTP-3), because a network that
+#   permits web traffic usually permits it; 51820 is aliased to it, and 53 is
+#   offered as an opt-in alias. Every port is probed first, and anything already
+#   in use is skipped — if both defaults are taken the script suggests a free
+#   random port. Aliases are DNAT'd to the one instance, so a client can just
+#   switch its Endpoint line if one port is filtered. This defeats *port-based*
+#   blocking — ACLs on hotel, campus and
+#   office networks. It does NOT defeat deep packet inspection: WireGuard's
+#   handshake is trivially fingerprintable (fixed 148/92-byte handshake packets
+#   with a constant leading message-type byte), so DPI identifies it on any port.
+#   Beating DPI requires a different protocol, not a different port.
+#
+set -euo pipefail
+umask 077
+
+WG_IF=wg0
+WGDIR=/etc/wireguard
+KEYDIR=$WGDIR/keys
+CLIENTDIR=$WGDIR/clients
+WG_CONF=$WGDIR/$WG_IF.conf
+STATE=$WGDIR/simplewire.env
+SYSCTL_FILE=/etc/sysctl.d/99-wireguard.conf
+TAG=simplewire
+V6_NET="fd42:42:42::"          # ULA prefix used inside the tunnel (blackholed v6)
+
+# ---------------------------------------------------------------- helpers ----
+
+die()  { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
+info() { printf '  %s\n' "$*"; }
+head1(){ printf '\n== %s ==\n' "$*"; }
+
+ask() {  # ask "prompt" ["default"] -> answer on stdout (bash prints -p to stderr)
+    local prompt=$1 def=${2-} ans=''
+    if [ -n "$def" ]; then
+        read -r -p "$prompt [$def]: " ans || true
+        printf '%s' "${ans:-$def}"
+    else
+        read -r -p "$prompt: " ans || true
+        printf '%s' "$ans"
+    fi
+}
+
+confirm() {  # confirm "question" -> 0 if user typed y/yes
+    local ans
+    ans=$(ask "$1 (y/N)" "n")
+    [[ ${ans,,} == y || ${ans,,} == yes ]]
+}
+
+confirm_yes() {  # confirm "question" -> 0 unless user typed n/no
+    local ans
+    ans=$(ask "$1 (Y/n)" "y")
+    [[ ${ans,,} != n && ${ans,,} != no ]]
+}
+
+ip2int() {
+    local IFS=. a b c d
+    read -r a b c d <<<"$1"
+    printf '%s' $(( (10#$a << 24) + (10#$b << 16) + (10#$c << 8) + 10#$d ))
+}
+
+int2ip() {
+    local i=$1
+    printf '%s.%s.%s.%s' $(( (i >> 24) & 255 )) $(( (i >> 16) & 255 )) \
+                         $(( (i >> 8) & 255 ))  $((  i        & 255 ))
+}
+
+valid_ipv4() {
+    [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    local IFS=. o
+    for o in $1; do [ "$o" -le 255 ] || return 1; done
+}
+
+detect_wan() { ip -4 route show default 2>/dev/null | awk '/^default/{print $5; exit}'; }
+detect_ip()  { ip -4 addr show dev "$1" 2>/dev/null | awk '/inet /{print $2; exit}' | cut -d/ -f1; }
+
+# A WireGuard interface name is the config file's basename, and wg-quick only
+# accepts ^[a-zA-Z0-9_=+.-]{1,15}$ — so "john@vm1" cannot be an interface name.
+# The client tunnel is therefore named after the SERVER host (that is what
+# identifies which VPN it is, from the client's point of view), while the
+# NetworkManager connection gets the pretty "<device>@<server>" label, which is
+# free-form text and is what the user actually sees in the desktop menu.
+sanitize_ifname() {
+    local s
+    s=$(printf '%s' "$1" | tr -c 'a-zA-Z0-9_=+.-' '-')
+    s=${s:0:15}
+    s=$(printf '%s' "$s" | sed 's/-*$//')
+    printf '%s' "${s:-wg}"
+}
+
+# Name suggested for the tunnel itself, on any platform. Must satisfy
+# [a-zA-Z0-9_=+.-]{1,15} — the Android app enforces exactly the same rule as
+# wg-quick (Tunnel.NAME_PATTERN), so "device@server" is not usable there. iOS
+# and the desktop apps are more permissive, so a name that satisfies Android
+# satisfies all of them; that is why the strictest rule is the one used.
+# Prefer "device-server" when it fits; otherwise fall back to the server name,
+# which is what actually identifies the VPN from the client's side.
+suggest_tunnel_name() {
+    local raw="$1-$SERVER_HOST"
+    if [ "${#raw}" -le 15 ]; then
+        sanitize_ifname "$raw"
+    else
+        sanitize_ifname "$SERVER_HOST"
+    fi
+}
+
+# "server" is reserved: peer keys live in the same directory as the server's, so
+# a device by that name would overwrite $KEYDIR/server.key and permanently break
+# every existing peer.
+valid_name() {
+    [[ $1 =~ ^[A-Za-z0-9_-]+$ ]] || die "invalid device name: $1"
+    [ "$1" != server ] || die "'server' is reserved — it would overwrite the server keypair"
+}
+
+# ------------------------------------------------------------- platform ------
+#
+# Supported: systemd + iptables. That is Debian, Ubuntu, Arch, and Fedora/RHEL
+# with firewalld turned off. Anything else is refused rather than half-supported
+# — see the firewalld note below for why a silent half-success is the worse
+# outcome here.
+
+detect_pm() {  # first supported package manager on PATH
+    local pm
+    for pm in apt-get pacman dnf zypper; do
+        command -v "$pm" >/dev/null 2>&1 && { printf '%s' "$pm"; return 0; }
+    done
+    return 1
+}
+
+require_platform() {
+    command -v systemctl >/dev/null 2>&1 \
+        || die "systemd is required — the tunnel is run as the wg-quick@$WG_IF unit.
+  On OpenRC/runit systems, bring wg-quick up however your init does it and
+  this script has nothing left to manage."
+    command -v iptables >/dev/null 2>&1 || die "iptables is required (iptables-nft is fine)"
+    # firewalld keeps its rules in the nftables 'inet firewalld' table while
+    # ours land in 'ip filter'. Both are evaluated and a DROP in either wins, so
+    # our INPUT ACCEPT would install cleanly and the port would still be shut.
+    # That failure looks exactly like a working install, hence the hard stop.
+    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        die "firewalld is running, and it would silently override these rules.
+  Its rules live in the nftables 'inet firewalld' table, ours in 'ip filter';
+  both are evaluated, so firewalld's default zone keeps dropping the traffic
+  even once the rules here are installed. The listen port would look open and
+  not be. Either turn it off:
+      systemctl disable --now firewalld
+  or drop this script and configure WireGuard through firewall-cmd instead."
+    fi
+}
+
+need_root()      { [ "$(id -u)" -eq 0 ] || die "run this as root (sudo $0)"; }
+is_installed()   { [ -f "$STATE" ] && [ -f "$WG_CONF" ]; }
+load_state()     { # shellcheck source=/dev/null
+                   . "$STATE"; : "${ALT_PORTS:=}"
+                   : "${SERVER_HOST:=$(sanitize_ifname "$(hostname -s 2>/dev/null || echo wg)")}"; }
+
+# Written in one place so install and later edits produce the same file. Values
+# are quoted because load_state *sources* it; everything stored here is
+# validated at the prompt, so a single quote cannot appear in one.
+write_state() {
+    cat > "$STATE" <<EOF
+WG_IF='$WG_IF'
+WAN_IF='$WAN_IF'
+SUBNET='$SUBNET'
+NET_ADDR='$NET_ADDR'
+PREFIX='$PREFIX'
+SERVER_IP='$SERVER_IP'
+MAX_HOST='$MAX_HOST'
+PORT='$PORT'
+ALT_PORTS='$ALT_PORTS'
+SERVER_HOST='$SERVER_HOST'
+ENDPOINT='$ENDPOINT'
+CLIENT_DNS='$CLIENT_DNS'
+EOF
+    chmod 600 "$STATE"
+}
+
+# ---------------------------------------------------------- port picking -----
+#
+# "Busy" means two different things here, and the difference is what lets us
+# share udp/53 with a local resolver:
+#
+#   * The port WireGuard BINDS must have no UDP socket on it at all — not even a
+#     loopback-only one. Binding 0.0.0.0:P returns EADDRINUSE while another
+#     process holds 127.0.0.1:P, so a local resolver really does block it.
+#
+#   * An ALIASED port is only DNAT'd; nothing binds it. The redirect matches
+#     "-i $WAN_IF", so it sees external traffic only, and locally-generated
+#     lookups traverse OUTPUT->POSTROUTING and never reach PREROUTING at all.
+#     A resolver bound to 127.0.0.53 or 127.0.0.1 therefore keeps working
+#     untouched. Only a *publicly* bound service genuinely conflicts, because
+#     its inbound traffic would be redirected away to WireGuard.
+
+port_listeners() {  # <port> -> "local-address process" lines, empty if free
+    ss -H -lunp "sport = :$1" 2>/dev/null | awk '{print $4, $6}'
+}
+
+port_free() { [ -z "$(port_listeners "$1")" ]; }
+
+port_public() {  # 0 if something reachable from off-box holds the port
+    local addr rest
+    while read -r addr rest; do
+        [ -n "$addr" ] || continue
+        case ${addr%:*} in
+            127.*|'[::1]'|*%lo) continue ;;   # loopback-only: harmless for an alias
+        esac
+        return 0
+    done < <(port_listeners "$1")
+    return 1
+}
+
+describe_port() {  # one-line human description of what holds <port>
+    local all n first addr proc
+    all=$(port_listeners "$1")
+    if [ -z "$all" ]; then printf 'nothing'; return; fi
+    n=$(printf '%s\n' "$all" | wc -l)
+    first=$(printf '%s\n' "$all" | head -1)
+    addr=${first%% *}
+    proc=$(printf '%s' "$first" | sed -n 's/.*users:((\"\([^\"]*\)\".*/\1/p')
+    printf '%s' "$addr"
+    [ -n "$proc" ] && printf ' (%s)' "$proc"
+    [ "$n" -gt 1 ] && printf ' +%d more' "$(( n - 1 ))"
+    return 0
+}
+
+random_free_port() {
+    local p n=0
+    while [ "$n" -lt 100 ]; do
+        p=$(( 20000 + RANDOM % 40000 ))
+        if port_free "$p"; then printf '%s' "$p"; return 0; fi
+        n=$((n+1))
+    done
+    die "could not find a free UDP port"
+}
+
+# Sets PORT and ALT_PORTS. Needs WAN_IF.
+choose_ports() {
+    local pref=443 fallback=51820 suggest p alt=()
+
+    head1 "Ports"
+    if port_free "$pref"; then
+        suggest=$pref
+    elif port_free "$fallback"; then
+        suggest=$fallback
+        info "udp/$pref is taken by $(describe_port "$pref")"
+        info "suggesting udp/$fallback as the listen port instead"
+    else
+        suggest=$(random_free_port)
+        info "udp/$pref is taken by $(describe_port "$pref")"
+        info "udp/$fallback is taken by $(describe_port "$fallback")"
+        info "both defaults are in use — suggesting a free random port, udp/$suggest"
+    fi
+
+    PORT=$(ask "UDP listen port" "$suggest")
+    [[ $PORT =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || die "bad port: $PORT"
+    port_free "$PORT" || die "udp/$PORT is held by $(describe_port "$PORT") — WireGuard cannot bind it"
+
+    # Alias whichever of the two standard ports we are not already using,
+    # unless something publicly reachable is sitting on it.
+    for p in "$pref" "$fallback"; do
+        if [ "$p" = "$PORT" ]; then continue; fi
+        if port_public "$p"; then
+            info "not aliasing udp/$p — publicly served by $(describe_port "$p")"
+            continue
+        fi
+        alt+=("$p")
+    done
+
+    # udp/53 is opt-in: it is the most useful port on captive-portal networks
+    # but also the one most likely to collide with something real.
+    if port_public 53; then
+        info "not offering udp/53 — it is served publicly by $(describe_port 53),"
+        info "and redirecting it would hijack DNS queries sent to this server"
+    else
+        printf '\n  udp/53 is often reachable on captive-portal, hotel and guest networks.\n'
+        if port_free 53; then
+            printf '  Nothing is listening on udp/53 here.\n'
+        else
+            printf '  A resolver holds udp/53 but only on loopback (%s).\n' "$(describe_port 53)"
+            printf '  It keeps working: the redirect only matches traffic arriving on\n'
+            printf '  %s, and local lookups never traverse PREROUTING.\n' "$WAN_IF"
+        fi
+        if confirm "  Also accept WireGuard on udp/53?"; then
+            alt+=(53)
+        fi
+    fi
+
+    ALT_PORTS=$(IFS=,; printf '%s' "${alt[*]:-}")
+
+    # Say what was decided — ports accepted silently are otherwise invisible.
+    printf '\n'
+    info "listen port : udp/$PORT   (clients use this by default)"
+    if [ -n "$ALT_PORTS" ]; then
+        info "also answers: udp/${ALT_PORTS//,/, udp/}   (redirected to udp/$PORT)"
+    else
+        info "also answers: nothing else — udp/$PORT only"
+    fi
+    info "open udp/$PORT${ALT_PORTS:+,$ALT_PORTS} in your provider's cloud firewall"
+}
+
+# ------------------------------------------------------------- iptables ------
+
+# Rules are "<command> <table> <chain> <spec…>". The comment match is part of
+# the spec so that -C / -D match exactly what -I inserted.
+build_rules() {
+    local ip dev px port
+    RULES=(
+      "iptables nat POSTROUTING -s $SUBNET -o $WAN_IF -m comment --comment $TAG -j MASQUERADE"
+      "iptables filter INPUT -p udp --dport $PORT -m comment --comment $TAG -j ACCEPT"
+      "iptables filter FORWARD -i $WG_IF -o $WAN_IF -m comment --comment $TAG -j ACCEPT"
+      "iptables filter FORWARD -i $WAN_IF -o $WG_IF -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment $TAG -j ACCEPT"
+      # Devices share one subnet, so device-to-device traffic is wg0 -> wg0.
+      # Stated explicitly so it works the same whether the host's FORWARD
+      # policy is ACCEPT (stock Debian) or DROP (hardened box).
+      "iptables filter FORWARD -i $WG_IF -o $WG_IF -m comment --comment $TAG -j ACCEPT"
+    )
+    # The ULA v6 inside the tunnel exists only to swallow the client's IPv6
+    # traffic, so nothing from wg0 should ever be forwarded or delivered. These
+    # make that true instead of relying on net.ipv6.conf.all.forwarding being 0:
+    # where a host image has it on, the isolation DROPs below would be bypassed
+    # entirely — they are iptables, and peer-to-peer over fd42:42:42::/64 is
+    # ip6tables. Skipped on hosts built without IPv6.
+    if ip6tables -L -n >/dev/null 2>&1; then
+        RULES+=("ip6tables filter FORWARD -i $WG_IF -m comment --comment $TAG -j DROP")
+        RULES+=("ip6tables filter INPUT -i $WG_IF -m comment --comment $TAG -j DROP")
+    fi
+    # Devices answered "n" at add time cannot OPEN a connection to the others.
+    # The reverse direction stays open on purpose: the isolated device is the
+    # untrusted one, the rest are yours, so you keep being able to reach in and
+    # administer it. The conntrack ACCEPT is what makes that work — the reply
+    # leg of an inbound connection is sourced by the isolated device, so a bare
+    # source DROP would leave every inbound connection half-open.
+    #
+    # Their internet access (wg0 -> WAN) and their access to this server (INPUT)
+    # are untouched either way.
+    #
+    # ORDER: apply_rules inserts every rule at position 1, so entries LATER in
+    # this array end up HIGHER in the chain. The DROP must stay after the blanket
+    # ACCEPT above, and the conntrack ACCEPT after the DROP it sits above.
+    while read -r ip; do
+        [ -n "$ip" ] || continue
+        RULES+=("iptables filter FORWARD -i $WG_IF -o $WG_IF -s $ip/32 -m comment --comment $TAG -j DROP")
+        RULES+=("iptables filter FORWARD -i $WG_IF -o $WG_IF -s $ip/32 -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment $TAG -j ACCEPT")
+    done < <(isolated_ips)
+    # Transparent proxying. Burp ("invisible proxying") and mitmproxy recover the
+    # real destination from the Host header and the TLS SNI rather than from
+    # SO_ORIGINAL_DST, which is why the proxy can sit on a different machine than
+    # the one doing the NAT — a plain DNAT to it is enough. The device needs no
+    # proxy settings at all, so apps that ignore them (Flutter's HttpClient being
+    # the usual offender) are caught too.
+    #
+    # ORDER: these go last in the array, so they land at the TOP of their chains
+    # — above the isolation DROPs, which would otherwise block a fenced-off
+    # device from reaching the very proxy it is supposed to use.
+    while read -r dev px port; do
+        [ -n "$dev" ] || continue
+        # Excluding the tunnel subnet keeps device-to-device traffic, and traffic
+        # to this server, off the proxy — only outbound web traffic is diverted.
+        RULES+=("iptables nat PREROUTING -i $WG_IF -s $dev ! -d $SUBNET -p tcp -m multiport --dports 80,443 -m comment --comment $TAG -j DNAT --to-destination $px:$port")
+        # QUIC sails straight past an HTTP proxy, so a proxied device must not be
+        # allowed to speak it — otherwise a large share of its traffic silently
+        # bypasses the intercept and nothing looks wrong. REJECT rather than DROP
+        # so clients fall back to TCP at once instead of waiting for a timeout.
+        RULES+=("iptables filter FORWARD -i $WG_IF -s $dev -p udp --dport 443 -m comment --comment $TAG -j REJECT --reject-with icmp-port-unreachable")
+        # nat/PREROUTING has already rewritten the destination by the time the
+        # packet reaches FORWARD, so matching the proxy port here grants an
+        # isolated device exactly its proxy and nothing else on that machine —
+        # no SSH, no file shares, no dev servers. Replies need no rule: the
+        # isolation DROP above is source-scoped, so inbound is never blocked.
+        RULES+=("iptables filter FORWARD -i $WG_IF -o $WG_IF -s $dev -d $px -p tcp --dport $port -m comment --comment $TAG -j ACCEPT")
+    done < <(proxied_peers)
+    # Extra ports are DNAT'd to the real listen port, so one wg instance answers
+    # on several ports and a client can just switch its Endpoint if one is
+    # blocked. No extra INPUT rule needed: nat/PREROUTING runs before
+    # filter/INPUT, so by then the dport is already $PORT.
+    if [ -n "${ALT_PORTS:-}" ]; then
+        RULES+=("iptables nat PREROUTING -i $WAN_IF -p udp -m multiport --dports $ALT_PORTS -m comment --comment $TAG -j REDIRECT --to-ports $PORT")
+    fi
+}
+
+apply_rules() {  # apply_rules add|del
+    local action=$1 r cmd table chain spec
+    build_rules
+    for r in "${RULES[@]}"; do
+        cmd=${r%% *};   r=${r#* }
+        table=${r%% *}; r=${r#* }
+        chain=${r%% *}; spec=${r#* }
+        # shellcheck disable=SC2086  # deliberate word splitting of the rule spec
+        if [ "$action" = add ]; then
+            "$cmd" -t "$table" -C "$chain" $spec 2>/dev/null || \
+            "$cmd" -t "$table" -I "$chain" 1 $spec
+        else
+            while "$cmd" -t "$table" -C "$chain" $spec 2>/dev/null; do
+                "$cmd" -t "$table" -D "$chain" $spec
+            done
+        fi
+    done
+}
+
+# Rules are NOT persisted through a distro package. wg0.conf carries
+#   PostUp = simplewire --apply-rules
+# so they reinstall themselves whenever the interface comes up. That works the
+# same on every distro, needs no iptables-persistent equivalent (every distro
+# spells it differently), and self-heals after anything that flushes iptables.
+# To restore them by hand at any time:  simplewire --apply-rules
+
+# --------------------------------------------------------------- wg state ----
+
+reload_wg() {
+    systemctl is-active --quiet "wg-quick@$WG_IF" || return 0
+    wg syncconf "$WG_IF" <(wg-quick strip "$WG_IF")
+    wg set "$WG_IF" private-key "$KEYDIR/server.key"   # not carried by `strip`
+}
+
+used_ips() { awk -F'[ =,/]+' '/^AllowedIPs/{print $2}' "$WG_CONF"; }
+
+peer_names() { awk '/^### BEGIN peer /{print $4}' "$WG_CONF"; }
+
+peer_exists() { peer_names | grep -qxF -- "$1"; }
+
+peer_ip() {  # peer_ip <name> -> its tunnel IPv4
+    awk -v w="$1" '
+        $0 == "### BEGIN peer " w {f=1}
+        f && /^AllowedIPs/ {split($3,a,"/"); print a[1]; exit}' "$WG_CONF"
+}
+
+# All peers share one subnet, so by default any device can reach any other. A
+# device added with "reach the other devices? n" gets "# reach-peers = no" in
+# its block and a pair of DROP rules (see build_rules). Blocks written before
+# this option existed carry no marker and stay unrestricted.
+peer_isolated() {  # peer_isolated <name> -> 0 if fenced off from the other peers
+    awk -v w="$1" '
+        $0 == "### BEGIN peer " w  {f=1}
+        f && /^### END peer /      {f=0}
+        f && $0 == "# reach-peers = no" {iso=1}
+        END {exit iso ? 0 : 1}' "$WG_CONF"
+}
+
+isolated_ips() {  # tunnel IPv4 of every device fenced off from the other peers
+    [ -f "$WG_CONF" ] || return 0
+    awk '
+        /^### BEGIN peer /         {iso=0; ip=""}
+        $0 == "# reach-peers = no" {iso=1}
+        /^AllowedIPs/              {split($3,a,"/"); ip=a[1]}
+        /^### END peer /           {if (iso && ip != "") print ip}' "$WG_CONF"
+}
+
+# A device's web traffic can be DNAT'd to an intercepting proxy running on
+# another device on the VPN — Burp Suite with "invisible proxying" enabled, or
+# mitmproxy. Recorded per device as "# proxy = <ip>:<port>".
+peer_proxy() {  # peer_proxy <name> -> "<ip>:<port>", empty if not proxied
+    awk -v w="$1" '
+        $0 == "### BEGIN peer " w {f=1}
+        f && /^### END peer /     {f=0}
+        f && /^# proxy = /        {print $4}' "$WG_CONF"
+}
+
+proxied_peers() {  # "<device-ip> <proxy-ip> <proxy-port>" per proxied device
+    [ -f "$WG_CONF" ] || return 0
+    awk '
+        /^### BEGIN peer / {px=""; ip=""}
+        /^# proxy = /      {px=$4}
+        /^AllowedIPs/      {split($3,a,"/"); ip=a[1]}
+        /^### END peer /   {if (px != "" && ip != "") {split(px,b,":"); print ip, b[1], b[2]}}
+    ' "$WG_CONF"
+}
+
+# Accepts the name of another device on the VPN (its tunnel address is looked
+# up) or a bare <ip>[:<port>]. Port defaults to 8080 — Burp's and mitmproxy's.
+resolve_proxy() {  # resolve_proxy <answer> -> "<ip>:<port>"
+    local a=$1 host port
+    host=${a%%:*}; port=${a#*:}
+    [ "$port" = "$a" ] && port=8080
+    if peer_exists "$host"; then host=$(peer_ip "$host"); fi
+    valid_ipv4 "$host" || die "proxy must be a device name or an IP address: $a"
+    [[ $port =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] \
+        || die "bad proxy port: $port"
+    printf '%s:%s' "$host" "$port"
+}
+
+list_peers() {
+    local n=0 name flags px
+    while read -r name; do
+        [ -n "$name" ] || continue
+        n=$((n+1))
+        flags=''
+        peer_isolated "$name" && flags='isolated'
+        px=$(peer_proxy "$name")
+        [ -n "$px" ] && flags="${flags:+$flags, }proxy $px"
+        printf '  %-22s %-14s %-34s %s\n' "$name" "$(peer_ip "$name")" \
+            "$([ -f "$CLIENTDIR/$name.conf" ] && echo "$CLIENTDIR/$name.conf" || echo '(conf missing)')" \
+            "$flags"
+    done < <(peer_names)
+    [ "$n" -gt 0 ] || info "(no devices yet)"
+}
+
+# Next address = highest currently-assigned host + 1
+next_ip() {
+    local max cur ip
+    max=$(ip2int "$SERVER_IP")
+    while read -r ip; do
+        [ -n "$ip" ] || continue
+        cur=$(ip2int "$ip")
+        if [ "$cur" -gt "$max" ]; then max=$cur; fi
+    done < <(used_ips)
+    int2ip $(( max + 1 ))
+}
+
+v6_for() {  # v6_for <ipv4>  -> ULA address with the same host offset
+    local off
+    off=$(( $(ip2int "$1") - $(ip2int "$NET_ADDR") ))
+    printf '%s%x' "$V6_NET" "$off"
+}
+
+# ---------------------------------------------------------------- install ----
+
+do_install() {
+    head1 "Install WireGuard server"
+
+    local wan pubip subnet dns endpoint prefix net_int mask SELF
+    SELF=$(readlink -f "$0")   # baked into wg0.conf's PostUp, so it must be absolute
+
+    wan=$(detect_wan) || true
+    wan=$(ask "WAN interface" "${wan:-eth0}")
+    ip link show "$wan" >/dev/null 2>&1 || die "interface '$wan' does not exist"
+
+    pubip=$(detect_ip "$wan") || true
+    # Kept to hostname/IP characters: this value is written into the state file
+    # (which load_state sources) and into the paste-and-run block for clients.
+    endpoint=$(ask "Public address clients will connect to (IP or hostname)" "${pubip:-}")
+    [[ $endpoint =~ ^[A-Za-z0-9._-]+$ ]] || die "endpoint must be an IP or hostname: ${endpoint:-<empty>}"
+
+    subnet=$(ask "Tunnel subnet (CIDR)" "10.8.0.0/24")
+    [[ $subnet =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]{1,2})$ ]] || die "bad subnet: $subnet"
+    prefix=${subnet#*/}
+    [ "$prefix" -ge 8 ] && [ "$prefix" -le 30 ] || die "prefix must be between /8 and /30"
+    valid_ipv4 "${subnet%/*}" || die "bad network address"
+
+    WAN_IF=$wan          # choose_ports explains the udp/53 redirect in terms of it
+    choose_ports         # sets PORT and ALT_PORTS
+
+    dns=$(ask "DNS pushed to clients (or 'none')" "1.1.1.1")
+    if [ "$dns" = "none" ]; then dns=""; fi
+    [ -z "$dns" ] || [[ $dns =~ ^[0-9a-fA-F.:,\ ]+$ ]] || die "DNS must be IP addresses: $dns"
+
+    # normalise to the real network address, derive the server address
+    mask=$(( 0xFFFFFFFF ^ ((1 << (32 - prefix)) - 1) ))
+    net_int=$(( $(ip2int "${subnet%/*}") & mask ))
+
+    NET_ADDR=$(int2ip "$net_int")
+    SUBNET="$NET_ADDR/$prefix"
+    PREFIX=$prefix
+    SERVER_IP=$(int2ip $(( net_int + 1 )))
+    SERVER_HOST=$(sanitize_ifname "$(hostname -s 2>/dev/null || echo wg)")
+    ENDPOINT=$endpoint
+    CLIENT_DNS=$dns
+    MAX_HOST=$(( net_int + (1 << (32 - prefix)) - 2 ))
+
+    head1 "Installing packages"
+    local pm
+    pm=$(detect_pm) || die "no supported package manager found (apt-get, pacman, dnf or zypper)"
+    info "using $pm"
+    # No persistence package: wg0.conf's PostUp re-applies the rules on every
+    # interface-up, which is portable and self-healing. See save_rules' comment.
+    case $pm in
+        apt-get) DEBIAN_FRONTEND=noninteractive apt-get update -qq
+                 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+                     --no-install-recommends wireguard-tools qrencode iptables ;;
+        pacman)  pacman -Sy --needed --noconfirm wireguard-tools qrencode iptables ;;
+        dnf)     dnf install -y -q wireguard-tools qrencode iptables ;;
+        zypper)  zypper --non-interactive --quiet install wireguard-tools qrencode iptables ;;
+    esac
+    modprobe wireguard 2>/dev/null || true
+
+    head1 "Configuring"
+    printf 'net.ipv4.ip_forward=1\n' > "$SYSCTL_FILE"
+    chmod 644 "$SYSCTL_FILE"
+    sysctl -q --system
+    info "IPv4 forwarding enabled ($SYSCTL_FILE)"
+
+    install -d -m 700 "$WGDIR" "$KEYDIR" "$CLIENTDIR"
+    wg genkey > "$KEYDIR/server.key"
+    chmod 600 "$KEYDIR/server.key"
+    wg pubkey < "$KEYDIR/server.key" > "$KEYDIR/server.pub"
+    chmod 644 "$KEYDIR/server.pub"
+    info "server keypair written to $KEYDIR (private key 0600, root-only dir)"
+
+    cat > "$WG_CONF" <<EOF
+# Managed by simplewire — edit peers through the script, not by hand.
+[Interface]
+Address    = $SERVER_IP/$PREFIX, ${V6_NET}1/64
+ListenPort = $PORT
+# The private key deliberately does not live in this file:
+PostUp     = wg set %i private-key $KEYDIR/server.key
+# Re-applies the firewall rules on every interface-up, so they survive reboots
+# without a persistence package and come back after anything flushes iptables.
+# '|| true' so that moving this script cannot stop the tunnel from coming up.
+PostUp     = "$SELF" --apply-rules || true
+EOF
+    chmod 600 "$WG_CONF"
+
+    write_state
+
+    apply_rules add
+
+    systemctl enable -q --now "wg-quick@$WG_IF"
+
+    head1 "Done"
+    info "interface : $WG_IF  ($SERVER_IP/$PREFIX, listening on udp/$PORT)"
+    info "endpoint  : $ENDPOINT:$PORT"
+    if [ -n "$ALT_PORTS" ]; then
+        info "also on   : udp/${ALT_PORTS//,/, udp/}  (redirected to udp/$PORT)"
+    fi
+    info "server pub: $(cat "$KEYDIR/server.pub")"
+    printf '\nOpen udp/%s%s in your VPS provider'"'"'s firewall if it has one, then add a device.\n' \
+        "$PORT" "$([ -n "$ALT_PORTS" ] && printf ',%s' "$ALT_PORTS" || true)"
+}
+
+# ------------------------------------------------------------ add / remove ---
+
+write_client_conf() {  # write_client_conf <name> <ipv4>
+    local name=$1 ip=$2 conf
+    conf="$CLIENTDIR/$name.conf"
+
+    {
+        printf '# %s — generated %s\n'  "$name" "$(date -u '+%Y-%m-%d %H:%M UTC')"
+        printf '[Interface]\n'
+        printf 'PrivateKey = %s\n'      "$(cat "$KEYDIR/$name.key")"
+        printf 'Address    = %s/32, %s/128\n' "$ip" "$(v6_for "$ip")"
+        if [ -n "$CLIENT_DNS" ]; then printf 'DNS        = %s\n' "$CLIENT_DNS"; fi
+        printf '\n[Peer]\n'
+        printf 'PublicKey  = %s\n'      "$(cat "$KEYDIR/server.pub")"
+        printf 'Endpoint   = %s:%s\n'   "$ENDPOINT" "$PORT"
+        printf 'AllowedIPs = 0.0.0.0/0, ::/0\n'
+        printf 'PersistentKeepalive = 25\n'
+        if [ -n "$ALT_PORTS" ]; then
+            printf '\n# If udp/%s is blocked on the network you are on, edit the\n' "$PORT"
+            printf '# Endpoint line above to one of these — same server, same keys:\n'
+            local ap
+            for ap in ${ALT_PORTS//,/ }; do
+                printf '#   Endpoint = %s:%s\n' "$ENDPOINT" "$ap"
+            done
+        fi
+    } > "$conf"
+
+    chmod 600 "$conf"
+    printf '%s' "$conf"
+}
+
+# The QR encodes a minimal version of the config: comments, the alignment spaces
+# around "=", and the spaces after commas are all dropped. The file on disk keeps
+# them. Only the FIRST "=" on a line is collapsed — base64 keys end in "=".
+#
+# This is about as small as a WireGuard QR gets, and it is worth knowing why:
+#   * 257 bytes fits QR version 10 (57x57 modules). Version 9 would be 53x53 but
+#     caps at 230 bytes, so it is 27 bytes out of reach — and 88 of those 257 are
+#     the two base64 keys, which cannot be shortened.
+#     Even sacrificing IPv6 entirely only reaches 232 bytes — still version 10.
+#
+# So the module count is fixed at 59 (57 + a 1-module quiet zone) and the only
+# remaining lever is how many modules are packed into one terminal character.
+# A cell is ~2x taller than wide, so packing NxM modules gives a module aspect
+# of M:2N, and the QR comes out cols=ceil(59/N) x rows=ceil(59/M):
+#
+#   half-block 1x2  59 x 29   modules 1:1   square, but wide
+#   sextant    2x3  30 x 20   modules 3:4   33% too tall
+#   octant     2x4  30 x 15   modules 1:1   square AND smallest  <- optimal
+#
+# Octants are the mathematical floor: square modules, half the width, half the
+# height. The catch is purely font coverage — they are Unicode 16 (2024) and
+# the table also needs a few glyphs from the Legacy Computing Supplement block,
+# so a font without them renders tofu. Sextants (Unicode 13, 2020) are the
+# safer default. QR_STYLE=octant | sextant | square picks explicitly.
+qr_payload() {
+    grep -vE '^[[:space:]]*(#|$)' "$1" \
+        | sed -e 's/[[:space:]]*=[[:space:]]*/=/' -e 's/, /,/g'
+}
+
+# Re-renders qrencode's ASCII grid, packing 2 modules per column and CH per row.
+# Self-calibrating so it does not depend on qrencode's output style: module
+# width comes from line-length/row-count, and polarity from the top-left finder
+# corner, which is always dark. Sub-cell k of row i carries weight 2^(2i+k),
+# which is exactly Unicode's BLOCK SEXTANT-n / BLOCK OCTANT-n position order.
+QR_PACK_AWK='
+function raw(rr, cc,   ch) {
+    ch = substr(rows[rr], (cc - 1) * hs + 1, 1)
+    return (ch != " " && ch != "") ? 1 : 0
+}
+function bit(rr, cc) {
+    if (rr < 1 || cc < 1 || rr > n || cc > w) return 0
+    return (raw(rr, cc) != inv) ? 1 : 0
+}
+BEGIN {
+    nn = split(GLYPHS, t, "|"); for (i = 1; i <= nn; i++) g[i-1] = t[i]
+    p[0] = 1; for (i = 1; i < 8; i++) p[i] = p[i-1] * 2
+}
+{ rows[NR] = $0 }
+END {
+    n  = NR
+    hs = int(length(rows[1]) / n); if (hs < 1) hs = 1
+    w  = int(length(rows[1]) / hs)
+    inv = raw(mg + 1, mg + 1) ? 0 : 1
+    for (r = 1; r <= n; r += CH) {
+        line = ""
+        for (c = 1; c <= w; c += 2) {
+            v = 0
+            for (i = 0; i < CH; i++)
+                v += bit(r + i, c) * p[2 * i] + bit(r + i, c + 1) * p[2 * i + 1]
+            line = line g[v]
+        }
+        printf "%s%s%s\n", pre, line, post
+    }
+}'
+
+QR_SEXTANTS=' |🬀|🬁|🬂|🬃|🬄|🬅|🬆|🬇|🬈|🬉|🬊|🬋|🬌|🬍|🬎|🬏|🬐|🬑|🬒|🬓|▌|🬔|🬕|🬖|🬗|🬘|🬙|🬚|🬛|🬜|🬝|🬞|🬟|🬠|🬡|🬢|🬣|🬤|🬥|🬦|🬧|▐|🬨|🬩|🬪|🬫|🬬|🬭|🬮|🬯|🬰|🬱|🬲|🬳|🬴|🬵|🬶|🬷|🬸|🬹|🬺|🬻|█'
+QR_OCTANTS=' |𜺨|𜺫|🮂|𜴀|▘|𜴁|𜴂|𜴃|𜴄|▝|𜴅|𜴆|𜴇|𜴈|▀|𜴉|𜴊|𜴋|𜴌|🯦|𜴍|𜴎|𜴏|𜴐|𜴑|𜴒|𜴓|𜴔|𜴕|𜴖|𜴗|𜴘|𜴙|𜴚|𜴛|𜴜|𜴝|𜴞|𜴟|🯧|𜴠|𜴡|𜴢|𜴣|𜴤|𜴥|𜴦|𜴧|𜴨|𜴩|𜴪|𜴫|𜴬|𜴭|𜴮|𜴯|𜴰|𜴱|𜴲|𜴳|𜴴|𜴵|🮅|𜺣|𜴶|𜴷|𜴸|𜴹|𜴺|𜴻|𜴼|𜴽|𜴾|𜴿|𜵀|𜵁|𜵂|𜵃|𜵄|▖|𜵅|𜵆|𜵇|𜵈|▌|𜵉|𜵊|𜵋|𜵌|▞|𜵍|𜵎|𜵏|𜵐|▛|𜵑|𜵒|𜵓|𜵔|𜵕|𜵖|𜵗|𜵘|𜵙|𜵚|𜵛|𜵜|𜵝|𜵞|𜵟|𜵠|𜵡|𜵢|𜵣|𜵤|𜵥|𜵦|𜵧|𜵨|𜵩|𜵪|𜵫|𜵬|𜵭|𜵮|𜵯|𜵰|𜺠|𜵱|𜵲|𜵳|𜵴|𜵵|𜵶|𜵷|𜵸|𜵹|𜵺|𜵻|𜵼|𜵽|𜵾|𜵿|𜶀|𜶁|𜶂|𜶃|𜶄|𜶅|𜶆|𜶇|𜶈|𜶉|𜶊|𜶋|𜶌|𜶍|𜶎|𜶏|▗|𜶐|𜶑|𜶒|𜶓|▚|𜶔|𜶕|𜶖|𜶗|▐|𜶘|𜶙|𜶚|𜶛|▜|𜶜|𜶝|𜶞|𜶟|𜶠|𜶡|𜶢|𜶣|𜶤|𜶥|𜶦|𜶧|𜶨|𜶩|𜶪|𜶫|▂|𜶬|𜶭|𜶮|𜶯|𜶰|𜶱|𜶲|𜶳|𜶴|𜶵|𜶶|𜶷|𜶸|𜶹|𜶺|𜶻|𜶼|𜶽|𜶾|𜶿|𜷀|𜷁|𜷂|𜷃|𜷄|𜷅|𜷆|𜷇|𜷈|𜷉|𜷊|𜷋|𜷌|𜷍|𜷎|𜷏|𜷐|𜷑|𜷒|𜷓|𜷔|𜷕|𜷖|𜷗|𜷘|𜷙|𜷚|▄|𜷛|𜷜|𜷝|𜷞|▙|𜷟|𜷠|𜷡|𜷢|▟|𜷣|▆|𜷤|𜷥|█'
+
+qr_pack() {  # qr_pack <modules-per-cell-row> <glyph-table>
+    qrencode -t ASCII -m 1 \
+        | awk -v mg=1 -v CH="$1" -v GLYPHS="$2" \
+              -v pre=$'\033[30;47m' -v post=$'\033[0m' "$QR_PACK_AWK"
+}
+
+qr_render() {
+    local style=${QR_STYLE:-sextant}
+    [ "${QR_WIDE:-0}" = 1 ] && style=square
+    case $style in
+        square|wide) qrencode -t ansiutf8 -m 1 ;;
+        octant)      qr_pack 4 "$QR_OCTANTS"   ;;
+        *)           qr_pack 3 "$QR_SEXTANTS"  ;;
+    esac
+}
+
+show_client() {  # show_client <name>
+    local name=$1 conf tname
+    valid_name "$name"
+    conf="$CLIENTDIR/$name.conf"
+    [ -f "$conf" ] || die "no client config at $conf"
+    tname=$(suggest_tunnel_name "$name")
+    head1 "Scan this with the WireGuard app on '$name'"
+    qr_payload "$conf" | qr_render
+    printf '\n  The app will ask for a name. Use:   %s\n' "$tname"
+    printf '  (Android accepts only A-Z a-z 0-9 _ = + . - and 15 chars, so no "@";\n'
+    printf '   iOS and the desktop apps are laxer, but this name works everywhere)\n'
+    printf '\nconfig file : %s\n' "$conf"
+    printf 'linux client: menu option 4 prints a paste-and-run block for this device\n'
+    printf 'qr size     : QR_STYLE=octant  30x15, square  (needs a Unicode 16 font)\n'
+    printf '              QR_STYLE=square  59x29, square  (works with any font)\n'
+    if [ -n "$ALT_PORTS" ]; then
+        printf 'fallback    : if udp/%s is blocked, change Endpoint to udp/%s\n' \
+            "$PORT" "${ALT_PORTS//,/ or udp\/}"
+    fi
+}
+
+# Everything a Linux client needs as ONE block to paste. The block installs
+# wireguard-tools if missing, writes the config, registers it with
+# NetworkManager when NetworkManager is actually running, and finally prints
+# the how-to-connect summary itself — so the user reads the instructions on the
+# machine they just set up, not mixed into this server's output.
+#
+# Emission note: the parts below are quoted heredocs (<<'PART') so $WG_NAME and
+# friends survive to be expanded on the CLIENT. Only the three assignment lines
+# are substituted here, on the server.
+# Reads one key out of a client config. Anchored and non-global, so the "=" in
+# base64 key material survives.
+conf_get() { sed -n "s/^$2[[:space:]]*=[[:space:]]*//p" "$1" | head -1; }
+
+# Stable UUID derived from the profile name, so regenerating this block targets
+# the same NetworkManager profile instead of creating a second one.
+stable_uuid() {
+    local h
+    h=$(printf '%s' "$1" | sha1sum | cut -c1-32)
+    printf '%s-%s-5%s-a%s-%s' "${h:0:8}" "${h:8:4}" "${h:13:3}" "${h:17:3}" "${h:20:12}"
+}
+
+# A NetworkManager keyfile for this client, with autoconnect=false baked in.
+# Written straight to disk rather than going through `nmcli connection import`:
+# an imported profile is born with autoconnect=yes and WireGuard supplies its
+# own virtual device, so NM activates it instantly and the desktop shows
+# "activated" then "deactivated" as we turn it back off. Creating the file
+# already disabled means NM never activates it and stays quiet.
+nm_keyfile() {  # nm_keyfile <conf> <id> <iface> <uuid>
+    local conf=$1 id=$2 iface=$3 uuid=$4 addr v4 v6 dns aips
+
+    addr=$(conf_get "$conf" Address)
+    v4=${addr%%,*}; v4=${v4// /}
+    v6=""; case $addr in *,*) v6=${addr#*,}; v6=${v6// /} ;; esac
+    dns=$(conf_get "$conf" DNS)
+    aips=$(conf_get "$conf" AllowedIPs | tr -d ' ' | tr ',' ';')
+
+    printf '[connection]\nid=%s\nuuid=%s\ntype=wireguard\ninterface-name=%s\nautoconnect=false\n\n' \
+        "$id" "$uuid" "$iface"
+    printf '[wireguard]\nprivate-key=%s\n\n' "$(conf_get "$conf" PrivateKey)"
+    printf '[wireguard-peer.%s]\nendpoint=%s\nallowed-ips=%s;\n' \
+        "$(conf_get "$conf" PublicKey)" "$(conf_get "$conf" Endpoint)" "$aips"
+    local ka; ka=$(conf_get "$conf" PersistentKeepalive)
+    [ -n "$ka" ] && printf 'persistent-keepalive=%s\n' "$ka"
+    printf '\n[ipv4]\nmethod=manual\naddress1=%s\n' "$v4"
+    # negative priority = this connection's DNS wins while the tunnel is up
+    [ -n "$dns" ] && printf 'dns=%s;\ndns-priority=-50\n' "$dns"
+    printf '\n[ipv6]\n'
+    if [ -n "$v6" ]; then printf 'method=manual\naddress1=%s\n' "$v6"
+    else                  printf 'method=ignore\n'; fi
+    printf 'addr-gen-mode=default\n'
+    return 0
+}
+
+show_linux() {  # show_linux <name>
+    local name=$1 conf tun nmid uuid keyfile
+    valid_name "$name"
+    conf="$CLIENTDIR/$name.conf"
+    [ -f "$conf" ] || die "no client config at $conf"
+    tun=$(suggest_tunnel_name "$name")   # same name the QR screen suggests
+    nmid="$name@$SERVER_HOST"
+    uuid=$(stable_uuid "$nmid")
+    keyfile=$(nm_keyfile "$conf" "$nmid" "$tun" "$uuid")
+
+    head1 "Linux setup for '$name'"
+    printf '\nCopy the whole block and paste it into the client terminal. It will\n'
+    printf 'install what is missing, write the config, register it with\n'
+    printf 'NetworkManager if present, then print how to connect.\n\n'
+
+    printf '#--------------------- copy from here ---------------------\n'
+    printf 'WG_NAME=%s\n'   "$tun"
+    printf "NM_NAME='%s'\n" "$nmid"
+    printf 'WG_UUID=%s\n'   "$uuid"
+    printf "SRV_IP='%s'\n\n" "$ENDPOINT"
+    cat <<'PART'
+if ! command -v wg >/dev/null 2>&1; then
+  if   command -v apt-get >/dev/null 2>&1; then sudo apt-get update -qq && sudo apt-get install -y wireguard-tools
+  elif command -v pacman  >/dev/null 2>&1; then sudo pacman -S --needed --noconfirm wireguard-tools
+  elif command -v dnf     >/dev/null 2>&1; then sudo dnf install -y wireguard-tools
+  elif command -v zypper  >/dev/null 2>&1; then sudo zypper install -y wireguard-tools
+  else echo "!! install wireguard-tools yourself, then paste this again"; fi
+fi
+
+sudo install -d -m 700 /etc/wireguard
+sudo tee "/etc/wireguard/$WG_NAME.conf" >/dev/null <<'WGEOF'
+PART
+    cat "$conf"
+    cat <<'PART'
+WGEOF
+sudo chmod 600 "/etc/wireguard/$WG_NAME.conf"
+
+NM=no
+NM_OLD=0
+if command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager 2>/dev/null; then
+  # Drop stray profiles for this tunnel left by earlier runs — match either of
+  # our names or the interface it binds (catches a hand-renamed profile). Our
+  # own profile is skipped by UUID: its file is simply overwritten below.
+  for u in $(sudo nmcli -t -f UUID,TYPE connection show 2>/dev/null \
+             | awk -F: '$2 == "wireguard" { print $1 }'); do
+    if [ "$u" = "$WG_UUID" ]; then continue; fi
+    cid=$(sudo nmcli -g connection.id             connection show "$u" 2>/dev/null)
+    cif=$(sudo nmcli -g connection.interface-name connection show "$u" 2>/dev/null)
+    if [ "$cid" = "$NM_NAME" ] || [ "$cid" = "$WG_NAME" ] || [ "$cif" = "$WG_NAME" ]; then
+      sudo nmcli connection delete uuid "$u" >/dev/null 2>&1 && NM_OLD=$((NM_OLD + 1))
+    fi
+  done
+
+  # Write the profile with autoconnect=false already set, so NM never activates
+  # it and the desktop stays silent. (`nmcli connection import` would create it
+  # with autoconnect=yes, activate it at once, and pop up activated/deactivated
+  # notifications when we turned it back off.)
+  # Create the file 0600 *before* writing it: this one carries the private key,
+  # and unlike /etc/wireguard its directory is world-traversable, so a
+  # tee-then-chmod would leave the key readable to every local user in between.
+  sudo mkdir -p /etc/NetworkManager/system-connections
+  sudo install -m 600 /dev/null "/etc/NetworkManager/system-connections/$WG_NAME.nmconnection"
+  sudo tee "/etc/NetworkManager/system-connections/$WG_NAME.nmconnection" >/dev/null <<'NMEOF'
+PART
+    printf '%s\n' "$keyfile"
+    cat <<'PART'
+NMEOF
+  sudo nmcli connection reload >/dev/null 2>&1
+  if sudo nmcli -g connection.id connection show "$WG_UUID" >/dev/null 2>&1; then
+    NM=yes
+  else
+    # Keyfile not accepted (older NM, unexpected schema): fall back to import so
+    # a profile still ends up registered. This path does flash a notification.
+    echo "!! keyfile not accepted, falling back to nmcli import"
+    sudo nmcli connection import type wireguard file "/etc/wireguard/$WG_NAME.conf" >/dev/null 2>&1 \
+      && sudo nmcli connection modify "$WG_NAME" connection.id "$NM_NAME" connection.autoconnect no >/dev/null 2>&1
+    sudo nmcli connection down "$NM_NAME" >/dev/null 2>&1
+    if sudo nmcli -g connection.id connection show "$NM_NAME" >/dev/null 2>&1; then NM=yes; fi
+  fi
+fi
+
+printf '\n'
+printf '  +--------------------------------------------------------------+\n'
+printf '  |  VPN ready                                                   |\n'
+printf '  +--------------------------------------------------------------+\n'
+printf '\n     name: %s\n\n' "$NM_NAME"
+if [ "$NM" = yes ]; then
+  printf '   1) Desktop     click "%s" in the network menu to connect\n' "$NM_NAME"
+  printf '                  or from a terminal:\n'
+  printf '                     nmcli con up   "%s"\n' "$NM_NAME"
+  printf '                     nmcli con down "%s"\n' "$NM_NAME"
+  if [ "$NM_OLD" -gt 0 ]; then
+    printf '                  (replaced %d older profile(s) for this tunnel; if one\n' "$NM_OLD"
+    printf '                   was connected, connect again)\n'
+  fi
+else
+  printf '   1) Desktop     NetworkManager is not running here, so nothing\n'
+  printf '                  was registered. Use option 2.\n'
+fi
+printf '\n   2) Terminal    sudo wg-quick up   %s\n' "$WG_NAME"
+printf '                  sudo wg-quick down %s\n' "$WG_NAME"
+printf '\n   Check         sudo wg show          (expect a recent handshake)\n'
+printf '                 curl -4 ifconfig.me   (should print %s)\n' "$SRV_IP"
+printf '\n   Use one or the other, not both at the same time.\n\n'
+PART
+    printf '#---------------------- to here ---------------------------\n'
+}
+
+do_add() {
+    head1 "Add a device"
+    local name ip def want cur reach=no proxy=''
+
+    name=$(ask "Device name (letters, digits, - and _)")
+    valid_name "$name"
+    if peer_exists "$name"; then die "a device named '$name' already exists"; fi
+
+    def=$(next_ip)
+    if [ "$PREFIX" -eq 24 ]; then
+        want=$(ask "Address (last octet, or full IP)" "${def##*.}")
+        if [[ $want =~ ^[0-9]{1,3}$ ]]; then want="${NET_ADDR%.*}.$want"; fi
+    else
+        want=$(ask "Address" "$def")
+    fi
+    valid_ipv4 "$want" || die "invalid address: $want"
+    ip=$want
+
+    cur=$(ip2int "$ip")
+    [ "$cur" -gt "$(ip2int "$SERVER_IP")" ] && [ "$cur" -le "$MAX_HOST" ] \
+        || die "$ip is outside the usable range of $SUBNET"
+    if used_ips | grep -qxF -- "$ip"; then die "$ip is already assigned"; fi
+
+    printf '\n  Every device is on the same tunnel subnet, so by default it can\n'
+    printf '  reach the others (file shares, SSH, dev servers on 0.0.0.0...).\n'
+    printf "  Answer 'n' for a device you do not fully trust — a phone you lend\n"
+    printf '  out, a machine someone else uses. Your other devices can still\n'
+    printf '  reach IN to it, and it still gets internet through this server.\n'
+    confirm_yes "  Let '$name' reach the other devices?" && reach=yes
+
+    printf '\n  Its web traffic (tcp/80 and tcp/443) can be diverted to an\n'
+    printf '  intercepting proxy running on another device on this VPN — Burp\n'
+    printf "  Suite with 'invisible proxying' enabled, or mitmproxy. The device\n"
+    printf '  needs no proxy settings, so apps that ignore them are caught too.\n'
+    if confirm "  Send '$name' web traffic through a proxy?"; then
+        proxy=$(resolve_proxy "$(ask "  Proxy (device name, or ip[:port])" "")")
+        [ "${proxy%%:*}" != "$ip" ] || die "a device cannot be its own proxy"
+        info "proxying tcp/80 and tcp/443 to $proxy; udp/443 (QUIC) rejected"
+    fi
+
+    wg genkey > "$KEYDIR/$name.key"
+    chmod 600 "$KEYDIR/$name.key"
+    wg pubkey < "$KEYDIR/$name.key" > "$KEYDIR/$name.pub"
+    chmod 644 "$KEYDIR/$name.pub"
+
+    cat >> "$WG_CONF" <<EOF
+
+### BEGIN peer $name
+[Peer]
+# $name
+# reach-peers = $reach${proxy:+
+# proxy = $proxy}
+PublicKey  = $(cat "$KEYDIR/$name.pub")
+AllowedIPs = $ip/32, $(v6_for "$ip")/128
+### END peer $name
+EOF
+
+    reload_wg
+    apply_rules add          # picks up this device's isolation rules, if any
+    write_client_conf "$name" "$ip" >/dev/null
+    info "added '$name' at $ip$([ "$reach" = no ] && printf ', cannot open connections to the other devices' || true)"
+    show_client "$name"
+}
+
+do_remove() {
+    head1 "Remove a device"
+    list_peers
+    local name
+    name=$(ask "Device to remove")
+    [ -n "$name" ] || return 0
+    valid_name "$name"
+    peer_exists "$name" || die "no such device: $name"
+    confirm "Really remove '$name' and delete its keys?" || { info "aborted"; return 0; }
+
+    # The rule set is derived from the peer list, so tear it down while this
+    # device is still in the file — otherwise its isolation rules would be
+    # orphaned in the chain — then rebuild from the trimmed one.
+    apply_rules del
+
+    awk -v w="$name" '
+        $0 == "### BEGIN peer " w { skip=1 }
+        !skip { print }
+        $0 == "### END peer " w   { skip=0 }
+    ' "$WG_CONF" > "$WG_CONF.new"
+    mv "$WG_CONF.new" "$WG_CONF"
+    chmod 600 "$WG_CONF"
+
+    rm -f "$KEYDIR/$name.key" "$KEYDIR/$name.pub" "$CLIENTDIR/$name.conf"
+    apply_rules add
+    reload_wg
+    info "removed '$name'"
+}
+
+do_isolate() {
+    head1 "Device isolation"
+    list_peers
+    local name cur new=no
+    name=$(ask "Device")
+    [ -n "$name" ] || return 0
+    valid_name "$name"
+    peer_exists "$name" || die "no such device: $name"
+
+    if peer_isolated "$name"; then cur=no; else cur=yes; fi
+    if [ "$cur" = yes ]; then
+        info "currently: '$name' can reach the other devices"
+    else
+        info "currently: '$name' cannot open connections to the other devices"
+        info "           (they can still reach in to it)"
+    fi
+
+    # Default follows the current setting, so a stray Enter changes nothing.
+    if [ "$cur" = yes ]; then
+        confirm_yes "Let '$name' reach the other devices?" && new=yes
+    else
+        confirm     "Let '$name' reach the other devices?" && new=yes
+    fi
+    [ "$new" != "$cur" ] || { info "unchanged"; return 0; }
+
+    apply_rules del          # built from the old marker; see do_remove
+    # Always writes the marker, so devices added before this option existed —
+    # which carry none at all — get one rather than staying unmanaged.
+    awk -v w="$name" -v val="$new" '
+        $0 == "### BEGIN peer " w    { f=1 }
+        f && /^# reach-peers = /     { next }
+        f && $0 == "### END peer " w { print "# reach-peers = " val; f=0 }
+        { print }
+    ' "$WG_CONF" > "$WG_CONF.new"
+    mv "$WG_CONF.new" "$WG_CONF"
+    chmod 600 "$WG_CONF"
+    apply_rules add
+
+    if [ "$new" = yes ]; then
+        info "'$name' can now reach the other devices"
+    else
+        info "'$name' can no longer open connections to the other devices"
+        [ -n "$(peer_proxy "$name")" ] && info "its proxy stays reachable, on the proxy port only"
+    fi
+    info "existing connections keep their old path until they are re-established"
+}
+
+# Toggling the proxy is the thing you do constantly while testing, so it has to
+# work without regenerating the device's keys and re-pairing it.
+do_proxy() {
+    head1 "Proxy for a device"
+    list_peers
+    local name cur new=''
+    name=$(ask "Device")
+    [ -n "$name" ] || return 0
+    valid_name "$name"
+    peer_exists "$name" || die "no such device: $name"
+
+    cur=$(peer_proxy "$name")
+    info "currently: ${cur:-no proxy}"
+    if [ -n "$cur" ]; then
+        confirm_yes "Keep proxying '$name'?" && new=$(resolve_proxy "$(ask "Proxy (device name, or ip[:port])" "$cur")")
+    else
+        confirm "Send '$name' web traffic through a proxy?" \
+            && new=$(resolve_proxy "$(ask "Proxy (device name, or ip[:port])" "")")
+    fi
+    [ "${new%%:*}" != "$(peer_ip "$name")" ] || die "a device cannot be its own proxy"
+    [ "$new" != "$cur" ] || { info "unchanged"; return 0; }
+
+    apply_rules del          # built from the old marker; see do_remove
+    awk -v w="$name" -v px="$new" '
+        $0 == "### BEGIN peer " w    { f=1 }
+        f && /^# proxy = /           { next }
+        f && $0 == "### END peer " w { if (px != "") print "# proxy = " px; f=0 }
+        { print }
+    ' "$WG_CONF" > "$WG_CONF.new"
+    mv "$WG_CONF.new" "$WG_CONF"
+    chmod 600 "$WG_CONF"
+    apply_rules add
+
+    if [ -n "$new" ]; then
+        info "'$name' now proxied to $new (tcp/80, tcp/443; udp/443 rejected)"
+        info "the proxy must listen on $new and have invisible/transparent mode on"
+    else
+        info "'$name' is no longer proxied"
+    fi
+    info "existing connections keep their old path until they are re-established"
+}
+
+# DNS lives in the CLIENT config, so this only changes what the .conf files on
+# this server say. A device that already holds its config keeps the old resolver
+# until it is re-imported — there is no way to push it from here.
+do_dns() {
+    head1 "DNS pushed to clients"
+    info "current: ${CLIENT_DNS:-none}"
+    printf '\n  This is the resolver written into each client config. Changing it\n'
+    printf '  rebuilds the .conf files here, but a device that is already paired\n'
+    printf '  keeps its old resolver until you re-import it (option 3 for the QR,\n'
+    printf '  option 4 for the Linux block).\n\n'
+
+    local dns n=0 name ip
+    dns=$(ask "DNS pushed to clients (or 'none')" "${CLIENT_DNS:-none}")
+    if [ "$dns" = "none" ]; then dns=""; fi
+    [ -z "$dns" ] || [[ $dns =~ ^[0-9a-fA-F.:,\ ]+$ ]] || die "DNS must be IP addresses: $dns"
+    [ "$dns" != "$CLIENT_DNS" ] || { info "unchanged"; return 0; }
+
+    CLIENT_DNS=$dns
+    write_state
+
+    while read -r name; do
+        [ -n "$name" ] || continue
+        if [ ! -f "$KEYDIR/$name.key" ]; then
+            info "skipped '$name' — its private key is gone, cannot rebuild its config"
+            continue
+        fi
+        ip=$(peer_ip "$name")
+        write_client_conf "$name" "$ip" >/dev/null
+        n=$((n+1))
+    done < <(peer_names)
+
+    info "DNS is now ${CLIENT_DNS:-none}; rebuilt $n client config(s)"
+    if [ "$n" -gt 0 ]; then
+        info "re-import each device (option 3 or 4) before it takes effect there"
+    fi
+}
+
+do_uninstall() {
+    head1 "Uninstall"
+    printf 'This removes the %s interface, the simplewire iptables rules and every key.\n' "$WG_IF"
+    local ans
+    ans=$(ask "Type UNINSTALL to confirm")
+    [ "$ans" = "UNINSTALL" ] || { info "aborted"; return 0; }
+
+    systemctl disable -q --now "wg-quick@$WG_IF" 2>/dev/null || true
+    ip link del "$WG_IF" 2>/dev/null || true
+    apply_rules del
+    rm -f "$SYSCTL_FILE"
+    sysctl -q --system
+    rm -rf "$WGDIR"
+    info "removed $WGDIR, iptables rules and $SYSCTL_FILE"
+
+    local pm
+    if pm=$(detect_pm) && confirm "Also remove the wireguard-tools and qrencode packages?"; then
+        case $pm in
+            apt-get) DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq wireguard-tools qrencode ;;
+            pacman)  pacman -Rns --noconfirm wireguard-tools qrencode ;;
+            dnf)     dnf remove -y -q wireguard-tools qrencode ;;
+            zypper)  zypper --non-interactive --quiet remove wireguard-tools qrencode ;;
+        esac
+    fi
+    info "done"
+}
+
+do_status() {
+    head1 "Status"
+    systemctl is-active --quiet "wg-quick@$WG_IF" \
+        && info "wg-quick@$WG_IF: active" || info "wg-quick@$WG_IF: INACTIVE"
+    printf '\n'
+    wg show "$WG_IF" 2>/dev/null || info "(interface is down)"
+    printf '\nDevices:\n'
+    list_peers
+    printf '\nFirewall rules tagged "%s":\n' "$TAG"
+    { iptables-save; ip6tables-save 2>/dev/null || true; } \
+        | grep -- "$TAG" | sed 's/^/  /' || info "  (none)"
+}
+
+# -------------------------------------------------------------------- menu ---
+
+menu_installed() {
+    while true; do
+        load_state
+        head1 "WireGuard on $ENDPOINT:$PORT — $SUBNET"
+        list_peers
+        printf '\n  1) Add a device\n  2) Remove a device\n'
+        printf '  3) Show QR for a device        (phones, any QR-capable client)\n'
+        printf '  4) Show paste-and-run setup    (Linux)\n'
+        printf '  5) Device isolation            (reach other devices?)\n'
+        printf '  6) Proxy for a device          (Burp / mitmproxy)\n'
+        printf '  7) DNS pushed to clients\n'
+        printf '  8) Status\n  9) Uninstall server\n  q) Quit\n\n'
+        local choice
+        choice=$(ask "Choice" "q")
+        case $choice in
+            1) do_add ;;
+            2) do_remove ;;
+            3) local n; n=$(ask "Device name"); if [ -n "$n" ]; then show_client "$n"; fi ;;
+            4) local m; m=$(ask "Device name"); if [ -n "$m" ]; then show_linux  "$m"; fi ;;
+            5) do_isolate ;;
+            6) do_proxy ;;
+            7) do_dns ;;
+            8) do_status ;;
+            9) do_uninstall; return 0 ;;
+            q|Q) return 0 ;;
+            *) info "no such option" ;;
+        esac
+    done
+}
+
+main() {
+    need_root
+
+    # Non-interactive mode, called from wg0.conf's PostUp. Handled before the
+    # tty check below because at boot there is no terminal, and kept minimal so
+    # a failure here cannot stop the tunnel from coming up.
+    if [ "${1-}" = --apply-rules ]; then
+        is_installed || die "not installed — no $STATE"
+        load_state
+        apply_rules add
+        return 0
+    fi
+
+    # Every prompt below reads stdin. Piped into bash (curl … | sudo bash) stdin
+    # is the script itself, so `read` would silently eat its own source lines.
+    [ -t 0 ] || die "run this from a terminal — download the script first, do not pipe it into bash"
+    command -v ip >/dev/null || die "iproute2 is missing"
+    require_platform
+
+    if is_installed; then
+        menu_installed
+    else
+        head1 "No WireGuard server configured on this host"
+        printf '\n  1) Install WireGuard server\n  q) Quit\n\n'
+        local choice
+        choice=$(ask "Choice" "1")
+        case $choice in
+            1) do_install; load_state; menu_installed ;;
+            *) return 0 ;;
+        esac
+    fi
+}
+
+main "$@"

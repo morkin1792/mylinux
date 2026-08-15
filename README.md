@@ -15,4 +15,5 @@
 - 💦 [waterbox: script for sandboxing CLI agents, specially claude-code](waterbox/waterbox)
 - 🎬 [manodavinci: helps you deal with DaVinci Resolve free's codec limitations on Linux by transcoding footage it can't edit](manodavinci/manodavinci)
 - 🛡️ [pvpn: ProtonVPN CLI wrapper to make it a bit decent](pvpn)
+- 🔒 [simplewire: WireGuard server manager to quickly setup a VPN on a VPS + transparent proxy support](simplewire/simplewire)
 
