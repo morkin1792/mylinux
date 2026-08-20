@@ -19,4 +19,4 @@ eval "$(oh-my-posh init zsh --config ~/.zsh.craver.omp.json)"
 
 # fixing vim-powerline error when using virtualenvs
 export SITE_PACKAGES=`python -c 'import site; print(site.getsitepackages()[0])'`
-export PYTHONPATH=$SITE_PACKAGES
+vim() { PYTHONPATH=$SITE_PACKAGES command vim "$@"; } 
