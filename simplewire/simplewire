@@ -31,6 +31,27 @@
 #     proxying", or mitmproxy. tcp/80 and tcp/443 are DNAT'd to it and udp/443 is
 #     rejected so QUIC cannot slip past. The device itself is configured with
 #     nothing, which is what makes it work on apps that ignore proxy settings.
+#   * Each device is either full-tunnel (AllowedIPs 0.0.0.0/0 — the VPN is its
+#     default gateway) or split-tunnel (AllowedIPs = the tunnel subnet only, its
+#     normal internet untouched). Asked at add time, changed later with menu
+#     option 7. AllowedIPs is a client-side routing decision WireGuard has no
+#     channel to push, so the device must be re-imported for it to stop sending
+#     its internet traffic here — but a split-tunnel device is ALSO rejected at
+#     the server's FORWARD chain, which needs nothing from the client. The
+#     setting is therefore enforced, not advisory; the config is only what makes
+#     the device stop offering traffic that would be refused anyway. Its tunnel
+#     address carries the subnet prefix rather than /32, so the tunnel range is
+#     an on-link route either way and devices can always reach each other.
+#   * A full-tunnel device can be made to come out through ANOTHER device on the
+#     VPN instead of this server's own connection (option 7). Unlike the choice
+#     above, this one needs nothing from the routed device — it is already
+#     sending everything into the tunnel, so the whole decision is server-side:
+#     an ip rule per device, a table whose default points at wg0, and 0.0.0.0/0
+#     on the gateway peer so WireGuard hands it everything not claimed by a
+#     device's own /32. Changing the gateway takes effect on the next packet.
+#     The gateway DEVICE does need setting up — ip_forward and, the part people
+#     forget, MASQUERADE — and the script prints those commands for it. One
+#     gateway at a time; see peer_gateway for why.
 #   * Devices share one tunnel subnet, so by default each one can reach the others
 #     — that is what makes a personal VPN useful. "Add device" asks per device, and
 #     answering 'n' stops that one from OPENING connections to the rest, while your
@@ -66,6 +87,8 @@ STATE=$WGDIR/simplewire.env
 SYSCTL_FILE=/etc/sysctl.d/99-wireguard.conf
 TAG=simplewire
 V6_NET="fd42:42:42::"          # ULA prefix used inside the tunnel (blackholed v6)
+GW_TABLE=51821                 # policy-routing table for devices that exit via another device
+GW_PRIO=100                    # its ip-rule priority: after 'local' (0), before 'main' (32766)
 
 # ---------------------------------------------------------------- helpers ----
 
@@ -385,6 +408,39 @@ build_rules() {
         RULES+=("iptables filter FORWARD -i $WG_IF -o $WG_IF -s $ip/32 -m comment --comment $TAG -j DROP")
         RULES+=("iptables filter FORWARD -i $WG_IF -o $WG_IF -s $ip/32 -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment $TAG -j ACCEPT")
     done < <(isolated_ips)
+    # A device that exits through another device hands it traffic bound for the
+    # internet, which is wg0 -> wg0 with a destination OUTSIDE the tunnel. If it
+    # is also isolated, the DROP above eats exactly that. Allowing "anything that
+    # is not another device on the VPN" keeps the isolation intact — it still
+    # cannot open connections to its neighbours — while letting its own traffic
+    # out through its gateway.
+    #
+    # ORDER: after the isolation DROPs, so it lands above them.
+    while read -r ip gw; do
+        [ -n "$ip" ] || continue
+        RULES+=("iptables filter FORWARD -i $WG_IF -o $WG_IF -s $ip/32 ! -d $SUBNET -m comment --comment $TAG -j ACCEPT")
+    done < <(gateway_users)
+    # Devices marked "do not route the internet through here" are enforced, not
+    # just asked. AllowedIPs is client-side and cannot be pushed, so without this
+    # the server goes on NATing for a device whose config was never re-imported
+    # and the setting means nothing. With it, the split-tunnel decision holds the
+    # moment it is made and the config is only what makes the device pleasant to
+    # use — it stops sending traffic we would refuse anyway.
+    #
+    # REJECT, not DROP: we cannot tell the client to route around us, so the
+    # honest answer is "not through me". Apps fail at once with ENETUNREACH
+    # instead of hanging until a timeout, which is also what makes a
+    # not-yet-re-imported device obvious rather than mysteriously slow.
+    #
+    # Only -o $WAN_IF, so the tunnel subnet, this server and any proxy on the
+    # VPN stay reachable — the point is to stop being its gateway, not to cut it
+    # off from the private network it joined for.
+    #
+    # ORDER: after the blanket wg0 -> WAN ACCEPT above, so it lands higher.
+    while read -r ip; do
+        [ -n "$ip" ] || continue
+        RULES+=("iptables filter FORWARD -i $WG_IF -o $WAN_IF -s $ip/32 -m comment --comment $TAG -j REJECT --reject-with icmp-net-unreachable")
+    done < <(split_tunnel_ips)
     # Transparent proxying. Burp ("invisible proxying") and mitmproxy recover the
     # real destination from the Host header and the TLS SNI rather than from
     # SO_ORIGINAL_DST, which is why the proxy can sit on a different machine than
@@ -421,6 +477,33 @@ build_rules() {
     fi
 }
 
+# Policy routing for devices that exit through another device. Torn down and
+# rebuilt from the peer list on every call, like the iptables rules — `ip rule
+# add` is not idempotent, and deleting by table sweeps up anything left behind by
+# a device that has since been removed.
+apply_routes() {  # apply_routes add|del
+    local action=$1 ip gw n=0
+    # `ip rule del` removes ONE match per call, so this drains them. Bounded
+    # because it runs from PostUp: a version of ip that returned success on an
+    # empty table would otherwise hang the interface coming up at boot, and no
+    # real rule set gets anywhere near this many.
+    while [ "$n" -lt 64 ] && ip rule del lookup "$GW_TABLE" 2>/dev/null; do n=$((n+1)); done
+    ip route flush table "$GW_TABLE" 2>/dev/null || true
+    [ "$action" = add ] || return 0
+    [ -n "$(gateway_users)" ] || return 0
+
+    # "out $WG_IF" is the whole route: WireGuard then picks the peer by looking
+    # up the DESTINATION, and the gateway is the only one holding 0.0.0.0/0.
+    # Traffic to another device still reaches it — its /32 wins on longest
+    # prefix — and traffic to this server never gets here at all, because the
+    # kernel consults the 'local' table at priority 0, ahead of these rules.
+    ip route replace default dev "$WG_IF" table "$GW_TABLE"
+    while read -r ip gw; do
+        [ -n "$ip" ] || continue
+        ip rule add from "$ip/32" lookup "$GW_TABLE" priority "$GW_PRIO"
+    done < <(gateway_users)
+}
+
 apply_rules() {  # apply_rules add|del
     local action=$1 r cmd table chain spec
     build_rules
@@ -438,6 +521,7 @@ apply_rules() {  # apply_rules add|del
             done
         fi
     done
+    apply_routes "$action"
 }
 
 # Rules are NOT persisted through a distro package. wg0.conf carries
@@ -446,6 +530,9 @@ apply_rules() {  # apply_rules add|del
 # same on every distro, needs no iptables-persistent equivalent (every distro
 # spells it differently), and self-heals after anything that flushes iptables.
 # To restore them by hand at any time:  simplewire --apply-rules
+#
+# The other non-interactive flag is  simplewire --rebuild-clients , which
+# regenerates the client .conf files after this script has been upgraded.
 
 # --------------------------------------------------------------- wg state ----
 
@@ -488,6 +575,73 @@ isolated_ips() {  # tunnel IPv4 of every device fenced off from the other peers
         /^### END peer /           {if (iso && ip != "") print ip}' "$WG_CONF"
 }
 
+# Whether a device sends ALL its traffic through here (AllowedIPs 0.0.0.0/0) or
+# only traffic to the tunnel subnet. Recorded as "# full-tunnel = yes|no"; blocks
+# written before this option existed carry no marker and stay full-tunnel, which
+# is what they already do.
+#
+# This is the one setting that CANNOT be pushed: AllowedIPs is a client-side
+# routing decision and WireGuard has no channel to change it from the server.
+# Toggling it here rewrites the .conf and the device must be re-imported.
+peer_full_tunnel() {  # peer_full_tunnel <name> -> 0 if it uses the VPN as default gateway
+    awk -v w="$1" '
+        $0 == "### BEGIN peer " w      {f=1}
+        f && /^### END peer /          {f=0}
+        f && $0 == "# full-tunnel = no" {sp=1}
+        END {exit sp ? 1 : 0}' "$WG_CONF"
+}
+
+# A device can exit through ANOTHER device on the VPN instead of this server's
+# own connection. Recorded on the routed device as "# gateway = <ip>".
+#
+# How it works, and why the routed device needs no config change: it already
+# sends everything into the tunnel (this is a full-tunnel-only option), so the
+# whole decision is made here. An ip rule for its address picks a table whose
+# default route points at wg0, and WireGuard then picks the peer by looking the
+# DESTINATION up in its allowed-ips trie — so the gateway peer is given
+# 0.0.0.0/0 and catches everything that is not another device's /32.
+#
+# That trie is global to the interface and the last writer silently steals an
+# entry from the previous holder, so exactly one peer can hold 0.0.0.0/0:
+# one gateway at a time, any number of devices routed through it.
+# ponytail: one gateway per interface. Lifting it needs a second wg interface
+# per gateway — another port, keypair and client config each — which is a lot of
+# machinery for a case that has not come up.
+peer_gateway() {  # peer_gateway <name> -> tunnel IP of the device routing it, empty if none
+    awk -v w="$1" '
+        $0 == "### BEGIN peer " w {f=1}
+        f && /^### END peer /     {f=0}
+        f && /^# gateway = /      {print $4}' "$WG_CONF"
+}
+
+gateway_users() {  # "<routed-device-ip> <gateway-ip>" per device exiting through another
+    [ -f "$WG_CONF" ] || return 0
+    awk '
+        /^### BEGIN peer / {gw=""; ip=""}
+        /^# gateway = /    {gw=$4}
+        /^AllowedIPs/      {split($3,a,"/"); ip=a[1]}
+        /^### END peer /   {if (gw != "" && ip != "") print ip, gw}' "$WG_CONF"
+}
+
+current_gateway() {  # tunnel IP of the device acting as gateway, empty if none
+    gateway_users | awk '{print $2; exit}'
+}
+
+peer_by_ip() {  # peer_by_ip <ipv4> -> device name, empty if unassigned
+    awk -v ip="$1" '
+        /^### BEGIN peer / {n=$4}
+        /^AllowedIPs/      {split($3,a,"/"); if (a[1] == ip) {print n; exit}}' "$WG_CONF"
+}
+
+split_tunnel_ips() {  # tunnel IPv4 of every device that must not route the internet through here
+    [ -f "$WG_CONF" ] || return 0
+    awk '
+        /^### BEGIN peer /         {sp=0; ip=""}
+        $0 == "# full-tunnel = no" {sp=1}
+        /^AllowedIPs/              {split($3,a,"/"); ip=a[1]}
+        /^### END peer /           {if (sp && ip != "") print ip}' "$WG_CONF"
+}
+
 # A device's web traffic can be DNAT'd to an intercepting proxy running on
 # another device on the VPN — Burp Suite with "invisible proxying" enabled, or
 # mitmproxy. Recorded per device as "# proxy = <ip>:<port>".
@@ -508,6 +662,46 @@ proxied_peers() {  # "<device-ip> <proxy-ip> <proxy-port>" per proxied device
     ' "$WG_CONF"
 }
 
+# wg-quick reads every peer's AllowedIPs and adds a matching route, and for a
+# /0 it does not add a plain route — it installs the full default-route/fwmark
+# machinery for the whole host. On a client that is the entire point. On this
+# server it would push the server's OWN traffic into the tunnel the moment a
+# gateway peer gets 0.0.0.0/0, taking SSH with it.
+#
+# Table = off stops wg-quick touching routes at all, which costs nothing here:
+# every route it would have added is already covered by the interface addresses
+# (the tunnel subnet is on-link, and every peer sits inside it). Added on demand
+# rather than at install, so an existing server picks it up too. It only matters
+# at interface-up, so no restart is needed to make it safe.
+ensure_table_off() {
+    grep -q '^Table[[:space:]]*=' "$WG_CONF" && return 0
+    awk -v note="# Keep wg-quick from turning a gateway peer's 0.0.0.0/0 into a default route here:" '
+        !done && /^ListenPort/ { print; print note; print "Table      = off"; done=1; next }
+        { print }' "$WG_CONF" > "$WG_CONF.new"
+    mv "$WG_CONF.new" "$WG_CONF"
+    chmod 600 "$WG_CONF"
+}
+
+# Gives 0.0.0.0/0 to whichever peer is currently the gateway and takes it off
+# everyone else, then reloads. This is a SERVER-side edit only — it changes which
+# destinations this server will encrypt to that peer. The gateway device's own
+# config is untouched, and so is every routed device's.
+sync_gateway_routes() {
+    local gw
+    gw=$(current_gateway)
+    [ -z "$gw" ] || ensure_table_off
+    awk -v gw="$gw" '
+        /^AllowedIPs/ {
+            sub(/,[[:space:]]*0\.0\.0\.0\/0/, "")
+            split($3, a, "/")
+            if (gw != "" && a[1] == gw) $0 = $0 ", 0.0.0.0/0"
+        }
+        { print }' "$WG_CONF" > "$WG_CONF.new"
+    mv "$WG_CONF.new" "$WG_CONF"
+    chmod 600 "$WG_CONF"
+    reload_wg
+}
+
 # Accepts the name of another device on the VPN (its tunnel address is looked
 # up) or a bare <ip>[:<port>]. Port defaults to 8080 — Burp's and mitmproxy's.
 resolve_proxy() {  # resolve_proxy <answer> -> "<ip>:<port>"
@@ -521,20 +715,69 @@ resolve_proxy() {  # resolve_proxy <answer> -> "<ip>:<port>"
     printf '%s:%s' "$host" "$port"
 }
 
+# Listed by tunnel address rather than by position in wg0.conf: peers are
+# appended in creation order, so the file order stops matching the addresses as
+# soon as one is removed and next_ip hands its number to something else.
+#
+# Each line is built with a sort key in front — the address as a plain integer,
+# separated by a tab — and the key is cut off after sorting. Sorting the
+# formatted line directly does not work: the name column is padded, so any
+# address-column key carries a variable run of leading blanks, and `sort -V`
+# silently ignores -b (it says so with --debug), which sorts short names first
+# instead of low addresses.
+# Accepts a device name or a bare tunnel IP, and refuses the combinations that
+# cannot work: itself, a device that is not on this VPN, a device that is itself
+# routed through someone else (no chains), and a second, different gateway.
+resolve_gateway() {  # resolve_gateway <answer> <own-tunnel-ip> -> gateway tunnel IP
+    local a=$1 mine=$2 ip name cur cur_name
+    if peer_exists "$a"; then ip=$(peer_ip "$a"); else ip=$a; fi
+    valid_ipv4 "$ip" || die "gateway must be a device name or an IP address: $a"
+    [ "$ip" != "$mine" ] || die "a device cannot be its own gateway"
+    name=$(peer_by_ip "$ip")
+    [ -n "$name" ] || die "$ip is not a device on this VPN"
+    [ -z "$(peer_gateway "$name")" ] \
+        || die "'$name' is itself routed through another device — gateways cannot be chained"
+    # Ignore this device's own marker, or repointing the only routed device at a
+    # different gateway would be refused on the strength of where it points now.
+    cur=$(gateway_users | awk -v me="$mine" '$1 != me {print $2; exit}')
+    if [ -n "$cur" ] && [ "$cur" != "$ip" ]; then
+        cur_name=$(peer_by_ip "$cur")
+        die "'${cur_name:-$cur}' is already the gateway for this VPN.
+  Only one device can be the gateway: it is the peer holding 0.0.0.0/0, and
+  WireGuard keeps that entry for a single peer per interface. Point the other
+  devices at '${cur_name:-$cur}' too, or move them off it first."
+    fi
+    printf '%s' "$ip"
+}
+
 list_peers() {
-    local n=0 name flags px
+    local n=0 name ip key flags px gw gwname conf out=''
     while read -r name; do
         [ -n "$name" ] || continue
         n=$((n+1))
         flags=''
-        peer_isolated "$name" && flags='isolated'
+        peer_full_tunnel "$name" || flags='split-tunnel'
+        peer_isolated "$name" && flags="${flags:+$flags, }isolated"
+        gw=$(peer_gateway "$name")
+        if [ -n "$gw" ]; then
+            gwname=$(peer_by_ip "$gw")
+            flags="${flags:+$flags, }via ${gwname:-$gw}"
+        fi
         px=$(peer_proxy "$name")
         [ -n "$px" ] && flags="${flags:+$flags, }proxy $px"
-        printf '  %-22s %-14s %-34s %s\n' "$name" "$(peer_ip "$name")" \
-            "$([ -f "$CLIENTDIR/$name.conf" ] && echo "$CLIENTDIR/$name.conf" || echo '(conf missing)')" \
-            "$flags"
+        conf="$CLIENTDIR/$name.conf"
+        [ -f "$conf" ] || conf='(conf missing)'
+        # A hand-edited block with no AllowedIPs has no address to sort on;
+        # sort it first rather than letting ip2int fail and kill the menu.
+        ip=$(peer_ip "$name")
+        key=0; [ -n "$ip" ] && key=$(ip2int "$ip")
+        out+="$key"$'\t'"$(printf '  %-22s %-14s %-34s %s' "$name" "$ip" "$conf" "$flags")"$'\n'
     done < <(peer_names)
-    [ "$n" -gt 0 ] || info "(no devices yet)"
+    if [ "$n" -gt 0 ]; then
+        printf '%s' "$out" | sort -n -k1,1 | cut -f2-
+    else
+        info "(no devices yet)"
+    fi
 }
 
 # Next address = highest currently-assigned host + 1
@@ -633,6 +876,10 @@ do_install() {
 [Interface]
 Address    = $SERVER_IP/$PREFIX, ${V6_NET}1/64
 ListenPort = $PORT
+# Keep wg-quick from turning a gateway peer's 0.0.0.0/0 into a default route
+# here — see ensure_table_off. Every route it would add is already covered by
+# the addresses above.
+Table      = off
 # The private key deliberately does not live in this file:
 PostUp     = wg set %i private-key $KEYDIR/server.key
 # Re-applies the firewall rules on every interface-up, so they survive reboots
@@ -662,19 +909,33 @@ EOF
 # ------------------------------------------------------------ add / remove ---
 
 write_client_conf() {  # write_client_conf <name> <ipv4>
-    local name=$1 ip=$2 conf
+    local name=$1 ip=$2 conf ftun=yes
     conf="$CLIENTDIR/$name.conf"
+    peer_full_tunnel "$name" || ftun=no
 
     {
         printf '# %s — generated %s\n'  "$name" "$(date -u '+%Y-%m-%d %H:%M UTC')"
         printf '[Interface]\n'
         printf 'PrivateKey = %s\n'      "$(cat "$KEYDIR/$name.key")"
-        printf 'Address    = %s/32, %s/128\n' "$ip" "$(v6_for "$ip")"
-        if [ -n "$CLIENT_DNS" ]; then printf 'DNS        = %s\n' "$CLIENT_DNS"; fi
+        # The tunnel address carries the SUBNET prefix, not /32, so the client
+        # gets an on-link route for the whole tunnel range and can reach the
+        # other devices whatever AllowedIPs says. With /32 a split-tunnel client
+        # has an address on the subnet and no route to it.
+        printf 'Address    = %s/%s, %s/128\n' "$ip" "$PREFIX" "$(v6_for "$ip")"
+        # A split-tunnel device keeps using its own resolver: pushing one here
+        # would hijack all of its DNS while most of its traffic stays off the
+        # tunnel, breaking local/corporate names for no gain.
+        if [ -n "$CLIENT_DNS" ] && [ "$ftun" = yes ]; then
+            printf 'DNS        = %s\n' "$CLIENT_DNS"
+        fi
         printf '\n[Peer]\n'
         printf 'PublicKey  = %s\n'      "$(cat "$KEYDIR/server.pub")"
         printf 'Endpoint   = %s:%s\n'   "$ENDPOINT" "$PORT"
-        printf 'AllowedIPs = 0.0.0.0/0, ::/0\n'
+        if [ "$ftun" = yes ]; then
+            printf 'AllowedIPs = 0.0.0.0/0, ::/0\n'
+        else
+            printf 'AllowedIPs = %s\n'  "$SUBNET"
+        fi
         printf 'PersistentKeepalive = 25\n'
         if [ -n "$ALT_PORTS" ]; then
             printf '\n# If udp/%s is blocked on the network you are on, edit the\n' "$PORT"
@@ -867,7 +1128,10 @@ show_linux() {  # show_linux <name>
     printf 'WG_NAME=%s\n'   "$tun"
     printf "NM_NAME='%s'\n" "$nmid"
     printf 'WG_UUID=%s\n'   "$uuid"
-    printf "SRV_IP='%s'\n\n" "$ENDPOINT"
+    printf "SRV_IP='%s'\n"  "$ENDPOINT"
+    printf 'WG_FULL=%s\n'   "$(peer_full_tunnel "$name" && echo yes || echo no)"
+    printf "WG_NET='%s'\n"  "$SUBNET"
+    printf "WG_GW='%s'\n\n" "$SERVER_IP"
     cat <<'PART'
 if ! command -v wg >/dev/null 2>&1; then
   if   command -v apt-get >/dev/null 2>&1; then sudo apt-get update -qq && sudo apt-get install -y wireguard-tools
@@ -950,15 +1214,112 @@ fi
 printf '\n   2) Terminal    sudo wg-quick up   %s\n' "$WG_NAME"
 printf '                  sudo wg-quick down %s\n' "$WG_NAME"
 printf '\n   Check         sudo wg show          (expect a recent handshake)\n'
-printf '                 curl -4 ifconfig.me   (should print %s)\n' "$SRV_IP"
+if [ "$WG_FULL" = yes ]; then
+  printf '                 curl -4 ifconfig.me   (should print %s)\n' "$SRV_IP"
+else
+  printf '                 ip route get %s   (should say "dev %s")\n' "$WG_GW" "$WG_NAME"
+  printf '\n   Split tunnel: only %s goes through the VPN. Your public IP\n' "$WG_NET"
+  printf '                 and everything else are unchanged.\n'
+fi
 printf '\n   Use one or the other, not both at the same time.\n\n'
 PART
     printf '#---------------------- to here ---------------------------\n'
 }
 
+# What the gateway device itself has to do. Its WireGuard config is NOT part of
+# it — the server-side change is enough for the traffic to arrive. What is
+# missing is plain Linux routing:
+#
+#   * ip_forward, or the kernel drops anything not addressed to it;
+#   * MASQUERADE, which is the one people leave out. Packets arrive with the
+#     ORIGINAL client source (10.8.0.x) on purpose, so the gateway can NAT them
+#     to its own address. Without it they go out with a private source and the
+#     replies are dropped somewhere on the internet — the tunnel looks up, the
+#     handshake is fine, and nothing loads;
+#   * explicit FORWARD accepts, because the policy is DROP on any host that has
+#     run Docker, and on plenty of hardened images.
+show_gateway() {  # show_gateway <name>
+    local name=$1
+    head1 "Set up '$name' as the gateway"
+    printf '\nRun this ON %s. Nothing about its WireGuard config changes — this\n' "$name"
+    printf 'is just Linux routing, which it does not do by default.\n\n'
+    printf '#--------------------- copy from here ---------------------\n'
+    cat <<EOF
+WGIF=\$(sudo wg show interfaces | awk '{print \$1}')
+test -n "\$WGIF" || echo '!! no wireguard interface is up here'
+
+sudo tee /etc/sysctl.d/99-simplewire-gateway.conf >/dev/null <<SYSCTL
+net.ipv4.ip_forward=1
+# Strict reverse-path filtering drops forwarded tunnel traffic with no log and
+# no counter, because the route back to $SUBNET is not the interface the
+# reply would leave by. Loose (2) still rejects genuinely unroutable sources.
+# The kernel takes max(all, <iface>), so both have to come down.
+net.ipv4.conf.all.rp_filter=2
+net.ipv4.conf.default.rp_filter=2
+SYSCTL
+sudo sysctl -q --system
+sudo sysctl -qw "net.ipv4.conf.\$WGIF.rp_filter=2"
+
+# NAT everything from the tunnel that is NOT heading back into the tunnel.
+# Matching on "not the tunnel" rather than on a guessed WAN name keeps working
+# on a laptop that moves between ethernet, wifi and a phone hotspot.
+sudo iptables -t nat -A POSTROUTING -s $SUBNET ! -o "\$WGIF" -j MASQUERADE
+sudo iptables -A FORWARD -i "\$WGIF" ! -o "\$WGIF" -s $SUBNET -j ACCEPT
+sudo iptables -A FORWARD -o "\$WGIF" -d $SUBNET -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+# If this machine's own default route is the VPN, forwarding hands the traffic
+# straight back to the server, which sends it here again. Break the loop loudly
+# rather than letting it ping-pong until the TTL runs out.
+sudo iptables -A FORWARD -i "\$WGIF" -o "\$WGIF" -s $SUBNET ! -d $SUBNET -j REJECT
+
+# Where would a forwarded packet from the tunnel actually go? Any interface
+# other than \$WGIF is fine. If it says "dev \$WGIF", see the note below.
+ip route get 8.8.8.8 from ${SUBNET%/*} iif "\$WGIF" 2>&1 | head -1
+EOF
+    printf '#---------------------- to here ---------------------------\n'
+    printf '\n  The last line is the check: it asks the kernel where a packet from\n'
+    printf '  the tunnel would actually go. If it answers with the tunnel\n'
+    printf '  interface again, %s is full-tunnel and its own default route is\n' "$name"
+    printf '  this server — traffic would loop, and the REJECT above stops it.\n'
+    printf '  Make it split-tunnel with option 7 and re-import it.\n'
+    printf '\n  Any OTHER interface is fine, including one belonging to a second\n'
+    printf '  VPN (nordlynx, tun0, ...). That is worth knowing rather than\n'
+    printf '  debugging later: the routed devices then come out of THAT VPN, so\n'
+    printf '  the chain is device -> this server -> %s -> its VPN -> internet.\n' "$name"
+    printf '\n  The iptables lines are not persistent. Re-run them after a reboot,\n'
+    printf '  or save them with whatever your distro uses (iptables-persistent,\n'
+    printf '  iptables-save > /etc/iptables/iptables.rules, ...). The sysctl ones\n'
+    printf '  are — that is what the tee is for.\n'
+    printf '\n  Note this makes %s a trusted device: to route for others it\n' "$name"
+    printf '  holds 0.0.0.0/0 here, which also means this server now accepts any\n'
+    printf '  source address from it, not just its own.\n'
+}
+
+# The DNAT lands the traffic on the proxy machine, but that machine's own
+# firewall still has to accept it, and a Burp box is exactly the kind of laptop
+# that has one. Printed rather than applied: it is a different machine.
+show_proxy_open() {  # show_proxy_open <proxy-ip:port> <device-name> <device-ip>
+    # Declared before assigning: `local a=$1 b=${a%%:*}` shadows a before b is
+    # computed, so b comes out empty. resolve_proxy splits them for the same reason.
+    local px=$1 dev=$2 devip=$3 host port who
+    host=${px%%:*}; port=${px##*:}
+    who=$(peer_by_ip "$host")
+    printf '\n  If %s does not answer on %s, its firewall is the usual reason.\n' \
+        "${who:-the machine at $host}" "$port"
+    printf '  Run this there:\n\n'
+    # The DNAT rewrites the destination, not the source, so packets reach the
+    # proxy still carrying the device's own tunnel address — which makes the
+    # rule exact instead of opening the port to the whole VPN.
+    printf '    sudo iptables -I INPUT 1 -s %s -p tcp --dport %s -j ACCEPT\n\n' "$devip" "$port"
+    printf '  That is %s only. Proxying another device to the same proxy needs\n' "$dev"
+    printf '  the same line again with its address — this option prints it.\n'
+    printf '  The proxy also has to BIND to %s or 0.0.0.0; on 127.0.0.1 it is\n' "$host"
+    printf '  unreachable from the tunnel however the firewall is set.\n'
+}
+
 do_add() {
     head1 "Add a device"
-    local name ip def want cur reach=no proxy=''
+    local name ip def want cur reach=no proxy='' ftun=no gw='' gwname=''
 
     name=$(ask "Device name (letters, digits, - and _)")
     valid_name "$name"
@@ -978,6 +1339,25 @@ do_add() {
     [ "$cur" -gt "$(ip2int "$SERVER_IP")" ] && [ "$cur" -le "$MAX_HOST" ] \
         || die "$ip is outside the usable range of $SUBNET"
     if used_ips | grep -qxF -- "$ip"; then die "$ip is already assigned"; fi
+
+    printf '\n  A device can send ALL its traffic through this server (a real VPN:\n'
+    printf '  its public IP becomes %s), or only traffic to %s,\n' "$ENDPOINT" "$SUBNET"
+    printf '  leaving its normal internet connection alone (split tunnel — for a\n'
+    printf '  device you only want on the private network).\n'
+    confirm_yes "  Route all of '$name' traffic through the VPN?" && ftun=yes
+
+    # Only offered for a full-tunnel device: a custom gateway changes where the
+    # traffic in the tunnel comes out, and a split-tunnel device does not put
+    # its internet traffic in the tunnel in the first place.
+    if [ "$ftun" = yes ] && [ -n "$(peer_names)" ]; then
+        printf '\n  That traffic leaves through this server by default. It can leave\n'
+        printf '  through another device on the VPN instead — so %s appears\n' "$name"
+        printf '  to be browsing from that device rather than from here.\n'
+        if confirm "  Send '$name' out through another device?"; then
+            gw=$(resolve_gateway "$(ask "  Gateway (device name, or IP)" "")" "$ip")
+            gwname=$(peer_by_ip "$gw")
+        fi
+    fi
 
     printf '\n  Every device is on the same tunnel subnet, so by default it can\n'
     printf '  reach the others (file shares, SSH, dev servers on 0.0.0.0...).\n'
@@ -1006,28 +1386,46 @@ do_add() {
 ### BEGIN peer $name
 [Peer]
 # $name
-# reach-peers = $reach${proxy:+
+# full-tunnel = $ftun
+# reach-peers = $reach${gw:+
+# gateway = $gw}${proxy:+
 # proxy = $proxy}
 PublicKey  = $(cat "$KEYDIR/$name.pub")
 AllowedIPs = $ip/32, $(v6_for "$ip")/128
 ### END peer $name
 EOF
 
-    reload_wg
-    apply_rules add          # picks up this device's isolation rules, if any
+    sync_gateway_routes      # reloads wg; widens the gateway peer if there is one
+    apply_rules add          # picks up this device's isolation and gateway rules
     write_client_conf "$name" "$ip" >/dev/null
     info "added '$name' at $ip$([ "$reach" = no ] && printf ', cannot open connections to the other devices' || true)"
     show_client "$name"
+    [ -n "$proxy" ] && show_proxy_open "$proxy" "$name" "$ip"
+    if [ -n "$gw" ]; then
+        info "'$name' exits through '${gwname:-$gw}', which must be set up to forward:"
+        show_gateway "${gwname:-$gw}"
+    fi
 }
 
 do_remove() {
     head1 "Remove a device"
     list_peers
-    local name
+    local name gwip orphans=''
     name=$(ask "Device to remove")
     [ -n "$name" ] || return 0
     valid_name "$name"
     peer_exists "$name" || die "no such device: $name"
+
+    # Removing the gateway would leave everything routed through it pointing at
+    # an address that is no longer a peer, which blackholes their traffic
+    # silently. Say so first, and drop the markers along with the device.
+    gwip=$(peer_ip "$name")
+    orphans=$(gateway_users | awk -v g="$gwip" '$2 == g {print $1}')
+    if [ -n "$orphans" ]; then
+        info "'$name' is the gateway for: $(printf '%s' "$orphans" | tr '\n' ' ')"
+        info "they will go back to leaving through this server"
+    fi
+
     confirm "Really remove '$name' and delete its keys?" || { info "aborted"; return 0; }
 
     # The rule set is derived from the peer list, so tear it down while this
@@ -1035,17 +1433,17 @@ do_remove() {
     # orphaned in the chain — then rebuild from the trimmed one.
     apply_rules del
 
-    awk -v w="$name" '
+    awk -v w="$name" -v g="# gateway = $gwip" '
         $0 == "### BEGIN peer " w { skip=1 }
-        !skip { print }
+        !skip && $0 != g { print }
         $0 == "### END peer " w   { skip=0 }
     ' "$WG_CONF" > "$WG_CONF.new"
     mv "$WG_CONF.new" "$WG_CONF"
     chmod 600 "$WG_CONF"
 
     rm -f "$KEYDIR/$name.key" "$KEYDIR/$name.pub" "$CLIENTDIR/$name.conf"
+    sync_gateway_routes      # reloads wg; narrows the peer that just lost the role
     apply_rules add
-    reload_wg
     info "removed '$name'"
 }
 
@@ -1096,6 +1494,117 @@ do_isolate() {
     info "existing connections keep their old path until they are re-established"
 }
 
+# Two halves, because AllowedIPs is a client-side routing decision the protocol
+# cannot push:
+#   * the .conf here is rewritten, and the device has to be re-imported (option 3
+#     or 4) before it stops SENDING its internet traffic into the tunnel;
+#   * the firewall rule takes effect immediately, so the server stops CARRYING
+#     it either way. That half needs nothing from the client, which is what makes
+#     the setting enforceable rather than advisory.
+do_route() {
+    head1 "Default gateway"
+    list_peers
+    local name cur new=no ip mine gwcur gwnew='' gwname
+    name=$(ask "Device")
+    [ -n "$name" ] || return 0
+    valid_name "$name"
+    peer_exists "$name" || die "no such device: $name"
+    mine=$(peer_ip "$name")
+
+    if peer_full_tunnel "$name"; then cur=yes; else cur=no; fi
+    gwcur=$(peer_gateway "$name")
+    if [ "$cur" = yes ]; then
+        if [ -n "$gwcur" ]; then
+            gwname=$(peer_by_ip "$gwcur")
+            info "currently: all of '$name' traffic goes through the VPN, leaving via '${gwname:-$gwcur}'"
+        else
+            info "currently: all of '$name' traffic goes through the VPN, leaving via this server"
+        fi
+        confirm_yes "Route all of '$name' traffic through the VPN?" && new=yes
+    else
+        info "currently: '$name' only routes $SUBNET through the VPN"
+        confirm     "Route all of '$name' traffic through the VPN?" && new=yes
+    fi
+
+    # Where it comes OUT is a second question, and only has an answer while the
+    # traffic is in the tunnel at all. A device turned split-tunnel loses its
+    # gateway along with it, since there is nothing left to route.
+    if [ "$new" = yes ]; then
+        printf '\n  It can leave through this server, or through another device on\n'
+        printf '  the VPN — so it appears to be browsing from that device.\n'
+        if [ -n "$gwcur" ]; then
+            gwname=$(peer_by_ip "$gwcur")
+            if confirm_yes "  Keep sending '$name' out through '${gwname:-$gwcur}'?"; then
+                gwnew=$(resolve_gateway "$(ask "  Gateway (device name, or IP)" "${gwname:-$gwcur}")" "$mine")
+            fi
+        elif confirm "  Send '$name' out through another device?"; then
+            gwnew=$(resolve_gateway "$(ask "  Gateway (device name, or IP)" "")" "$mine")
+        fi
+    fi
+
+    if [ "$new" = "$cur" ] && [ "$gwnew" = "$gwcur" ]; then info "unchanged"; return 0; fi
+
+    if [ "$new" = no ] && [ "$cur" = yes ]; then
+        printf '\n  The server stops forwarding its traffic to the internet as soon\n'
+        printf '  as you confirm, and %s will not fall back to its own\n' "$name"
+        printf '  connection until it has re-imported its config — so it loses\n'
+        printf '  internet in between. Re-import it right after this.\n\n'
+        confirm "  Go ahead?" || { info "aborted"; return 0; }
+    fi
+
+    apply_rules del          # built from the old markers; see do_remove
+    # Always writes both markers, so devices added before these options existed —
+    # which carry neither — get them rather than staying unmanaged.
+    awk -v w="$name" -v val="$new" -v gw="$gwnew" '
+        $0 == "### BEGIN peer " w    { f=1 }
+        f && /^# full-tunnel = /     { next }
+        f && /^# gateway = /         { next }
+        f && $0 == "### END peer " w {
+            print "# full-tunnel = " val
+            if (gw != "") print "# gateway = " gw
+            f=0
+        }
+        { print }
+    ' "$WG_CONF" > "$WG_CONF.new"
+    mv "$WG_CONF.new" "$WG_CONF"
+    chmod 600 "$WG_CONF"
+    sync_gateway_routes      # reloads wg; moves 0.0.0.0/0 to whoever holds the role now
+    apply_rules add
+
+    if [ ! -f "$KEYDIR/$name.key" ]; then
+        die "'$name' is now full-tunnel=$new, but its private key is gone —
+  its config cannot be rebuilt. Remove and re-add the device."
+    fi
+    ip=$(peer_ip "$name")
+    write_client_conf "$name" "$ip" >/dev/null
+
+    if [ "$new" = yes ]; then
+        info "'$name' now uses the VPN as its default gateway"
+        if [ -n "$gwnew" ]; then
+            gwname=$(peer_by_ip "$gwnew")
+            info "its traffic now leaves through '${gwname:-$gwnew}', in effect immediately"
+            info "nothing on '$name' needs to change for that — the routing is all done here"
+        else
+            info "the server forwards its traffic to the internet again"
+        fi
+    else
+        info "'$name' now routes only $SUBNET through the VPN"
+        info "the server rejects its traffic to the internet as of now, re-imported or not"
+        info "$SUBNET, this server and any proxy on the VPN stay reachable"
+        [ -n "$gwcur" ] && info "it no longer exits through another device — there is nothing left to route"
+        [ -n "$CLIENT_DNS" ] && info "the pushed DNS ($CLIENT_DNS) is dropped from its config — see option 8"
+    fi
+    if [ "$new" = "$cur" ]; then
+        info "the tunnel setting itself did not change, so there is nothing to re-import"
+    else
+        info "re-import it (option 3 for the QR, option 4 for the Linux block) to take effect there"
+    fi
+    if [ -n "$gwnew" ] && [ "$gwnew" != "$gwcur" ]; then
+        gwname=$(peer_by_ip "$gwnew")
+        show_gateway "${gwname:-$gwnew}"
+    fi
+}
+
 # Toggling the proxy is the thing you do constantly while testing, so it has to
 # work without regenerating the device's keys and re-pairing it.
 do_proxy() {
@@ -1136,6 +1645,30 @@ do_proxy() {
         info "'$name' is no longer proxied"
     fi
     info "existing connections keep their old path until they are re-established"
+    [ -n "$new" ] && show_proxy_open "$new" "$name" "$(peer_ip "$name")"
+    return 0
+}
+
+# Regenerate every client .conf from the current state and per-peer markers.
+# Needed after anything that changes what goes INTO those files: the DNS option,
+# and — because the generator itself can change — after upgrading this script.
+# That second case is what `simplewire --rebuild-clients` is for. Server keys and
+# the [Peer] blocks in wg0.conf are untouched, so the tunnel keeps running and no
+# device has to be re-paired; they only have to re-import.
+# Sets REBUILT to the number of configs written.
+rebuild_confs() {
+    local name ip
+    REBUILT=0
+    while read -r name; do
+        [ -n "$name" ] || continue
+        if [ ! -f "$KEYDIR/$name.key" ]; then
+            info "skipped '$name' — its private key is gone, cannot rebuild its config"
+            continue
+        fi
+        ip=$(peer_ip "$name")
+        write_client_conf "$name" "$ip" >/dev/null
+        REBUILT=$((REBUILT+1))
+    done < <(peer_names)
 }
 
 # DNS lives in the CLIENT config, so this only changes what the .conf files on
@@ -1149,7 +1682,7 @@ do_dns() {
     printf '  keeps its old resolver until you re-import it (option 3 for the QR,\n'
     printf '  option 4 for the Linux block).\n\n'
 
-    local dns n=0 name ip
+    local dns
     dns=$(ask "DNS pushed to clients (or 'none')" "${CLIENT_DNS:-none}")
     if [ "$dns" = "none" ]; then dns=""; fi
     [ -z "$dns" ] || [[ $dns =~ ^[0-9a-fA-F.:,\ ]+$ ]] || die "DNS must be IP addresses: $dns"
@@ -1157,20 +1690,11 @@ do_dns() {
 
     CLIENT_DNS=$dns
     write_state
+    rebuild_confs
 
-    while read -r name; do
-        [ -n "$name" ] || continue
-        if [ ! -f "$KEYDIR/$name.key" ]; then
-            info "skipped '$name' — its private key is gone, cannot rebuild its config"
-            continue
-        fi
-        ip=$(peer_ip "$name")
-        write_client_conf "$name" "$ip" >/dev/null
-        n=$((n+1))
-    done < <(peer_names)
-
-    info "DNS is now ${CLIENT_DNS:-none}; rebuilt $n client config(s)"
-    if [ "$n" -gt 0 ]; then
+    info "DNS is now ${CLIENT_DNS:-none}; rebuilt $REBUILT client config(s)"
+    info "split-tunnel devices keep their own resolver — they get no DNS line"
+    if [ "$REBUILT" -gt 0 ]; then
         info "re-import each device (option 3 or 4) before it takes effect there"
     fi
 }
@@ -1213,6 +1737,12 @@ do_status() {
     printf '\nFirewall rules tagged "%s":\n' "$TAG"
     { iptables-save; ip6tables-save 2>/dev/null || true; } \
         | grep -- "$TAG" | sed 's/^/  /' || info "  (none)"
+    if [ -n "$(gateway_users)" ]; then
+        printf '\nPolicy routing for devices exiting through another device:\n'
+        ip rule show | grep -- "lookup $GW_TABLE" | sed 's/^/  /' || info "  (no ip rules!)"
+        ip route show table "$GW_TABLE" 2>/dev/null | sed "s/^/  table $GW_TABLE: /" \
+            || info "  (table $GW_TABLE is empty!)"
+    fi
 }
 
 # -------------------------------------------------------------------- menu ---
@@ -1227,8 +1757,9 @@ menu_installed() {
         printf '  4) Show paste-and-run setup    (Linux)\n'
         printf '  5) Device isolation            (reach other devices?)\n'
         printf '  6) Proxy for a device          (Burp / mitmproxy)\n'
-        printf '  7) DNS pushed to clients\n'
-        printf '  8) Status\n  9) Uninstall server\n  q) Quit\n\n'
+        printf '  7) Default gateway             (all traffic? and out through whom?)\n'
+        printf '  8) DNS pushed to clients\n'
+        printf '  9) Status\n 10) Uninstall server\n  q) Quit\n\n'
         local choice
         choice=$(ask "Choice" "q")
         case $choice in
@@ -1238,9 +1769,10 @@ menu_installed() {
             4) local m; m=$(ask "Device name"); if [ -n "$m" ]; then show_linux  "$m"; fi ;;
             5) do_isolate ;;
             6) do_proxy ;;
-            7) do_dns ;;
-            8) do_status ;;
-            9) do_uninstall; return 0 ;;
+            7) do_route ;;
+            8) do_dns ;;
+            9) do_status ;;
+            10) do_uninstall; return 0 ;;
             q|Q) return 0 ;;
             *) info "no such option" ;;
         esac
@@ -1257,6 +1789,19 @@ main() {
         is_installed || die "not installed — no $STATE"
         load_state
         apply_rules add
+        return 0
+    fi
+
+    # Rewrite every client .conf with the current generator. Run this after
+    # dropping in a new version of this script: the configs on disk were written
+    # by the old one and are not regenerated by anything else. Non-interactive
+    # and safe to repeat — it changes no keys and does not touch the interface.
+    if [ "${1-}" = --rebuild-clients ]; then
+        is_installed || die "not installed — no $STATE"
+        load_state
+        rebuild_confs
+        info "rebuilt $REBUILT client config(s) in $CLIENTDIR"
+        info "re-import each device (menu option 3 or 4) before it changes there"
         return 0
     fi
 
