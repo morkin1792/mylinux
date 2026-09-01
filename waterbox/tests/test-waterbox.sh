@@ -57,6 +57,8 @@ if command -v zsh >/dev/null 2>&1; then
 else
     skip_test "generated zshrc syntax (zsh unavailable)"
 fi
+assert_has "$(cat "$TMP/zshrc")" 'known_marketplaces.json' \
+    "zshrc self-heals pre-1.9 marketplace installLocation paths"
 
 extract "cat <<'AGENTENV_HEAD'" '^AGENTENV_HEAD$' "$TMP/agent-head.zsh"
 extract "cat <<'AGENTENV'" '^AGENTENV$' "$TMP/agent-body.zsh"
@@ -597,6 +599,16 @@ assert_has "$(grep -A40 'del|detach)' "$WB")" "it remains shared" \
 assert_has "$(grep -F -A8 'if [ "$keep_shares" != 1 ]; then' "$WB")" \
     ': > "$PENDING_SHARE_LIST"' "reset pending-share cleanup"
 ok "primary isolation, device, namespace, resource, and share-mount invariants"
+
+# USB sharing is opt-in: the flag must reach the helper, the raw-usbfs bind and
+# its DeviceAllow must exist only inside the usb branch of the full boot path,
+# a failed access grant must stop the box, and stop must revoke the host ACLs.
+assert_has "$(grep -A30 'local boot_args=(boot)' "$WB")" '--usb' "usb boot flag plumbed"
+assert_eq 1 "$(grep -c -- '--bind=/dev/bus/usb' "$TMP/helper.bash")" "raw usbfs bind count"
+assert_eq 1 "$(grep -c -- 'char-usb_device rw' "$TMP/helper.bash")" "usb DeviceAllow count"
+assert_has "$(grep -A3 'usb_grant; then' "$TMP/helper.bash")" 'power_off' "failed usb grant stops the box"
+assert_has "$(grep -A2 '^power_off()' "$TMP/helper.bash")" 'usb_revoke' "stop revokes usb ACLs"
+ok "usb sharing stays opt-in, helper-validated, and cleaned up on stop"
 
 # Missing readiness may trigger an automatic retry only with Waterbox's separate
 # host marker; deleting the in-box marker alone must never authorize a wipe.

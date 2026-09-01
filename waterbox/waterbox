@@ -4,7 +4,7 @@
 
 set -e
 
-WATERBOX_VERSION="1.15"
+WATERBOX_VERSION="1.16"
 
 # Absolute path to this script, recorded so the shell-completion snippet can fall
 # back to it when 'waterbox' isn't on $PATH (e.g. run by ./waterbox, or moved).
@@ -171,6 +171,11 @@ EOF
 # GPU (/dev/dri) is shared, not exclusive, so it's bound by default; --no-gpu off.
 WATERBOX_GUI="${WATERBOX_GUI:-auto}"
 WATERBOX_NO_GPU="${WATERBOX_NO_GPU:-0}"
+# USB: off by default because it hands the box raw access to EVERY attached USB
+# device (reflash a dongle, talk to a security key, …). --usb binds /dev/bus/usb
+# (raw usbfs — adb, dfu-util, any libusb tool) plus ttyUSB/ttyACM serial nodes
+# present at boot. Devices stay shared with the host, not moved into the box.
+WATERBOX_USB="${WATERBOX_USB:-0}"
 WATERBOX_HERE=0                       # CLI-only: `start --here` shares cwd + opens there
 WATERBOX_X11="${WATERBOX_X11:-0}"     # explicit opt-in to X11/Xwayland on a Wayland host
 # Deliberately NOT configurable through the environment or a saved config file.
@@ -329,7 +334,7 @@ ${C_HEAD}waterbox v$WATERBOX_VERSION${C_OFF} — isolated Arch sandbox (systemd-
 AI agents in bypass mode without exposing your machine. Ships with Claude Code
 and Codex; inside the box, run ${C_CMD}claude${C_OFF} or ${C_CMD}codex${C_OFF}.
 
-${C_HEAD}Usage:${C_OFF} ${C_CMD}waterbox${C_OFF} [command] [args] [--gui|--no-gui|--x11] [--no-gpu]
+${C_HEAD}Usage:${C_OFF} ${C_CMD}waterbox${C_OFF} [command] [args] [--gui|--no-gui|--x11] [--no-gpu] [--usb]
   Bare '${C_CMD}waterbox${C_OFF}' boots the box and attaches.   ${C_DIM}Ctrl-b d = detach · exit = end session${C_OFF}
 
 ${C_HEAD}Box${C_OFF}
@@ -376,7 +381,7 @@ EOF
 # top-level help stays short and points here.
 help_start() {
     cat <<EOF
-${C_HEAD}Usage:${C_OFF} ${C_CMD}waterbox start${C_OFF} [<session> | --here] [--gui|--no-gui|--x11] [--no-gpu]
+${C_HEAD}Usage:${C_OFF} ${C_CMD}waterbox start${C_OFF} [<session> | --here] [--gui|--no-gui|--x11] [--no-gpu] [--usb]
 
 Boot the box if it isn't already up, then attach to a tmux session inside it. This
 is the default command, so a bare '${C_CMD}waterbox${C_OFF}' does exactly the same thing. Sessions
@@ -395,6 +400,12 @@ outlive your terminal: ${C_CMD}Ctrl-b d${C_OFF} detaches (it keeps running), '${
   ${C_CMD}--x11${C_OFF}             Also expose X11/Xwayland. On Wayland this is deliberately
                      separate from --gui because X11 can observe/control other X clients.
   ${C_CMD}--no-gpu${C_OFF}           Don't bind /dev/dri into the box.
+  ${C_CMD}--usb${C_OFF}              Share USB with the box: /dev/bus/usb (adb, dfu-util and other
+                     libusb tools) plus ttyUSB/ttyACM serial ports present at boot.
+                     Devices stay usable on the host at the same time. SECURITY:
+                     the box gets raw access to EVERY attached USB device — it
+                     could reflash a dongle or talk to a plugged-in security key.
+                     Serial ports plugged in later need 'waterbox restart --usb'.
 
 ${C_HEAD}GUI apps: ON by default on Wayland, OFF by default on X11${C_OFF}
 Forwarding the display into the box lets an agent open a browser or any GUI app
@@ -849,6 +860,19 @@ bindkey '^U' backward-kill-line
 
 eval "$(oh-my-posh init zsh --config blue-owl)"
 export PATH="$HOME/.local/bin:$PATH"
+
+# Claude Code records absolute installLocation paths in known_marketplaces.json.
+# The 1.9 layout migration moved ~/.claude-env to ~/.agent-env/claude without
+# rewriting those strings, and newer Claude Code refuses to refresh a marketplace
+# whose recorded path is outside the real config root (the compat symlink does
+# not help — it compares strings). Self-heal before anything launches claude;
+# a no-op once every record uses the new layout.
+for _wb_mk in "$HOME"/.agent-env/claude/*/plugins/known_marketplaces.json(N.); do
+    if grep -qF "$HOME/.claude-env/" "$_wb_mk" 2>/dev/null; then
+        sed -i "s|$HOME/\\.claude-env/|$HOME/.agent-env/claude/|g" "$_wb_mk" 2>/dev/null || true
+    fi
+done
+unset _wb_mk
 
 # Enable the completion system so agent-env (and others) get Tab-completion.
 autoload -Uz compinit && compinit -u
@@ -2832,6 +2856,10 @@ start_sandbox() {
         log_info "Sandbox already running, attaching..."
         [ "$WATERBOX_GUI" = "1" ] && [ ! -s "$GUI_BINDS_FILE" ] \
             && log_warn "GUI binds are set at boot — 'waterbox restart --gui' to enable them."
+        if [ "$WATERBOX_USB" = "1" ] \
+           && ! systemctl show "$MACHINE_NAME.service" -p DeviceAllow 2>/dev/null | grep -q 'usb_device'; then
+            log_warn "USB binds are set at boot — 'waterbox restart --usb' to enable them."
+        fi
         # Re-assert the fixed veth/firewall setup as well as DNS on every attach.
         # Firewall managers can reload while the box stays up; reporting a usable
         # session while its forwarding rules are gone is a misleading success.
@@ -2863,6 +2891,12 @@ start_sandbox() {
         local boot_args=(boot)
         [ "$WATERBOX_GUI" = "1" ] && boot_args+=(--gui)
         [ "$WATERBOX_NO_GPU" = "1" ] && boot_args+=(--no-gpu)
+        if [ "$WATERBOX_USB" = "1" ]; then
+            command -v setfacl >/dev/null 2>&1 \
+                || log_error "--usb needs setfacl (package 'acl') to grant the box access to device nodes."
+            log_warn "--usb: the box gets raw access to EVERY attached USB device — it could reflash a dongle or talk to a plugged-in security key."
+            boot_args+=(--usb)
+        fi
         [ "$WATERBOX_UNSAFE_HOST_ROOT" = "1" ] && boot_args+=(--unsafe-host-root)
         local boot_output="" boot_rc=0 failed_b64="" failed_share=""
         local share_retries=0
@@ -3808,7 +3842,56 @@ boot_min() {
     fi
     sleep 3   # let networkd bring host0 up inside before we hit the network
 }
+# --- USB sharing (--usb) --------------------------------------------------------
+# Bind-mounted device nodes are the same inode on both sides, so the host keeps
+# full use of every shared device. Inside the user namespace the nodes appear
+# owned by an unmapped uid; container uid 1000 can only open them through the
+# permission bits it can satisfy. Grant exactly that: an ACL for the host uid
+# that container uid 1000 maps to (identity in the explicit unsafe mode). The
+# globs are fixed host /dev paths on kernel-managed devtmpfs — no caller input,
+# and the guest cannot plant symlinks there.
+_usb_mapped_uid() {
+    local leader base
+    leader=$(machinectl show "$MACHINE_NAME" -p Leader --value 2>/dev/null)
+    [ -n "$leader" ] && [ "$leader" != 0 ] || return 1
+    read -r _ base _ < "/proc/$leader/uid_map" || return 1
+    echo $((base + 1000))
+}
+usb_grant() {
+    # ponytail: nodes hotplugged while the box runs keep default perms until the
+    # next 'restart --usb'; add a udev hook if live replug ever matters.
+    local uid n granted=0
+    command -v setfacl >/dev/null 2>&1 \
+        || { echo "helper: setfacl not found — install the 'acl' package for --usb" >&2; return 1; }
+    uid=$(_usb_mapped_uid) || return 1
+    for n in /dev/bus/usb/*/* /dev/ttyUSB* /dev/ttyACM*; do
+        [ -c "$n" ] || continue
+        # A device unplugged mid-boot must not abort the whole start; only a
+        # real ACL failure (e.g. noacl mount) on a still-present node is fatal.
+        setfacl -m "u:$uid:rw" "$n" || { [ -c "$n" ] || continue; return 1; }
+        granted=$((granted + 1))
+    done
+    [ "$granted" -gt 0 ] || echo "helper: --usb: no USB device nodes to grant" >&2
+    return 0
+}
+usb_revoke() {
+    # Best-effort: without cleanup a later unrelated container could be picked
+    # into the same uid range and inherit the grant. ACLs also vanish on unplug
+    # or host reboot, so failures here are not fatal.
+    local uid n
+    running || return 0
+    uid=$(_usb_mapped_uid 2>/dev/null) || return 0
+    # Identity map (unsafe mode): uid 1000 is normally the real host user — leave
+    # that user's own device ACLs alone.
+    [ "$uid" != 1000 ] || return 0
+    command -v setfacl >/dev/null 2>&1 || return 0
+    for n in /dev/bus/usb/*/* /dev/ttyUSB* /dev/ttyACM*; do
+        [ -c "$n" ] || continue
+        setfacl -x "u:$uid" "$n" 2>/dev/null || true
+    done
+}
 power_off() {
+    usb_revoke || true
     running && machinectl poweroff "$MACHINE_NAME" >/dev/null 2>&1 || true
     local t=120; while [ "$t" -gt 0 ] && running; do sleep 0.25; t=$((t - 1)); done
     if running; then
@@ -4009,7 +4092,7 @@ clear_gui_env() {
     rm -f "$target"
 }
 boot_full() {
-    local gui="$1" nogpu="$2" unsafe="$3"
+    local gui="$1" nogpu="$2" unsafe="$3" usb="$4"
     if running; then
         if [ "$unsafe" = 1 ]; then
             unsafe_unit \
@@ -4056,6 +4139,28 @@ boot_full() {
     if [ "$nogpu" != 1 ] && [ -d /dev/dri ]; then
         gpu+=(--bind=/dev/dri); props+=(--property=DeviceAllow="char-drm rw")
     fi
+    # USB is shared, not moved: the binds are the same device nodes the host keeps
+    # using. Raw usbfs is one live directory bind (hotplugged devices appear, and
+    # char-usb_device covers the whole major); serial nodes are per-device, so
+    # only the ones present now ride along.
+    local usb_dev=() n tty_usb=0 tty_acm=0
+    if [ "$usb" = 1 ]; then
+        if [ -d /dev/bus/usb ]; then
+            usb_dev+=(--bind=/dev/bus/usb)
+            props+=(--property=DeviceAllow="char-usb_device rw")
+        fi
+        for n in /dev/ttyUSB* /dev/ttyACM*; do
+            [ -c "$n" ] || continue
+            usb_dev+=(--bind="$n")
+            case "$n" in /dev/ttyUSB*) tty_usb=1 ;; *) tty_acm=1 ;; esac
+        done
+        if [ "$tty_usb" = 1 ]; then props+=(--property=DeviceAllow="char-ttyUSB rw"); fi
+        if [ "$tty_acm" = 1 ]; then props+=(--property=DeviceAllow="char-ttyACM rw"); fi
+        if [ "${#usb_dev[@]}" -eq 0 ]; then
+            echo "helper: --usb: no USB device nodes found on the host; booting without USB" >&2
+            usb=0
+        fi
+    fi
     _nspawn_supports_raf && raf=(--restrict-address-families="AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET")
     # KillMode=mixed: on stop, SIGTERM reaches nspawn (clean container poweroff),
     # not the container PID 1 (where SIGTERM means reexec, hanging the host).
@@ -4076,7 +4181,8 @@ boot_full() {
             "${userns[@]}" \
             --resolv-conf=off --capability=CAP_NET_ADMIN,CAP_NET_RAW --bind=/dev/net/tun \
             "${raf[@]}" \
-            "${gpu[@]}"
+            "${gpu[@]}" \
+            "${usb_dev[@]}"
     running || { echo "helper: boot failed"; exit 3; }
     if ! mount_collected_shares; then
         echo "helper: a configured share could not be mounted securely; stopping the box" >&2
@@ -4090,6 +4196,11 @@ boot_full() {
     fi
     if ! net_up; then
         echo "helper: could not configure Waterbox networking; stopping the box" >&2
+        power_off || true
+        return 3
+    fi
+    if [ "$usb" = 1 ] && ! usb_grant; then
+        echo "helper: could not grant the box access to USB device nodes; stopping the box" >&2
         power_off || true
         return 3
     fi
@@ -4510,16 +4621,17 @@ case "$verb" in
         ;;
     net-down) net_down ;;
     boot)
-        gui=0; nogpu=0; unsafe=0
+        gui=0; nogpu=0; unsafe=0; usb=0
         for a in "$@"; do
             case "$a" in
                 --gui) gui=1 ;;
                 --no-gpu) nogpu=1 ;;
+                --usb) usb=1 ;;
                 --unsafe-host-root) unsafe=1 ;;
                 *) echo "helper: unknown boot option '$a'" >&2; exit 2 ;;
             esac
         done
-        boot_full "$gui" "$nogpu" "$unsafe"
+        boot_full "$gui" "$nogpu" "$unsafe" "$usb"
         ;;
     status)
         status_color=0
@@ -5828,10 +5940,10 @@ _waterbox() {
         start)
             # `waterbox start <session>` boots (if needed) and attaches that session
             # directly — complete existing live session names, plus the flags.
-            items=(--here --gui --no-gui --x11 --no-gpu ${(f)"$(command waterbox _sessions 2>/dev/null)"})
+            items=(--here --gui --no-gui --x11 --no-gpu --usb ${(f)"$(command waterbox _sessions 2>/dev/null)"})
             compadd -a items ;;
         restart)
-            items=(--gui --no-gui --x11 --no-gpu)
+            items=(--gui --no-gui --x11 --no-gpu --usb)
             compadd -a items ;;
         share)
             if (( CURRENT == 3 )); then items=(add detach list); compadd -a items
@@ -5896,6 +6008,7 @@ while [ $# -gt 0 ]; do
         --no-gui) WATERBOX_GUI=0; CLI_BOOT_FLAG_USED=1; CLI_FLAGS_SEEN+=("$1"); shift ;;
         --x11)    WATERBOX_GUI=1; WATERBOX_X11=1; CLI_BOOT_FLAG_USED=1; CLI_FLAGS_SEEN+=("$1"); shift ;;
         --no-gpu) WATERBOX_NO_GPU=1; CLI_BOOT_FLAG_USED=1; CLI_FLAGS_SEEN+=("$1"); shift ;;
+        --usb)    WATERBOX_USB=1; CLI_BOOT_FLAG_USED=1; CLI_FLAGS_SEEN+=("$1"); shift ;;
         --here)   WATERBOX_HERE=1; CLI_HERE_FLAG_USED=1; CLI_FLAGS_SEEN+=("$1"); shift ;;
         --unsafe-host-root)
             WATERBOX_UNSAFE_HOST_ROOT=1
@@ -5934,18 +6047,18 @@ _cmd="${1:-start}"
 case "$_cmd" in
     start|"")
         [ "$#" -le 2 ] \
-            || log_error "Usage: waterbox start [<session> | --here] [--gui|--no-gui|--x11] [--no-gpu]"
+            || log_error "Usage: waterbox start [<session> | --here] [--gui|--no-gui|--x11] [--no-gpu] [--usb]"
         [ "$CLI_HERE_FLAG_USED" != 1 ] || [ "$#" -lt 2 ] \
             || log_error "--here and an explicit session name are mutually exclusive."
         ;;
     restart)
-        [ "$#" -eq 1 ] || log_error "Usage: waterbox restart [--gui|--no-gui|--x11] [--no-gpu]"
+        [ "$#" -eq 1 ] || log_error "Usage: waterbox restart [--gui|--no-gui|--x11] [--no-gpu] [--usb]"
         [ "$CLI_HERE_FLAG_USED" != 1 ] || log_error "--here is valid with start, not restart."
         ;;
     reset)
         [ "$#" -eq 1 ] || log_error "Usage: waterbox reset"
         [ "$CLI_BOOT_FLAG_USED" != 1 ] && [ "$CLI_HERE_FLAG_USED" != 1 ] \
-            || log_error "Display, GPU, and --here options are not valid with reset."
+            || log_error "Display, GPU, USB, and --here options are not valid with reset."
         ;;
     stop|status|setup|refresh-config|update|version|--version|-v|help|--help|-h|_sessions)
         [ "$#" -eq 1 ] || log_error "Unexpected argument '${2:-}' after '$_cmd'. See 'waterbox --help'."

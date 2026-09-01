@@ -187,6 +187,34 @@ an escape route.
 Avoid desktop-specific policy such as “Cinnamon does X, KDE does Y.” Detect the
 actual socket/protocol or use a universal fallback.
 
+### USB sharing is explicit opt-in and shared, not moved
+
+`--usb` (on `start`/`restart`) binds `/dev/bus/usb` (raw usbfs for libusb tools)
+plus the ttyUSB/ttyACM serial nodes present at boot. The binds are the host's
+own device nodes, so devices remain simultaneously usable on the host;
+concurrency limits are per-device (USB interface claiming, serial port
+contention), not imposed by Waterbox.
+
+Rules for this feature:
+
+- Never enable it by default and never persist it; it applies to the current
+  boot only, like the display flags.
+- `DevicePolicy=closed` stays; USB adds only explicit `DeviceAllow` entries
+  (`char-usb_device`, and `char-ttyUSB`/`char-ttyACM` only when such nodes
+  exist at boot).
+- Inside the user namespace the nodes belong to an unmapped owner, so the
+  helper grants access with an ACL for the host UID that container UID 1000
+  maps to, applied only after a successful boot. A failed grant stops the box.
+- Stop revokes those ACLs (skipped under the identity map of unsafe mode, where
+  UID 1000 is normally the real host user). The globs are fixed host `/dev`
+  paths on kernel-managed devtmpfs; no caller input reaches them.
+- Print a warning when enabling: the box gets raw access to every attached USB
+  device and could reprogram one or talk to a plugged-in security key.
+- Hotplug is partial by design: raw usbfs devices plugged in later appear in
+  the live directory bind but lack the ACL until the next `--usb` boot; serial
+  nodes plugged in later are not bound at all. Do not add udev hooks or a
+  device manager without a new design decision.
+
 ### Clipboard behavior is universal
 
 tmux mouse mode stays enabled everywhere so scrolling and pane interaction work.
@@ -272,6 +300,16 @@ per-account preference remains respected.
 Claude Code also defaults to the Opus model with `"effortLevel": "high"`. Existing
 profiles matching Waterbox’s former exact default of Opus + `xhigh` are migrated
 to Opus + `high`; other explicit model/effort combinations are preserved.
+
+Claude Code stores absolute `installLocation` paths in each profile's
+`plugins/known_marketplaces.json`. The pre-1.9 → 1.9 layout migration moved the
+files but historically not those strings, and Claude Code rejects a marketplace
+whose recorded path is outside the real config root (it compares strings, so
+the `~/.claude-env` compat symlink does not help). The generated zshrc contains
+an idempotent guest-side self-heal that rewrites stale `~/.claude-env/` prefixes
+in that file before any interactive `claude` launch. Keep it guest-side: a
+host-root rewrite of this guest-controlled file would need the full jail-write
+discipline for no added benefit.
 
 Deleting the active/default profile must:
 
@@ -657,6 +695,8 @@ Before considering a security change complete, inspect these regressions:
   change the guest identity as a small compatibility fix; that requires a
   separately designed migration.
 - A saturated `TasksMax` may block new in-box sessions; recover from the host.
+- USB sharing covers devices present at boot; hotplugged devices need another
+  `--usb` boot for access (raw usbfs) or for the bind itself (serial nodes).
 - Disk usage has no equivalent simple hard quota yet.
 - X11 forwarding fundamentally exposes other X11 clients.
 - Old releases pointing at the retired root-level update URL cannot discover the
