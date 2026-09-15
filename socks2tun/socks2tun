@@ -1,36 +1,58 @@
 #!/usr/bin/env bash
 #
-# socks2tun — SOCKS5 proxy (dante) whose outgoing traffic leaves through a VPN
-# interface, so single apps can use the VPN while the rest of the box does not.
+# socks2tun — SOCKS5 proxy (dante) whose outgoing traffic leaves through a chosen
+# interface, so single apps, or other machines on the LAN, can use a VPN this box
+# is connected to.
 #
-#   socks2tun.sh [-p port] [-b bind] [iface]   start (defaults: 1080, 0.0.0.0, tun0)
-#   socks2tun.sh stop                          stop and remove the routing rules
+#   socks2tun [-p port] [-b bind] [-g gateway] [iface]   defaults: 1080, 0.0.0.0, tun0
+#   socks2tun stop                                       stop and drop the routing rules
 #
 # It listens on every interface by default, and with socksmethod none anyone who
-# can reach the port gets a free ride into the VPN — restrict it with
+# can reach the port gets a free ride down the tunnel — restrict it with
 # -b 127.0.0.1 (this machine only) or -b <lan ip> when you don't trust the network.
 #
 set -euo pipefail
 
 PORT=1080
 BIND=0.0.0.0
+GW=
 TABLE=100
 CONF=/etc/danted.conf
 
 die() { echo "socks2tun: $*" >&2; exit 1; }
 
+# for failures after the proxy is configured: say what broke, then show the state
+# that explains it, so nothing has to be guessed at
+fail() {
+    {
+        echo "socks2tun: $*"
+        echo "--- journalctl -u danted";           sudo journalctl -u danted -n 15 --no-pager 2>&1
+        echo "--- ip rule list";                   ip rule list
+        echo "--- ip route show table $TABLE";     ip route show table "$TABLE" 2>&1
+        echo "--- ip route show table main";       ip -4 route show table main
+        echo "--- listeners";                      ss -lntp 2>/dev/null | grep -E "danted|:$PORT " || echo "(nothing listening on $PORT)"
+        echo "run '$0 stop' to undo the routing changes"
+    } >&2
+    exit 1
+}
+
 usage() {
-    echo "usage: $0 [-p port] [-b bind_addr] [iface]" >&2
+    echo "usage: $0 [-p port] [-b bind_addr] [-g gateway] [iface]" >&2
     echo "       $0 stop" >&2
     exit 1
 }
 
-stop() {
-    sudo systemctl stop danted || true
-    # one rule deleted per call, so loop until there are none left
+# leave no policy routing behind: stale rules from an earlier run silently
+# hijack traffic that the main table would route correctly
+clear_routing() {
     while sudo ip rule del table "$TABLE" 2>/dev/null; do :; done
     sudo ip route flush table "$TABLE" 2>/dev/null || true
     sudo ip route flush cache
+}
+
+stop() {
+    sudo systemctl stop danted || true
+    clear_routing
     echo "socks2tun: stopped"
 }
 
@@ -43,33 +65,67 @@ install_dante() {
     sudo systemctl disable danted || true   # started on demand by this script
 }
 
-if [ "${1:-}" = stop ]; then
-    stop
-    exit 0
-fi
+# True when traffic has to be *forced* out $1, i.e. the box doesn't already send
+# everything that way of its own accord.
+needs_policy_routing() {
+    local main_dev
+    main_dev=$(ip -4 route show table main default | awk '{for (i = 1; i < NF; i++) if ($i == "dev") print $(i + 1); exit}')
+    [ "$main_dev" != "$1" ]
+}
 
-while getopts ':p:b:h' opt; do
-    case $opt in
-        p) PORT=$OPTARG ;;
-        b) BIND=$OPTARG ;;
-        *) usage ;;
-    esac
-done
-shift $((OPTIND - 1))
-IFACE=${1:-tun0}
+# Prints the default-route spec for our routing table. An ethernet link needs a
+# real gateway: with a bare "default dev enp0s3" the kernel ARPs for every
+# destination address itself, gets no answer, and connections fail with SOCKS5
+# "host unreachable" while the proxy looks perfectly healthy. Point-to-point
+# tunnels (tun/wg) are the exception — NOARP, the peer is the only next hop.
+default_route() {
+    local iface=$1 gw=${2:-}
+    [ -n "$gw" ] || gw=$(ip -4 route show default dev "$iface" | awk '/via/ {print $3; exit}')
+    if [ -n "$gw" ]; then
+        echo "default via $gw dev $iface"
+    elif ip link show dev "$iface" | grep -q POINTOPOINT; then
+        echo "default dev $iface"
+    else
+        die "'$iface' has no default route and is not a tunnel — give its gateway with -g <ip>"
+    fi
+}
 
-ip link show dev "$IFACE" >/dev/null 2>&1 || die "no interface '$IFACE' — connect to the VPN first"
-IFACE_IP=$(ip -4 -o addr show dev "$IFACE" scope global | awk 'NR==1 {print $4}' | cut -d/ -f1)
-[ -n "$IFACE_IP" ] || die "'$IFACE' has no IPv4 address — is the VPN up?"
+main() {
+    if [ "${1:-}" = stop ]; then
+        stop
+        exit 0
+    fi
 
-install_dante
+    while getopts ':p:b:g:h' opt; do
+        case $opt in
+            p) PORT=$OPTARG ;;
+            b) BIND=$OPTARG ;;
+            g) GW=$OPTARG ;;
+            *) usage ;;
+        esac
+    done
+    shift $((OPTIND - 1))
+    local iface=${1:-tun0}
 
-sudo tee "$CONF" >/dev/null <<EOF
+    ip link show dev "$iface" >/dev/null 2>&1 || die "no interface '$iface' — connect to the VPN first"
+    local addrs
+    addrs=$(ip -4 -o addr show dev "$iface" scope global | awk '{print $4}' | cut -d/ -f1)
+    [ -n "$addrs" ] || die "'$iface' has no IPv4 address — is the VPN up?"
+
+    install_dante
+
+    # external.rotation: route makes dante pick the source address from the kernel
+    # routing table per destination. It matters when the interface holds more than
+    # one address (a split-tunnel VPN client parked on the physical NIC), where a
+    # fixed source reaches either the VPN or the internet, never both.
+    # logoutput goes to syslog: the danted unit is sandboxed and cannot write /var/log.
+    sudo tee "$CONF" >/dev/null <<EOF
 # generated by socks2tun.sh — edits are overwritten
-logoutput: /var/log/danted.log
+logoutput: syslog
 
 internal: $BIND port = $PORT
-external: $IFACE
+external: $iface
+external.rotation: route
 
 user.privileged: root
 user.unprivileged: nobody
@@ -88,24 +144,59 @@ socks pass {
 }
 EOF
 
-# send anything sourced from the tunnel IP out of the tunnel, whatever the main
-# routing table says
-sudo ip route replace default dev "$IFACE" table "$TABLE"
-sudo ip rule list | grep -q "from $IFACE_IP lookup $TABLE" ||
-    sudo ip rule add from "$IFACE_IP" table "$TABLE"
-sudo ip route flush cache
+    # Policy routing is only needed to *force* traffic somewhere it wouldn't go on
+    # its own. If the box already defaults out this interface, a table holding just
+    # a default route is worse than nothing: it also overrides the specific routes
+    # the main table has for that interface (a split tunnel's subnets, say).
+    local route
+    clear_routing
+    if needs_policy_routing "$iface"; then
+        route=$(default_route "$iface" "$GW") || exit 1
+        # shellcheck disable=SC2086  # $route is a deliberate multi-word route spec
+        sudo ip route replace $route table "$TABLE"
+        local addr
+        for addr in $addrs; do   # dante may source from any of them
+            sudo ip rule add from "$addr" table "$TABLE"
+        done
+        sudo ip route flush cache
+    else
+        route="main table (already defaults out $iface)"
+    fi
 
-sudo systemctl restart danted
-sudo systemctl is-active --quiet danted || die "danted failed to start — journalctl -u danted"
+    sudo systemctl restart danted
+    sudo systemctl is-active --quiet danted || fail "danted failed to start"
 
-echo "socks2tun: socks5://$BIND:$PORT -> $IFACE ($IFACE_IP)"
-TEST_HOST=$BIND
-if [ "$BIND" = 0.0.0.0 ]; then
-    TEST_HOST=127.0.0.1
-    echo "NOTICE: reachable from the whole LAN with no authentication."
-    echo "         Restrict it with -b 127.0.0.1 (this machine only) or -b <lan ip>."
-fi
-echo
-echo "Use this command to test it:"
-echo "  curl --socks5-hostname $TEST_HOST:$PORT https://ifconfig.me"
-echo "It should print the VPN's public IP, not yours."
+    local test_host=$BIND
+    [ "$BIND" = 0.0.0.0 ] && test_host=127.0.0.1
+
+    # wait for the listener instead of assuming it came up
+    local i
+    for i in $(seq 30); do
+        ss -lnt | grep -q ":$PORT " && break
+        sleep 0.1
+    done
+    ss -lnt | grep -q ":$PORT " || fail "danted is running but nothing is listening on $PORT"
+
+    echo "socks2tun: socks5://$BIND:$PORT -> $iface [$(echo $addrs | tr ' ' ',')], routed by $route"
+
+    # and prove traffic actually gets out, rather than printing success and hoping
+    local exit_ip
+    if ! command -v curl >/dev/null; then
+        echo "(install curl to have this script verify the proxy for you)"
+    elif exit_ip=$(curl -s --max-time 10 --socks5-hostname "$test_host:$PORT" https://ifconfig.me); then
+        echo "verified: traffic through the proxy exits from $exit_ip"
+    else
+        fail "the proxy is up but a request through it failed (curl exit $?)"
+    fi
+
+    if [ "$BIND" = 0.0.0.0 ]; then
+        echo "NOTICE: reachable from the whole LAN with no authentication."
+        echo "        Restrict it with -b 127.0.0.1 (this machine only) or -b <lan ip>."
+        echo "        Reaching it from another machine also needs $PORT open in your firewall."
+    fi
+    echo
+    echo "Use this command to test it yourself:"
+    echo "  curl --socks5-hostname $test_host:$PORT https://ifconfig.me"
+}
+
+main "$@"
