@@ -574,6 +574,23 @@ failed sends remain briefly for systemd/journal diagnosis before stale cleanup.
 Refresh must migrate the older command-timer accuracy setting without changing
 their calendar, command, target, or recurrence.
 
+Command-timer calendars always name their zone. The helper computes the time on
+the host from the host-local `HH:MM` the user typed, but the timer runs in the
+box's systemd, and the host list/garbage-collection parses the same string again.
+A bare wall-clock calendar is read in the box's zone by one and the host's zone by
+the other; nspawn only aligns the box's zone at boot, so they diverge whenever the
+host changes zone under a running box or the box sets its own. The command then
+fires hours off, or the host collects a one-shot before the box fires it. One-shots
+are therefore written as an absolute UTC instant and dailies carry the host's zone
+name so they follow that zone's DST. Do not write a bare calendar, and do not
+"fix" a mismatch by rewriting the box's zone from the host as a side effect. Bare
+calendars from older releases are still listed but are not migrated, because the
+zone they were created in is unknown.
+
+The command-line form is `<session> <HH:MM> "<command>" [once|daily]`: the mode is
+optional, defaults to `once`, and comes last. A mode-shaped token anywhere else is
+rejected rather than typed into the session.
+
 Host-side schedule inspection must go through the immutable helper's bounded
 record reader. That reader walks the rootfs using directory file descriptors,
 rejects symlinks and non-regular files, caps display data, and escapes terminal

@@ -174,9 +174,12 @@ parser_fails() {
 }
 assert_has "$(run_parser start alpha)" "CALL:start:<alpha>" "named start dispatch"
 assert_has "$(run_parser --gui start alpha)" "gui=1" "global flag before command"
-assert_has "$(run_parser schedule-command sess 12:00 once -- --gui)" "<--gui>" "literal option-like scheduled command"
-assert_has "$(run_parser schedule-command sess 12:00 once "")" \
-    "CALL:schedule <add> <sess> <12:00> <once> <>" "empty Enter-only command"
+assert_has "$(run_parser schedule-command sess 12:00 -- --gui daily)" \
+    "<--gui> <daily>" "literal option-like scheduled command"
+assert_has "$(run_parser schedule-command sess 12:00 "")" \
+    "CALL:schedule <add> <sess> <12:00> <>" "empty Enter-only command, default mode"
+assert_has "$(run_parser schedule-command sess 12:00 "" daily)" \
+    "CALL:schedule <add> <sess> <12:00> <> <daily>" "mode is the optional last argument"
 assert_has "$(run_parser share add "/tmp/a b")" \
     "CALL:share:<add>:</tmp/a b>" "share path containing spaces"
 parser_fails stop unexpected
@@ -186,8 +189,9 @@ parser_fails start --here named
 parser_fails status --unsafe-host-root
 parser_fails share list unexpected
 parser_fails wake-claude list 12:00 daily unexpected
-parser_fails schedule-command sess 12:00 once
-parser_fails schedule-command sess 12:00 typo ignored
+parser_fails schedule-command sess 12:00 once pwd
+parser_fails schedule-command sess 12:00 pwd typo
+parser_fails schedule-command sess 12:00 pwd daily extra
 assert_has "$(run_parser schedule-command list 12:00 pwd)" \
     "CALL:schedule <add> <list> <12:00> <pwd>" "session named list"
 assert_has "$(run_parser schedule-command del)" "CALL:sched-add:<del>" "session named del"
@@ -523,6 +527,66 @@ awk '
     ! _sched_remove schd-com-1
 ) || fail "schedule removal swallowed a helper failure"
 ok "schedule deletion propagates missing-helper and removal failures"
+
+# A schedule's calendar must name its zone. The box's systemd would read a bare
+# wall-clock time in the box's zone and the host list in the host's zone, so a
+# zone mismatch fired commands hours off or collected them before they fired.
+awk '
+    /^_sched_calendar\(\)/ { copying=1 }
+    copying && /^_sched_install\(\)/ { exit }
+    copying { print }
+' "$TMP/helper.bash" > "$TMP/sched-calendar.bash"
+(
+    # shellcheck disable=SC1090
+    source "$TMP/sched-calendar.bash"
+    export TZ=Asia/Tokyo
+    [[ "$(_sched_calendar 12:00 once)" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ 03:00:00\ UTC$ ]]
+    [[ "$(_sched_calendar 12:00 daily)" =~ ^\*-\*-\*\ [0-9]{2}:[0-9]{2}:00\ [A-Za-z] ]]
+) || fail "schedule calendar is not zone-qualified"
+awk '
+    /^_sched_dump_records\(\)/ { copying=1 }
+    copying && /^_sched_calendar\(\)/ { exit }
+    copying { print }
+' "$TMP/helper.bash" > "$TMP/sched-dump.bash"
+sched_units="$TMP/sched-root/etc/systemd/system"
+mkdir -p "$sched_units"
+sched_timer() {
+    printf '%s\n' "# waterbox: sess @ 12:00 $2" "[Timer]" "OnCalendar=$3" \
+        > "$sched_units/waterbox-schd-com-$1.timer"
+}
+sched_timer 1 once  '2026-01-02 03:00:00 UTC'
+sched_timer 2 daily '*-*-* 12:00:00 America/New_York'
+sched_timer 3 once  '2026-01-02 12:00:00'
+sched_timer 4 daily '*-*-* 13:00:00 America/New_York'
+sched_timer 5 once  '2026-01-02 12:00:00 America/New_York'
+sched_dump=$(
+    # shellcheck disable=SC1090
+    source "$TMP/sched-dump.bash"
+    JAIL_ROOT="$TMP/sched-root" _sched_dump_records | sort | cut -f1,3
+)
+assert_eq "$(printf 'schd-com-%s\n' \
+    $'1\tv2026-01-02 03:00:00 UTC' $'2\tv*-*-* 12:00:00 America/New_York' \
+    $'3\tv2026-01-02 12:00:00' $'4\tv' $'5\tv')" "$sched_dump" \
+    "schedule record calendars"
+if command -v systemd-analyze >/dev/null 2>&1; then
+    awk '
+        /^_fmt_left\(\)/ { copying=1 }
+        copying && /^HW_IDS=/ { exit }
+        copying { print }
+    ' "$WB" > "$TMP/timer-next.bash"
+    (
+        # shellcheck disable=SC1090
+        source "$TMP/timer-next.bash"
+        now=$(date +%s)
+        _timer_next a "$(date -u -d "@$((now - 10))" '+%Y-%m-%d %H:%M:%S UTC')" "$now"
+        [[ "$_TIMER_LEFT" == due && "$_TIMER_GC" == 0 ]]
+        _timer_next b "$(date -u -d "@$((now - 3600))" '+%Y-%m-%d %H:%M:%S UTC')" "$now"
+        [[ "$_TIMER_GC" == 1 ]]
+    ) || fail "UTC one-shot was not held as due inside the accuracy grace"
+else
+    skip_test "UTC one-shot due/garbage-collection window (systemd-analyze unavailable)"
+fi
+ok "schedule calendars are zone-qualified and read consistently by the host"
 
 # Mount-table inspection is host-side and exact. Live detach must use that result
 # before changing its user-visible/persistent state.

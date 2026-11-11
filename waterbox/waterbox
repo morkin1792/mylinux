@@ -4,7 +4,7 @@
 
 set -e
 
-WATERBOX_VERSION="1.16"
+WATERBOX_VERSION="1.17"
 
 # Absolute path to this script, recorded so the shell-completion snippet can fall
 # back to it when 'waterbox' isn't on $PATH (e.g. run by ./waterbox, or moved).
@@ -456,16 +456,17 @@ EOF
 }
 help_schedule() {
     cat <<EOF
-${C_HEAD}Usage:${C_OFF} ${C_CMD}waterbox schedule-command${C_OFF} [<session> <HH:MM> [once|daily] "<command>"]
+${C_HEAD}Usage:${C_OFF} ${C_CMD}waterbox schedule-command${C_OFF} [<session> <HH:MM> "<command>" [once|daily]]
 
-At <HH:MM>, type <command> + Enter into an existing tmux session (e.g. fire a
-prompt the moment your quota resets). The session must exist when you add it.
+At <HH:MM> (host time, whatever timezone the box uses), type <command> + Enter
+into an existing tmux session (e.g. fire a prompt the moment your quota resets).
+The session must exist when you add it.
 An empty command ("") just sends Enter — listed as <enter>.
 If the command is literally named like an option, put ${C_CMD}--${C_OFF} before it.
 
   ${C_DIM}(no args)${C_OFF}                                    Open the live manager (a add · d del · q quit).
-  ${C_CMD}<session>${C_OFF}                                    Pick the session, then just ask time, when + command.
-  ${C_CMD}<session> <HH:MM> [once|daily] "<command>"${C_OFF}   Add directly (default: once).
+  ${C_CMD}<session>${C_OFF}                                    Pick the session, then just ask time, command + when.
+  ${C_CMD}<session> <HH:MM> "<command>" [once|daily]${C_OFF}   Add directly (default: once).
   ${C_CMD}list${C_OFF}                                         List scheduled commands with time-to-trigger.
   ${C_CMD}del <id>${C_OFF}                                     Remove one (id from 'list', e.g. schd-com-1).
 EOF
@@ -667,6 +668,12 @@ bootstrap_sandbox() {
         # test the real filesystem capability; an explicitly unsafe request is
         # accepted only when this exact probe fails.
         is_running || _require_rootfs_idmap
+        # A recursive chown/chgrp anywhere over the rootfs — a careless host-side
+        # command, a backup restored without -p — silently clears every setuid bit,
+        # which breaks sudo, su, mount and passwd at once inside the box. Waterbox
+        # never chowns the tree itself, so this only ever comes from outside; warn
+        # and start anyway rather than refusing a box that is otherwise fine.
+        [ -u "$JAIL_ROOT/usr/bin/sudo" ] || log_warn "$JAIL_ROOT/usr/bin/sudo has lost its setuid bit, so sudo inside the box will fail. Something outside Waterbox chowned the rootfs; restore the bits with 'sudo chmod 4755 \"$JAIL_ROOT\"/usr/bin/{sudo,su,mount,umount,newgrp,passwd}'."
         return 0
     fi
     # Never replace a rootfs that a live container is still using. A damaged or
@@ -4311,11 +4318,14 @@ INFO_RE = re.compile(
     r"([A-Za-z0-9._][A-Za-z0-9._-]*) @ "
     r"((?:[01][0-9]|2[0-3]):[0-5][0-9]) (once|daily)\Z"
 )
+# Calendars name their zone (UTC for one-shots, the host's zone for dailies) so the
+# box and the host agree on the instant. Bare forms are pre-1.17 timers.
 ONCE_RE = re.compile(
-    r"[0-9]{4}-[0-9]{2}-[0-9]{2} ((?:[01][0-9]|2[0-3]):[0-5][0-9]):00\Z"
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2} ((?:[01][0-9]|2[0-3]):[0-5][0-9]):00( UTC)?\Z"
 )
 DAILY_RE = re.compile(
-    r"\*-\*-\* ((?:[01][0-9]|2[0-3]):[0-5][0-9]):00\Z"
+    r"\*-\*-\* ((?:[01][0-9]|2[0-3]):[0-5][0-9]):00"
+    r"( [A-Za-z0-9_+-]{1,32}(?:/[A-Za-z0-9_+-]{1,32}){0,2})?\Z"
 )
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
@@ -4392,7 +4402,11 @@ def timer_fields(data):
 
     expected_time, mode = match.group(2), match.group(3)
     cal_match = DAILY_RE.fullmatch(expr) if mode == "daily" else ONCE_RE.fullmatch(expr)
-    if not cal_match or cal_match.group(1) != expected_time:
+    if not cal_match:
+        return info, ""
+    # A UTC calendar holds the converted instant, so its HH:MM legitimately differs
+    # from the host-local time on the info line; every other form must still agree.
+    if cal_match.group(2) != " UTC" and cal_match.group(1) != expected_time:
         return info, ""
     return info, expr
 
@@ -4467,18 +4481,40 @@ finally:
 PY
 }
 
-_sched_install() {
-    local id="$1" sess="$2" time="$3" mode="$4" base="waterbox-$1"
-    local hh=${time%:*} mm=${time#*:} cal ts msg="$TASK_MSG_DIR/${1}.msg"
-    running && approved_box \
-        || { echo "helper: refusing to schedule in an unapproved legacy box" >&2; return 3; }
+# OnCalendar for a schedule-command, from the HOST's HH:MM. It must name its zone:
+# the box's systemd reads a bare wall-clock time in the BOX's zone, while the host
+# list/garbage-collection reads the same string in the HOST's zone. The two differ
+# whenever the host changes zone after boot or the box sets its own, and the command
+# then fires hours off (or is collected before it fires). A one-shot is an absolute
+# instant, so UTC; a daily keeps the host's zone name so it follows that zone's DST.
+_sched_calendar() {
+    local time="$1" mode="$2" ts tz
     if [ "$mode" = daily ]; then
-        cal="*-*-* ${hh}:${mm}:00"
+        tz=$(readlink -f /etc/localtime 2>/dev/null) || tz=""
+        case "$tz" in */zoneinfo/*) tz="${tz##*/zoneinfo/}" ;; *) tz="" ;; esac
+        if [[ "$tz" =~ ^[A-Za-z0-9_+-]{1,32}(/[A-Za-z0-9_+-]{1,32}){0,2}$ ]]; then
+            echo "*-*-* ${time}:00 $tz"
+        else
+            # ponytail: no resolvable zone name (/etc/localtime is not a zoneinfo
+            # symlink), so pin today's UTC offset; it drifts an hour across a DST
+            # change. Read the name from timedatectl if such hosts matter.
+            ts=$(date -u -d "@$(date -d "today ${time}" +%s)" +%H:%M) || return 1
+            echo "*-*-* ${ts}:00 UTC"
+        fi
     else
         ts=$(date -d "today ${time}" +%s) || return 1
         [ "$ts" -le "$(date +%s)" ] && ts=$(date -d "tomorrow ${time}" +%s)
-        cal=$(date -d "@$ts" '+%Y-%m-%d %H:%M:00')
+        date -u -d "@$ts" '+%Y-%m-%d %H:%M:00 UTC'
     fi
+}
+
+_sched_install() {
+    local id="$1" sess="$2" time="$3" mode="$4" base="waterbox-$1"
+    local cal msg="$TASK_MSG_DIR/${1}.msg"
+    running && approved_box \
+        || { echo "helper: refusing to schedule in an unapproved legacy box" >&2; return 3; }
+    cal=$(_sched_calendar "$time" "$mode") && [ -n "$cal" ] \
+        || { echo "helper: could not compute a calendar for $time" >&2; return 1; }
     {
         printf '%s\n' \
             "[Unit]" "Description=Waterbox scheduled command (-> $sess @ $time $mode)" "" \
@@ -5593,7 +5629,7 @@ _timer_next() {
                 unset "_NEXT_EPOCH[$key]"
                 # Only exact one-shot expressions can be "due". Invalid or other
                 # never-firing expressions retain the old immediate-GC behavior.
-                if [[ "$expr" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}$ ]]; then
+                if [[ "$expr" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}(\ UTC)?$ ]]; then
                     due_epoch=$(date -d "$expr" +%s 2>/dev/null || true)
                     if [ -n "$due_epoch" ] && [ "$now" -ge "$due_epoch" ]; then
                         age=$(( now - due_epoch ))
@@ -5706,20 +5742,15 @@ manage_schedule() {
         add)
             # The command may be an explicit "" — that means "just send Enter". Use the
             # arg COUNT (not -n) to tell an empty command apart from a missing one.
-            local nargs=$# session="$1" time="$2" mode command have_cmd=0
-            if [ "$3" = once ] || [ "$3" = daily ]; then
-                mode="$3"; command="$4"; [ "$nargs" -ge 4 ] && have_cmd=1
-            else
-                mode="once"; command="$3"; [ "$nargs" -ge 3 ] && have_cmd=1
-            fi
-            [ -n "$session" ] && [ -n "$time" ] && [ "$have_cmd" = 1 ] \
-                || log_error "Usage: waterbox schedule-command <session> <HH:MM> [once|daily] \"<command>\"  (\"\" sends just Enter)"
+            local nargs=$# session="$1" time="$2" command="$3" mode="${4:-once}"
+            [ -n "$session" ] && [ -n "$time" ] && [ "$nargs" -ge 3 ] \
+                || log_error "Usage: waterbox schedule-command <session> <HH:MM> \"<command>\" [once|daily]  (\"\" sends just Enter)"
             _valid_session_name "$session" || log_error "Invalid session name: '$session'."
             [[ "$time" =~ ^([01]?[0-9]|2[0-3]):[0-5][0-9]$ ]] \
                 || log_error "Time must be HH:MM (24-hour), got '$time'."
             time=$(printf '%02d:%s' "$((10#${time%%:*}))" "${time#*:}")   # 9:30 -> 09:30
             [ "$mode" = once ] || [ "$mode" = daily ] \
-                || log_error "Mode must be 'once' or 'daily', got '$mode'."
+                || log_error "Mode must be 'once' or 'daily', got '$mode' (it goes last, after the command)."
             is_running || log_error "The box must be running to schedule into a live session ('waterbox start' first)."
             container_tmux has-session -t "=$session" 2>/dev/null \
                 || log_error "No live session '$session'. Start it and check 'waterbox status'."
@@ -5756,7 +5787,7 @@ manage_schedule() {
             log_info "Scheduled commands (schedule-command):"
             _timer_list
             ;;
-        *) log_error "Usage: waterbox schedule-command <session> <HH:MM> [once|daily] \"<cmd>\" | list | del <id>" ;;
+        *) log_error "Usage: waterbox schedule-command <session> <HH:MM> \"<cmd>\" [once|daily] | list | del <id>" ;;
     esac
 }
 
@@ -5786,12 +5817,16 @@ _list_profiles() {
     done
 }
 
-# Shared wizard step: typed HH:MM (validated) + once/daily menu.
-# Sets AW_TIME / AW_MODE in the caller's scope; returns 1 on cancel.
-_wizard_when() {
+# Shared wizard steps: typed HH:MM (validated), then the once/daily menu. They set
+# AW_TIME / AW_MODE in the caller's scope and return 1 on cancel. Separate because
+# schedule-command asks for its command in between, leaving "when" for last where
+# Enter just keeps the first entry (once).
+_wizard_time() {
     prompt_field "Time (HH:MM): " '([01]?[0-9]|2[0-3]):[0-5][0-9]' \
         "use 24-hour HH:MM, e.g. 07:00 (or 7:00)" || return 1
     AW_TIME="$FIELD"
+}
+_wizard_when() {
     MENU_CANCEL=1
     choose_menu "When:" once daily
     [ "$MENU_CANCELLED" = 1 ] && return 1
@@ -5824,7 +5859,7 @@ wake_add() {
         [ "$MENU_CANCELLED" = 1 ] && { log_info "Cancelled."; return 0; }
         profile="${profiles[$MENU_CHOICE]}"   # capture before _wizard_when reuses MENU_CHOICE
     fi
-    _wizard_when || { log_info "Cancelled."; return 0; }
+    _wizard_time && _wizard_when || { log_info "Cancelled."; return 0; }
     manage_wake_claude add "$profile" "$AW_TIME" "$AW_MODE"
 }
 wake_del() { manage_wake_claude del "$1"; }
@@ -5842,7 +5877,7 @@ sched_add() {
     local session="${1:-}" sessions=() s AW_TIME AW_MODE command
     if [ -n "$session" ]; then
         # Pre-seeded from the CLI (`waterbox schedule-command <session>`): skip the
-        # picker and jump straight to time + when + command.
+        # picker and jump straight to time + command + when.
         _live_sessions | grep -qxF -- "$session" \
             || log_error "No live session '$session'. Start it and check 'waterbox status'."
     else
@@ -5855,12 +5890,13 @@ sched_add() {
         [ "$MENU_CANCELLED" = 1 ] && { log_info "Cancelled."; return 0; }
         session="${sessions[$MENU_CHOICE]}"
     fi
-    _wizard_when || { log_info "Cancelled."; return 0; }
+    _wizard_time || { log_info "Cancelled."; return 0; }
     # allow_empty=1: an empty command means "just send Enter" (Ctrl-C to cancel).
     prompt_field "Command to send (empty = just Enter): " "" "" 1 \
         || { log_info "Cancelled."; return 0; }
     command="$FIELD"
-    manage_schedule add "$session" "$AW_TIME" "$AW_MODE" "$command"
+    _wizard_when || { log_info "Cancelled."; return 0; }
+    manage_schedule add "$session" "$AW_TIME" "$command" "$AW_MODE"
 }
 sched_del() { manage_schedule del "$1"; }
 schedule_manager() {
@@ -5972,9 +6008,9 @@ _waterbox() {
             elif (( CURRENT == 4 )); then
                 _waterbox_time                          # <session> <HH:MM>
             elif (( CURRENT == 5 )); then
-                items=(once daily); compadd -a items    # [once|daily]
-            elif (( CURRENT == 6 )); then
                 _message -e command 'command to send — e.g. "continue"'
+            elif (( CURRENT == 6 )); then
+                items=(once daily); compadd -a items    # [once|daily]
             fi ;;
         completion)
             (( CURRENT == 3 )) && { items=(zsh); compadd -a items; } ;;
@@ -6114,20 +6150,15 @@ case "$_cmd" in
         elif [ "$#" -eq 2 ]; then
             : # session-only wizard, including sessions named del/rm
         elif [ "$#" -eq 4 ]; then
-            # Without an explicit mode, argument 4 is the command. Treating
-            # "once"/"daily" as that command is almost certainly a missing
-            # final argument and manage_schedule would otherwise reject it
-            # only after more setup work.
-            [ "$4" != once ] && [ "$4" != daily ] \
-                || log_error "A command is required after '$4' (use \"\" to send only Enter)."
+            : # <session> <HH:MM> "<command>" — mode defaults to once
         elif [ "$#" -eq 5 ]; then
-            # With five tokens, argument 4 must be the mode. Previously an
-            # arbitrary value here made manage_schedule silently ignore the
-            # trailing argument.
-            [ "$4" = once ] || [ "$4" = daily ] \
-                || log_error "Mode must be 'once' or 'daily', got '$4'."
+            # The optional mode is the LAST token. Reject anything else here so a
+            # pre-1.17 "<mode> <command>" order fails instead of typing the wrong
+            # text into the session.
+            [ "$5" = once ] || [ "$5" = daily ] \
+                || log_error "Mode must be 'once' or 'daily', got '$5' (it goes last, after the command)."
         else
-            log_error "Usage: waterbox schedule-command <session> <HH:MM> [once|daily] \"<command>\""
+            log_error "Usage: waterbox schedule-command <session> <HH:MM> \"<command>\" [once|daily]"
         fi
         ;;
     *) ;; # The final dispatcher prints the unknown-command error.
@@ -6196,7 +6227,7 @@ case "${1:-start}" in
             manage_schedule list
         elif [ "$#" -eq 3 ] && { [ "$2" = del ] || [ "$2" = rm ]; }; then
             manage_schedule del "$3"
-        # Just a session (no time yet) → open the wizard on time + when + command.
+        # Just a session (no time yet) → open the wizard on time + command + when.
         elif [ "$#" -eq 2 ]; then
             sched_add "$2"
         else
