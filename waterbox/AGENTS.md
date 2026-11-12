@@ -318,6 +318,33 @@ Deleting the active/default profile must:
 - select another profile when possible;
 - avoid alarming but harmless “file not found” shell errors.
 
+### Claude Code temp files live on disk, not on `/tmp`
+
+The box's `/tmp` is normally a tmpfs that systemd-nspawn mounts per boot, sized as
+a fraction of host memory. It is emptied only when the box stops, the stock
+tmpfiles age for it is far longer than agent files live, and its contents count
+against the box memory limit. Session scratchpads routinely hold hundreds of
+megabytes (package installs, build output), so a box that stays up for days fills
+it.
+
+The generated zshrc therefore exports `CLAUDE_CODE_TMPDIR=/var/tmp/claude`, and a
+managed `/etc/tmpfiles.d/waterbox-claude-tmp.conf` makes the box's own systemd
+create that directory (`0700`, guest user) at boot and remove entries untouched for
+7 days.
+
+- Keep creation and cleanup guest-side through tmpfiles. Do not add a host-root
+  sweep of this guest-controlled tree.
+- The export is conditional: if the directory is missing or not owned by the
+  user, the variable stays unset and Claude Code falls back to `/tmp`.
+- Keep the path short. Claude Code places Unix sockets under its temp dir and
+  socket paths have a small fixed length limit.
+- The zshrc path and the tmpfiles path must stay identical; the harness checks
+  both.
+- Do not enlarge the `/tmp` tmpfs as the fix: that only spends more memory on
+  discardable files.
+- Files there survive a box stop, unlike `/tmp`; the age rule is what bounds them.
+  Other tools that write straight to `/tmp` are unaffected.
+
 ### Self-update is atomic
 
 The canonical update URL is:

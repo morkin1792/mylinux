@@ -57,6 +57,13 @@ if command -v zsh >/dev/null 2>&1; then
 else
     skip_test "generated zshrc syntax (zsh unavailable)"
 fi
+# Agent temp files must not accumulate on the RAM-backed /tmp. The exported path and
+# the tmpfiles rule that creates and age-cleans it have to name the same directory.
+assert_has "$(cat "$TMP/zshrc")" 'export CLAUDE_CODE_TMPDIR=/var/tmp/claude' \
+    "zshrc moves Claude Code temp files off /tmp"
+assert_has "$(grep -F 'd /var/tmp/claude ' "$WB")" \
+    '"d /var/tmp/claude 0700 $USER_NAME $USER_NAME 7d"' \
+    "tmpfiles rule creates and age-cleans the Claude Code temp dir"
 assert_has "$(cat "$TMP/zshrc")" 'known_marketplaces.json' \
     "zshrc self-heals pre-1.9 marketplace installLocation paths"
 

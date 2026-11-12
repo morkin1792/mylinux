@@ -4,7 +4,7 @@
 
 set -e
 
-WATERBOX_VERSION="1.17"
+WATERBOX_VERSION="1.18"
 
 # Absolute path to this script, recorded so the shell-completion snippet can fall
 # back to it when 'waterbox' isn't on $PATH (e.g. run by ./waterbox, or moved).
@@ -851,6 +851,17 @@ bootstrap_sandbox() {
 
 # Dotfiles, claude defaults, git identity — all per-user, written once.
 configure_dotfiles() {
+    # Disk-backed, age-cleaned temp dir for Claude Code (the zshrc below points
+    # CLAUDE_CODE_TMPDIR at it; keep the two paths identical). The box's own systemd
+    # creates it at boot with the guest user's ownership and its daily tmpfiles
+    # cleanup removes entries untouched for 7 days, so nothing here runs as host
+    # root against a live rootfs.
+    _guard_jail_path "$JAIL_ROOT/etc/tmpfiles.d"
+    sudo mkdir -p "$JAIL_ROOT/etc/tmpfiles.d"
+    printf '%s\n' \
+        "# Managed by Waterbox; rewritten on config refresh." \
+        "d /var/tmp/claude 0700 $USER_NAME $USER_NAME 7d" \
+        | wb_tee "$JAIL_ROOT/etc/tmpfiles.d/waterbox-claude-tmp.conf"
     wb_tee "$JAIL_ROOT/home/$USER_NAME/.zshrc" <<'EOF'
 HISTFILE=~/.histfile
 HISTSIZE=20000
@@ -867,6 +878,15 @@ bindkey '^U' backward-kill-line
 
 eval "$(oh-my-posh init zsh --config blue-owl)"
 export PATH="$HOME/.local/bin:$PATH"
+
+# Claude Code keeps per-session scratch space, task output and unpacked skills in
+# its temp dir. The box's /tmp is a RAM-backed tmpfs capped at a fraction of host
+# memory and emptied only when the box stops, so days of agent sessions fill it and
+# every byte counts against the box memory limit. Use the disk-backed directory
+# from /etc/tmpfiles.d/waterbox-claude-tmp.conf instead; when it is missing or not
+# ours, leave the variable unset so Claude Code falls back to /tmp.
+[[ -d /var/tmp/claude && -O /var/tmp/claude && -w /var/tmp/claude ]] \
+    && export CLAUDE_CODE_TMPDIR=/var/tmp/claude
 
 # Claude Code records absolute installLocation paths in known_marketplaces.json.
 # The 1.9 layout migration moved ~/.claude-env to ~/.agent-env/claude without
@@ -909,8 +929,9 @@ waterbox_welcome() {
     print -P "%F{cyan}─────────────────────────────────────────────────────%f"
 }
 # Key the "already welcomed" marker to the tmux SERVER pid + session id. The pid
-# is unique per boot, so markers left in /tmp by a previous boot (/tmp is NOT a
-# tmpfs here — tmp.mount is masked) can't collide and silently suppress the banner
+# is unique per boot, so markers left in /tmp by a previous boot (systemd-nspawn
+# normally mounts a fresh tmpfs there, but tmp.mount is masked and that is not
+# guaranteed on every host) can't collide and silently suppress the banner
 # in a brand-new session that happens to reuse an old session id.
 if [[ -o interactive && -n "$TMUX" ]]; then
     _wb_sid=$(tmux display -p '#{pid}_#{session_id}' 2>/dev/null)
