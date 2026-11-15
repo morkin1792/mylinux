@@ -50,6 +50,10 @@ extract '^_statusline_body' '^SL$' "$TMP/statusline.sh"
 sh -n "$TMP/statusline.sh"
 ok "generated statusline POSIX shell syntax"
 
+extract "<<'RESUMEPY'" '^RESUMEPY$' "$TMP/waterbox-resume"
+python3 -m py_compile "$TMP/waterbox-resume"
+ok "generated session-restore helper Python syntax"
+
 extract "wb_tee .*[.]zshrc.*<<'EOF'" '^EOF$' "$TMP/zshrc"
 if command -v zsh >/dev/null 2>&1; then
     zsh -n "$TMP/zshrc"
@@ -66,6 +70,10 @@ assert_has "$(grep -F 'd /var/tmp/claude ' "$WB")" \
     "tmpfiles rule creates and age-cleans the Claude Code temp dir"
 assert_has "$(cat "$TMP/zshrc")" 'known_marketplaces.json' \
     "zshrc self-heals pre-1.9 marketplace installLocation paths"
+assert_has "$(cat "$TMP/zshrc")" 'cmd=(claude --resume "$id")' "zshrc reopens a restored Claude chat"
+assert_has "$(cat "$TMP/zshrc")" 'cmd=(codex resume "$id")' "zshrc reopens a restored Codex chat"
+assert_has "$(cat "$TMP/zshrc")" 'unset WB_RESUME_AGENT WB_RESUME_ID WB_RESUME_DIR WB_RESUME_BUSY' \
+    "zshrc consumes the restore variables so later shells do not reopen the chat"
 
 extract "cat <<'AGENTENV_HEAD'" '^AGENTENV_HEAD$' "$TMP/agent-head.zsh"
 extract "cat <<'AGENTENV'" '^AGENTENV$' "$TMP/agent-body.zsh"
@@ -166,6 +174,8 @@ run_parser() {
         schedule_manager() { echo CALL:schedule-manager; }
         manage_schedule() { printf "CALL:schedule"; printf " <%s>" "$@"; echo; }
         sched_add() { printf "CALL:sched-add:<%s>\n" "$1"; }
+        help_autostart() { echo CALL:help-autostart; }
+        manage_autostart() { printf "CALL:autostart:<%s>\n" "${1:-}"; }
         self_update() { echo CALL:update; }
         parser_file=$1
         shift
@@ -189,6 +199,13 @@ assert_has "$(run_parser schedule-command sess 12:00 "" daily)" \
     "CALL:schedule <add> <sess> <12:00> <> <daily>" "mode is the optional last argument"
 assert_has "$(run_parser share add "/tmp/a b")" \
     "CALL:share:<add>:</tmp/a b>" "share path containing spaces"
+assert_has "$(run_parser autostart)" "CALL:autostart:<>" "bare autostart shows status"
+assert_has "$(run_parser autostart on)" "CALL:autostart:<on>" "autostart on dispatch"
+assert_has "$(run_parser autostart off)" "CALL:autostart:<off>" "autostart off dispatch"
+assert_has "$(run_parser autostart --help)" "CALL:help-autostart" "autostart help"
+parser_fails autostart onn
+parser_fails autostart on extra
+parser_fails autostart on --gui
 parser_fails stop unexpected
 parser_fails reset unexpected
 parser_fails start alpha beta
@@ -648,6 +665,114 @@ assert_eq 0 "$(printf '%s\n' "$rename_body" | grep -c 'sched-rename.*|| true' ||
 assert_has "$rename_body" "scheduled commands could not be repointed" \
     "schedule rename failure warning"
 ok "session rename reports schedule retargeting failures truthfully"
+
+# Session restore. The host side only classifies the shutdown: a root-owned marker
+# outside the rootfs, set by a successful COLD boot and cleared by a verified stop.
+# Unattended paths never boot unsafely, and a wake boot never consumes a restore.
+assert_has "$(grep -A3 '^    down)' "$TMP/helper.bash")" 'rm -f "$RESUME_MARK_DIR/live-$wb_uid"' \
+    "verified stop clears the unclean-shutdown marker"
+assert_eq "power_off" "$(grep -A1 '^    down)' "$TMP/helper.bash" | tail -n1 | tr -d ' ')" \
+    "marker is cleared only after power_off succeeded"
+assert_eq 2 "$(grep -c 'if \[ "$BOOT_COLD" = 1 \]; then resume_after_boot; fi' "$TMP/helper.bash")" \
+    "restore/discard runs after cold boots only"
+assert_eq 0 "$(awk '/^boot_min\(\)/,/^}/' "$TMP/helper.bash" | grep -c resume_after_boot || true)" \
+    "wake boots never consume a pending restore"
+assert_has "$(grep -A5 '^    autostart)' "$TMP/helper.bash")" 'boot_full 0 0 0 0' \
+    "autostart boots secure, without GUI or USB"
+assert_has "$(grep -B1 'boot_full 0 0 0 0' "$TMP/helper.bash")" 'unattended_lock' "autostart waits for a wake"
+assert_has "$(awk '/^    wake\)/,/boot_min/' "$TMP/helper.bash")" 'unattended_lock' \
+    "wake takes the lock before it can boot"
+assert_eq 1 "$(grep -c 'RESUME_MARK_DIR="/var/lib/waterbox"' "$TMP/helper.bash")" "root-owned marker directory"
+assert_has "$(grep -B3 -A1 'ensure_helper$' "$WB" | grep -A1 'outdated helper')" 'ensure_helper' \
+    "reset of a stopped box refreshes the helper before clearing the marker"
+assert_has "$(grep -A3 '^        on)' "$WB")" '.waterbox-ready' "autostart refuses an unbuilt box"
+awk '/^write_resume_helper\(\)/ { copying=1 } /^# Next free schedule-command suffix/ { exit } copying { print }' \
+    "$WB" > "$TMP/write-resume.bash"
+(
+    # shellcheck disable=SC1090
+    source "$TMP/write-resume.bash"
+    JAIL_ROOT="$TMP/resume-root" USER_NAME=water
+    sudo() { "$@"; }
+    _guard_jail_path() { :; }
+    wb_tee() { mkdir -p "$(dirname "$1")"; cat > "$1"; }
+    write_resume_helper
+    python3 -c 'import json,sys; h=json.load(open(sys.argv[1]))["hooks"]
+assert sorted(h) == ["SessionEnd","SessionStart","Stop","UserPromptSubmit"]' \
+        "$JAIL_ROOT/etc/claude-code/managed-settings.json"
+    python3 -c 'import tomllib,sys; h=tomllib.load(open(sys.argv[1],"rb"))["hooks"]
+assert sorted(h) == ["Interrupt","SessionEnd","SessionStart","Stop","UserPromptSubmit"]
+assert all(g[0]["hooks"][0]["command"] == "/usr/local/bin/waterbox-resume hook codex" for g in h.values())' \
+        "$JAIL_ROOT/etc/codex/managed_config.toml"
+    grep -Fxq 'KillMode=process' "$JAIL_ROOT/etc/systemd/system/waterbox-resume@.service"
+    grep -Fxq 'Before=waterbox-resume-snapshot.timer' "$JAIL_ROOT/etc/systemd/system/waterbox-resume@.service"
+    grep -Fxq 'Environment=XDG_RUNTIME_DIR=/run/user/1000' "$JAIL_ROOT/etc/systemd/system/waterbox-resume@.service"
+    grep -Fxq 'After=user@1000.service' "$JAIL_ROOT/etc/systemd/system/waterbox-resume@.service"
+    [[ -f "$JAIL_ROOT/var/lib/systemd/linger/water" ]]
+    cmp -s "$JAIL_ROOT/usr/local/bin/waterbox-resume" "$TMP/waterbox-resume"
+) || fail "generated session-restore hooks/units are malformed"
+ok "session restore: marker lifecycle, unattended-boot limits, and managed agent hooks"
+
+# Functional restore against an isolated tmux server (never the developer's own):
+# record a mid-turn chat through the real hook, ignore an agent run BY an agent,
+# "crash", restore, and check layout, directories and what each pane reopens.
+if command -v tmux >/dev/null 2>&1; then
+    rt="$TMP/rt"
+    mkdir -p "$rt/home" "$rt/a" "$rt/b c"
+    cat > "$rt/agent.py" <<'AGENT'
+# Fake agent: fires the hook the way an agent does. argv: resume event sid [nested]
+import json, os, subprocess, sys
+resume, event, sid = sys.argv[1:4]
+payload = json.dumps({"hook_event_name": event, "session_id": sid, "cwd": os.getcwd(),
+                      "transcript_path": ""})
+if len(sys.argv) > 4:   # e.g. Claude running `codex exec` through its shell tool
+    subprocess.run(["bash", "-c", 'python3 "$0" "$1" "$2" "$3"', __file__, resume, event, sid + "-x"])
+else:
+    subprocess.run(["sh", "-c", 'exec python3 "$0" hook claude', resume], input=payload, text=True)
+AGENT
+    (
+        unset TMUX TMUX_PANE AGENT_ENV_PROFILE
+        export HOME="$rt/home" TMUX_TMPDIR="$rt" SHELL=/bin/sh
+        R="$TMP/waterbox-resume"
+        trap 'tmux kill-server 2>/dev/null || true' EXIT
+        tmux -f /dev/null new-session -d -s alpha -x 120 -y 40 -c "$rt/a"
+        tmux new-window -t =alpha: -c "$rt/b c"
+        tmux split-window -h -t =alpha:1 -c "$rt/a"
+        tmux new-session -d -s beta -c "$rt/a"
+        # Eight panes in one window: splitting without re-tiling runs out of room.
+        tmux new-session -d -s gamma -x 120 -y 40 -c "$rt/a"
+        for _ in {1..7}; do tmux split-window -t =gamma:0 -c "$rt/a" && tmux select-layout -t =gamma:0 tiled; done
+        sleep 0.3
+        tmux send-keys -t =alpha:1.1 "AGENT_ENV_PROFILE=work python3 '$rt/agent.py' '$R' UserPromptSubmit aaaa-1" Enter
+        tmux send-keys -t =alpha:0.0 "python3 '$rt/agent.py' '$R' UserPromptSubmit bbbb-2 nested" Enter
+        tmux send-keys -t =beta:0.0 "python3 '$rt/agent.py' '$R' Stop cccc-3" Enter
+        for _ in {1..50}; do
+            [[ $(ls "$rt/home/.local/state/waterbox-resume/now/panes" 2>/dev/null | wc -l) -ge 2 ]] && break
+            sleep 0.1
+        done
+        sleep 0.5
+        python3 "$R" snapshot
+        ino=$(stat -c %i "$rt/home/.local/state/waterbox-resume/now/layout.json")
+        python3 "$R" snapshot
+        [[ "$ino" == "$(stat -c %i "$rt/home/.local/state/waterbox-resume/now/layout.json")" ]] \
+            || { echo "unchanged layout was rewritten"; exit 1; }
+        before=$(tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index} #{pane_current_path} #{window_layout}')
+        tmux kill-server; sleep 0.2                    # the "power cut"
+        python3 "$R" restore
+        after=$(tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index} #{pane_current_path} #{window_layout}')
+        [[ "$(sed 's/%[0-9]*//g' <<< "$before")" == "$(sed 's/%[0-9]*//g' <<< "$after")" ]] \
+            || { echo "layout differs: $before /// $after"; exit 1; }
+        penv() { tr '\0' '\n' < "/proc/$(tmux display -p -t "$1" '#{pane_pid}')/environ" | grep -E '^(WB_RESUME|AGENT_ENV)' | sort | tr '\n' ' '; }
+        [[ "$(penv =alpha:1.1)" == "AGENT_ENV_PROFILE=work WB_RESUME_AGENT=claude WB_RESUME_BUSY=1 WB_RESUME_DIR=$rt/a WB_RESUME_ID=aaaa-1 " ]] \
+            || { echo "busy pane env: $(penv =alpha:1.1)"; exit 1; }
+        [[ "$(penv =beta:0.0)" == *"WB_RESUME_BUSY=0"*"WB_RESUME_ID=cccc-3 " ]] || { echo "idle pane env"; exit 1; }
+        [[ -z "$(penv =alpha:0.0)" ]] || { echo "nested agent was recorded"; exit 1; }
+        [[ -z "$(penv =alpha:1.0)" ]] || { echo "plain pane got a chat"; exit 1; }
+        ! tmux show-environment -t =beta | grep -q '^WB_RESUME' || { echo "restore vars leaked into the session env"; exit 1; }
+    ) || fail "tmux session restore did not reproduce the saved layout and chats"
+    ok "session restore rebuilds the tmux layout and reopens only the pane's own chats"
+else
+    skip_test "functional tmux session restore (tmux unavailable)"
+fi
 
 # Static boundary invariants are intentionally redundant: a future edit should
 # fail loudly if either boot path loses its user namespace, device cgroup, cgroup

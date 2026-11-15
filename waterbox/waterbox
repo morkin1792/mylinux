@@ -4,7 +4,7 @@
 
 set -e
 
-WATERBOX_VERSION="1.18"
+WATERBOX_VERSION="1.19"
 
 # Absolute path to this script, recorded so the shell-completion snippet can fall
 # back to it when 'waterbox' isn't on $PATH (e.g. run by ./waterbox, or moved).
@@ -346,6 +346,8 @@ ${C_HEAD}Box${C_OFF}
   ${C_CMD}restart${C_OFF} [GUI/GPU options]   stop + start (e.g. for display / GPU changes).
   ${C_CMD}status${C_OFF}                      Show if the box is running and its resource limits.
   ${C_CMD}reset${C_OFF}                       Wipe the rootfs and rebuild.
+  ${C_CMD}autostart${C_OFF} [on|off|status]   Boot the box with the host. Sessions and agent chats
+                              come back after any unexpected shutdown.
   ${C_CMD}update${C_OFF}                      Self-update waterbox to the latest release from GitHub.
 
 ${C_HEAD}Scheduling${C_OFF}  ${C_DIM}(bare command opens a TUI; both fire at a set time)${C_OFF}
@@ -432,6 +434,31 @@ Use ${C_CMD}--no-gui${C_OFF} when you want nothing forwarded.
 
 Options may appear before or after the command. Use ${C_CMD}--${C_OFF} before a literal path
 or scheduled command value that is itself named like an option. Session names cannot start with -.
+EOF
+}
+help_autostart() {
+    cat <<EOF
+${C_HEAD}Usage:${C_OFF} ${C_CMD}waterbox autostart${C_OFF} [on|off|status]
+
+${C_HEAD}Session restore${C_OFF} ${C_DIM}(always on, no setup)${C_OFF}
+If the box goes down without '${C_CMD}waterbox stop${C_OFF}', '${C_CMD}restart${C_OFF}' or '${C_CMD}reset${C_OFF}' (power cut,
+host crash or reboot), its next boot recreates the tmux sessions, windows, panes and
+their directories, and reopens the Claude Code or Codex chat that ran in each pane.
+A chat that was mid-task continues on its own: the agent gets one prompt telling it
+to check the interrupted work, then carries on. After a clean stop nothing is restored.
+
+${C_HEAD}Autostart${C_OFF} ${C_DIM}(off by default)${C_OFF}
+Boots the box together with the host, so the restore happens with nobody there,
+and the resumed agents keep working unattended. It always uses the secure mode and
+never forwards GUI or USB; restart with those flags when you are back. A share that
+cannot be mounted at boot keeps the box down, as it would for a manual start.
+
+  ${C_DIM}(no args)${C_OFF} / ${C_CMD}status${C_OFF}   Show whether autostart is on.
+  ${C_CMD}on${C_OFF}                   Boot the box with the host.
+  ${C_CMD}off${C_OFF}                  Stop doing that.
+
+Not restored: programs other than the agent running in a pane (editors, dev servers)
+and background processes an agent had started; the resumed agent restarts what it needs.
 EOF
 }
 help_wake() {
@@ -838,6 +865,7 @@ bootstrap_sandbox() {
     configure_dotfiles
     install_agent_env
     write_task_helper
+    write_resume_helper
     write_statusline
 
     # Mark the build complete (see the sentinel check at the top) and drop the
@@ -938,6 +966,35 @@ if [[ -o interactive && -n "$TMUX" ]]; then
     _wb_mark="/tmp/.waterbox-welcomed-${_wb_sid//[^0-9_]/}"
     [[ -n "$_wb_sid" && ! -e "$_wb_mark" ]] && { waterbox_welcome; : > "$_wb_mark"; }
     unset _wb_sid _wb_mark
+fi
+
+# Session restore (/usr/local/bin/waterbox-resume). After an unexpected shutdown the
+# box recreates its tmux panes and hands each one the chat that ran there through
+# WB_RESUME_*. Reopen it as this shell's first command, so quitting the agent leaves
+# an ordinary shell. A chat that was mid-turn gets one fixed prompt telling the agent
+# to check its interrupted work before carrying on.
+if [[ -o interactive && -n "$WB_RESUME_AGENT" ]]; then
+    () {
+        local agent="$WB_RESUME_AGENT" id="$WB_RESUME_ID" dir="$WB_RESUME_DIR" busy="$WB_RESUME_BUSY"
+        local -a cmd
+        unset WB_RESUME_AGENT WB_RESUME_ID WB_RESUME_DIR WB_RESUME_BUSY
+        [[ "$agent" == (claude|codex) && -n "$id" && "$id" != *[^A-Za-z0-9-]* ]] || return 0
+        (( $+commands[$agent] )) || return 0
+        if [[ -n "$dir" ]] && ! builtin cd -q -- "$dir" 2>/dev/null; then
+            print -r -- "waterbox: this $agent chat ran in '$dir', which no longer exists, so it was not reopened (chat id $id)."
+            return 0
+        fi
+        if [[ "$agent" == claude ]]; then cmd=(claude --resume "$id"); else cmd=(codex resume "$id"); fi
+        print -rs -- ${(q)cmd}   # in history, for a manual re-run
+        if [[ "$busy" == 1 ]]; then
+            print -r -- "waterbox: this chat was mid-task when the box went down unexpectedly; continuing it."
+            waterbox-resume wait-net "$agent"
+            cmd+=("The machine running this session went down unexpectedly (power loss, crash or reboot) while you were working. Your last step may have been cut off, and any background processes you started are gone. Check the current state first (partially written files, half-finished commands, stale locks such as .git/index.lock), then continue the task.")
+        else
+            print -r -- "waterbox: reopening the chat that was open here before the unexpected shutdown."
+        fi
+        "${cmd[@]}"
+    }
 fi
 EOF
     sudo chown 1000:1000 "$JAIL_ROOT/home/$USER_NAME/.zshrc"
@@ -3073,6 +3130,37 @@ status_sandbox() {
     fi
 }
 
+# --- Autostart (opt-in) ---
+# Session restore itself needs no setup: any cold boot after an unexpected shutdown
+# restores. Autostart only removes the need to type 'waterbox' after the host comes
+# back, through one fixed host unit the helper generates.
+AUTOSTART_UNIT="waterbox-autostart.service"
+manage_autostart() {   # on | off | status (default)
+    case "${1:-status}" in
+        on)
+            [ -f "$JAIL_ROOT/.waterbox-ready" ] \
+                || log_error "No built box to autostart. Run 'waterbox start' once first."
+            require_host_deps
+            ensure_helper
+            log_warn "Autostart: the box will boot with the host, and chats that were mid-task when the host went down continue on their own, with nobody watching them."
+            run_priv autostart-enable || log_error "Could not enable autostart."
+            log_success "Autostart on: the box boots with the host (secure mode, no GUI/USB) and restores its sessions after an unexpected shutdown."
+            ;;
+        off)
+            ensure_helper
+            run_priv autostart-disable || log_error "Could not disable autostart."
+            log_success "Autostart off. After an unexpected shutdown, the next 'waterbox' start still restores the sessions."
+            ;;
+        status)
+            if systemctl is-enabled --quiet "$AUTOSTART_UNIT" 2>/dev/null; then
+                log_info "Autostart is on: the box boots with the host and restores its sessions."
+            else
+                log_info "Autostart is off. Turn it on with 'waterbox autostart on'."
+            fi
+            ;;
+    esac
+}
+
 # --- Reset ---
 reset_sandbox() {
     # A reset becomes destructive only after this succeeds. In particular, do not
@@ -3131,6 +3219,12 @@ reset_sandbox() {
             is_running \
                 && log_error "Reset aborted: the sandbox is still running; the rootfs was not touched."
         fi
+    else
+        # A reset is deliberate: it must not be followed by a session restore owed
+        # to an earlier crash. `down` on a stopped box only clears that marker; an
+        # outdated helper (right after an update) would not know it, so refresh it.
+        ensure_helper
+        run_priv down >/dev/null 2>&1 || true
     fi
     teardown_host_network
 
@@ -3252,6 +3346,7 @@ refresh_config() {
     configure_hosts          # box→127.0.0.1 + host reachable by 'host' and its hostname
     write_agent_env_zsh
     write_task_helper
+    write_resume_helper
     write_statusline
     _write_config_version
     log_success "Config refreshed. It will be active on the next start."
@@ -3332,6 +3427,20 @@ EOF
 HW_ETC="/etc/systemd/system"
 TASK_ETC="/etc/systemd/system"      # inside the rootfs ($JAIL_ROOT$TASK_ETC)
 TASK_MSG_DIR="/etc/waterbox"        # inside the rootfs (schedule-command messages)
+# Session restore: a per-user marker that exists from a successful cold boot until a
+# verified `down`. Root-owned and outside both the rootfs (the box cannot touch it)
+# and the user's home (the NOPASSWD caller cannot aim the write at another file).
+RESUME_MARK_DIR="/var/lib/waterbox"
+BOOT_COLD=0                         # set by boot_full when it really booted the box
+
+# wake and autostart can both fire while the host boots. Taking turns stops one from
+# mistaking the other's half-done boot for the user's box (wake would then stop it
+# again and autostart would skip the restore): whichever runs second sees a settled
+# box. A fixed path in root-only /run; held until this helper exits.
+unattended_lock() {
+    exec 9>/run/waterbox-unattended.lock && flock -w 900 9 \
+        || { echo "helper: another unattended Waterbox boot did not finish within 15 minutes" >&2; exit 3; }
+}
 
 # Pull a trailing "--user <uid>" out of the args (a host root timer has no
 # SUDO_UID, so it passes the target uid explicitly). Everything else is positional.
@@ -4232,6 +4341,29 @@ boot_full() {
         power_off || true
         return 3
     fi
+    BOOT_COLD=1
+}
+
+# After a cold boot, classify the previous one. A marker left behind means it never
+# reached a verified `down` (power cut, host reboot, crash), so the box rebuilds its
+# tmux sessions and reopens their chats; otherwise it drops the stale records. Then
+# mark THIS boot live. Never fatal: the box is already up and usable either way.
+# Deliberately not called by boot_min, so an unattended wake-claude boot neither
+# consumes a pending restore nor clears the marker.
+resume_after_boot() {
+    local mark="$RESUME_MARK_DIR/live-$wb_uid" mode=discard
+    [ -e "$mark" ] && mode=restore
+    install -d -m 0755 -o root -g root "$RESUME_MARK_DIR" && : > "$mark" \
+        || echo "helper: could not mark the box as running; an unexpected shutdown will not restore its sessions" >&2
+    if [ "$mode" = restore ]; then
+        echo "The box did not shut down cleanly last time: restoring its tmux sessions and reopening their agent chats (chats that were mid-task continue on their own)."
+    fi
+    # Talks to the box's own systemd over machined; executes nothing from the rootfs
+    # on the host. Bounded because the box controls how long its unit takes.
+    timeout --signal=TERM --kill-after=5s 90s \
+        systemctl -M "$MACHINE_NAME" start "waterbox-resume@$mode.service" >/dev/null 2>&1 \
+        || echo "helper: the box's session $mode step failed; see 'journalctl -u waterbox-resume@$mode' inside the box" >&2
+    return 0
 }
 
 # Run tmux inside the running container as uid 1000 (leader-PID + nsenter). The
@@ -4664,7 +4796,11 @@ _reschedule_on_limit() {
 
 case "$verb" in
     up)    boot_min ;;
-    down)  power_off ;;
+    down)
+        power_off
+        # Only a verified stop is a clean shutdown; the next boot starts fresh.
+        rm -f "$RESUME_MARK_DIR/live-$wb_uid"
+        ;;
     state) running && echo running || echo stopped ;;
     security-state)
         running || { echo stopped; exit 0; }
@@ -4689,6 +4825,37 @@ case "$verb" in
             esac
         done
         boot_full "$gui" "$nogpu" "$unsafe" "$usb"
+        if [ "$BOOT_COLD" = 1 ]; then resume_after_boot; fi
+        ;;
+    autostart)
+        # Run by the opt-in host unit at host boot. Always the secure mode and never
+        # GUI/USB: an unattended boot must not enter --unsafe-host-root, and nobody is
+        # at a desktop yet. A box that only boots unsafely simply fails here.
+        unattended_lock
+        boot_full 0 0 0 0
+        if [ "$BOOT_COLD" = 1 ]; then resume_after_boot; fi
+        ;;
+    autostart-enable)
+        # Fixed unit body; only the validated numeric uid varies.
+        unit="$HW_ETC/waterbox-autostart.service"
+        printf '%s\n' \
+            "[Unit]" "Description=Waterbox: boot the box with the host and restore its sessions" \
+            "Wants=network-online.target" "After=network-online.target" "" \
+            "[Service]" "Type=oneshot" "ExecStart=$0 autostart --user $wb_uid" "TimeoutStartSec=10min" "" \
+            "[Install]" "WantedBy=multi-user.target" \
+            > "$unit"
+        systemctl daemon-reload
+        if ! systemctl enable waterbox-autostart.service >/dev/null 2>&1; then
+            rm -f "$unit"
+            systemctl daemon-reload >/dev/null 2>&1 || true
+            echo "helper: could not enable waterbox-autostart.service" >&2
+            exit 1
+        fi
+        ;;
+    autostart-disable)
+        systemctl disable waterbox-autostart.service >/dev/null 2>&1 || true
+        rm -f "$HW_ETC/waterbox-autostart.service"
+        systemctl daemon-reload
         ;;
     status)
         status_color=0
@@ -4861,6 +5028,7 @@ case "$verb" in
     wake)
         prof="${1:-}"
         _valid_profile "$prof" || { echo "helper: bad profile"; exit 2; }
+        unattended_lock
         # No such account (either layout: new tree, or pre-1.9 flat one): no-op.
         [ -d "$JAIL_ROOT/home/$USER_NAME/.agent-env/claude/$prof" ] \
             || [ -d "$JAIL_ROOT/home/$USER_NAME/.claude-env/$prof" ] || exit 0
@@ -5510,6 +5678,557 @@ _fire_current() {
     grep -q "^# WB_FIRE_VERSION=$WATERBOX_VERSION\$" <<< "$head"
 }
 
+# --- Session restore after an unexpected shutdown (guest side) -----------------
+# The host helper keeps a root-owned "box is live" marker outside the rootfs. A cold
+# boot that still finds it knows the previous boot never reached a verified stop, and
+# starts waterbox-resume@restore inside the box; any other cold boot starts
+# waterbox-resume@discard. Everything below runs inside the box as the guest user:
+# agent hooks note which chat runs in which pane and whether it is mid-turn, a timer
+# snapshots the tmux layout, and restore rebuilds both. The host never reads any of
+# it, so none of it needs the host-side read discipline. Hooks are installed as
+# MANAGED config for both agents: managed hooks run in every profile without
+# touching account settings, and Codex skips unmanaged hooks until a person trusts
+# them in /hooks, which would leave an unattended restore with nothing to restore.
+write_resume_helper() {
+    local etc="$JAIL_ROOT/etc" units="$JAIL_ROOT/etc/systemd/system"
+    local hook_cmd="/usr/local/bin/waterbox-resume hook"
+    _guard_jail_path "$units"
+    _guard_jail_path "$etc/claude-code"
+    _guard_jail_path "$etc/codex"
+    _guard_jail_path "$JAIL_ROOT/var/lib/systemd/linger"
+    sudo mkdir -p "$units" "$etc/claude-code" "$etc/codex" "$JAIL_ROOT/var/lib/systemd/linger"
+    # Linger: the box's systemd starts the user's manager, runtime dir and D-Bus at
+    # every boot, login or not. A restored tmux server starts with no login, and
+    # without this its panes have no XDG_RUNTIME_DIR, user bus or `systemctl --user`.
+    : | wb_tee "$JAIL_ROOT/var/lib/systemd/linger/$USER_NAME"
+
+    wb_tee "$JAIL_ROOT/usr/local/bin/waterbox-resume" <<'RESUMEPY'
+#!/usr/bin/python3 -I
+# waterbox-resume: generated by waterbox and rewritten on every config refresh.
+#
+# Brings the box's tmux sessions back after an UNEXPECTED shutdown (power cut,
+# host reboot, crash) and reopens the agent chat that ran in each pane; chats
+# that were mid-turn get one prompt to check their interrupted work and carry on.
+# Runs only inside the box, as the guest user. The host decides whether the last
+# shutdown was clean (a root-owned marker it keeps outside the rootfs) and starts
+# waterbox-resume@restore or waterbox-resume@discard once per cold boot. Nothing
+# on the host ever reads what this script writes.
+#
+#   hook <agent>       agent hook (Claude Code managed settings / Codex managed
+#                      config): which chat runs in which pane, and is it mid-turn
+#   snapshot           save the tmux layout (timer, every 30 s)
+#   restore            recreate the saved layout and reopen its chats
+#   discard            drop the previous boot's records (it shut down cleanly)
+#   wait-net <agent>   wait until the agent's API answers (at most 5 minutes)
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+
+STATE = os.path.join(os.path.expanduser("~"), ".local", "state", "waterbox-resume")
+NOW = os.path.join(STATE, "now")
+PANES = os.path.join(NOW, "panes")
+LAYOUT = os.path.join(NOW, "layout.json")
+RESTORED = os.path.join(STATE, "restored")   # the set last restored, kept for inspection
+
+AGENT_HOSTS = {"claude": "api.anthropic.com", "codex": "chatgpt.com"}
+SHELLS = {"sh", "bash", "dash", "zsh", "fish"}
+ID_RE = re.compile(r"[A-Za-z0-9-]{1,128}")
+NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
+PANE_RE = re.compile(r"%[0-9]{1,9}")
+RESUME_VARS = ("WB_RESUME_AGENT", "WB_RESUME_ID", "WB_RESUME_DIR", "WB_RESUME_BUSY")
+SEP = "\x1f"
+FIELDS = ("session_name", "window_index", "window_active", "automatic-rename",
+          "window_name", "window_layout", "window_width", "window_height",
+          "pane_index", "pane_id", "pane_pid", "pane_active", "@ce_name",
+          "pane_current_path")
+
+
+def tmux(*args):
+    return subprocess.run(["tmux", *args], capture_output=True, text=True, timeout=15)
+
+
+def as_int(value, lo, hi, default=None):
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return number if lo <= number <= hi else default
+
+
+def read_json(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def write_json(path, data):
+    # fsync + rename: after a power cut the file is either the old or the new copy.
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def is_dir(path):
+    return isinstance(path, str) and path.startswith("/") and os.path.isdir(path)
+
+
+# --- layout -------------------------------------------------------------------
+def live_layout():
+    """The live tmux layout; [] when no server runs; None when it is unknown."""
+    r = tmux("list-panes", "-a", "-F", SEP.join("#{%s}" % f for f in FIELDS))
+    if r.returncode != 0:
+        err = r.stderr.lower()
+        # Every session closed (or none yet): an empty layout is the truth. Any
+        # other failure is not evidence of anything, so keep the last snapshot.
+        return [] if ("no server running" in err or "error connecting" in err) else None
+    sessions = {}
+    for line in r.stdout.splitlines():
+        v = line.split(SEP)
+        if len(v) != len(FIELDS):
+            continue   # a separator/newline inside a name or path: skip that pane
+        f = dict(zip(FIELDS, v))
+        widx = as_int(f["window_index"], 0, 9999)
+        pidx = as_int(f["pane_index"], 0, 9999)
+        ppid = as_int(f["pane_pid"], 1, 1 << 22)
+        if (not NAME_RE.fullmatch(f["session_name"]) or not PANE_RE.fullmatch(f["pane_id"])
+                or None in (widx, pidx, ppid)):
+            continue
+        s = sessions.setdefault(f["session_name"], {"name": f["session_name"], "windows": {}})
+        w = s["windows"].setdefault(widx, {
+            "index": widx,
+            "active": f["window_active"] == "1",
+            "autoname": f["automatic-rename"] not in ("0", "off"),
+            "name": f["window_name"],
+            "layout": f["window_layout"],
+            "width": as_int(f["window_width"], 10, 2000, 200),
+            "height": as_int(f["window_height"], 5, 1000, 50),
+            "panes": [],
+        })
+        w["panes"].append({
+            "index": pidx, "id": f["pane_id"], "pid": ppid,
+            "active": f["pane_active"] == "1",
+            "profile": f["@ce_name"] if NAME_RE.fullmatch(f["@ce_name"]) else "",
+            "path": f["pane_current_path"],
+        })
+    out = []
+    for s in sessions.values():
+        windows = sorted(s["windows"].values(), key=lambda w: w["index"])
+        for w in windows:
+            w["panes"].sort(key=lambda p: p["index"])
+        out.append({"name": s["name"], "windows": windows})
+    return out
+
+
+def snapshot():
+    live = live_layout()
+    if live is None:
+        return
+    data = {"version": 1, "sessions": live}
+    if read_json(LAYOUT) != data:   # every 30 s: skip the fsync when nothing changed
+        write_json(LAYOUT, data)
+    # Forget chats whose pane is gone. Pane ids restart at %0 with every tmux
+    # server, so a record only counts while its id AND shell pid still match.
+    keep = {(p["id"], p["pid"]) for s in live for w in s["windows"] for p in w["panes"]}
+    try:
+        names = os.listdir(PANES)
+    except OSError:
+        return
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        rec = read_json(os.path.join(PANES, name))
+        pid = rec.get("pane_pid") if isinstance(rec, dict) else None
+        if ("%" + name[:-5], pid) not in keep:
+            try:
+                os.unlink(os.path.join(PANES, name))
+            except OSError:
+                pass
+
+
+# --- agent hooks --------------------------------------------------------------
+def parent_of(pid):
+    with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as f:
+        return int(f.read().rsplit(")", 1)[1].split()[1])
+
+
+def comm(pid):
+    with open(f"/proc/{pid}/comm", encoding="utf-8", errors="replace") as f:
+        return f.read().strip()
+
+
+def launched_from_pane(pane_pid):
+    """True when the agent firing this hook is the one the pane's shell started.
+
+    An agent that runs another agent (`codex exec` from Claude's Bash tool, a
+    `claude -p` helper) inherits TMUX_PANE; its hooks must not replace the
+    pane's chat. The agent firing the hook is its nearest non-shell ancestor
+    (hooks may run through sh/bash), and only shells may sit between that agent
+    and the pane's own shell.
+    """
+    pid = os.getppid()
+    for _ in range(64):
+        if pid <= 1:
+            return False
+        if comm(pid) not in SHELLS:
+            break
+        pid = parent_of(pid)
+    if pid == pane_pid:              # `exec claude` replaced the pane's shell
+        return True
+    pid = parent_of(pid)
+    for _ in range(64):
+        if pid == pane_pid:
+            return True
+        if pid <= 1 or comm(pid) not in SHELLS:
+            return False
+        pid = parent_of(pid)
+    return False
+
+
+def shutting_down():
+    try:
+        r = subprocess.run(["systemctl", "is-system-running"], capture_output=True,
+                           text=True, timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        return True
+    return r.stdout.strip() in ("stopping", "")
+
+
+def hook(agent):
+    pane = os.environ.get("TMUX_PANE", "")
+    if agent not in AGENT_HOSTS or not PANE_RE.fullmatch(pane) or not os.environ.get("TMUX"):
+        return
+    data = json.loads(sys.stdin.read(1 << 20))
+    if not isinstance(data, dict):
+        return
+    event, sid = data.get("hook_event_name"), data.get("session_id")
+    if not isinstance(sid, str) or not ID_RE.fullmatch(sid):
+        return
+    r = tmux("display-message", "-p", "-t", pane, "#{pane_pid}")
+    pane_pid = as_int(r.stdout.strip(), 2, 1 << 22)
+    if r.returncode != 0 or pane_pid is None or not launched_from_pane(pane_pid):
+        return
+    path = os.path.join(PANES, pane[1:] + ".json")
+    rec = read_json(path)
+    if not isinstance(rec, dict) or rec.get("pane_pid") != pane_pid:
+        rec = {}                     # a reused pane id from an earlier tmux server
+    same = rec.get("agent") == agent and rec.get("session_id") == sid
+    if event == "SessionEnd":
+        # Only the chat that ended: after /clear the new chat's SessionStart may
+        # already have replaced this record. And not when the box is going down:
+        # a graceful host reboot also counts as unexpected, and its SIGTERM/SIGHUP
+        # ends every chat. (A closed pane fails the lookup above instead; the next
+        # snapshot drops its record.)
+        if same and not shutting_down():
+            os.unlink(path)
+        return
+    if event == "SessionStart":
+        state = rec.get("state", "idle") if same else "idle"   # a restored busy chat stays busy
+    elif event == "UserPromptSubmit":
+        state = "busy"
+    elif event in ("Stop", "Interrupt"):
+        state = "idle"
+    else:
+        return
+    profile = os.environ.get("AGENT_ENV_PROFILE", "")
+    cwd, transcript = data.get("cwd"), data.get("transcript_path")
+    rec.update(
+        agent=agent, session_id=sid, state=state, pane_pid=pane_pid,
+        profile=profile if NAME_RE.fullmatch(profile) else "",
+        cwd=cwd if isinstance(cwd, str) and cwd.startswith("/") else rec.get("cwd", ""),
+        transcript=transcript if isinstance(transcript, str) else rec.get("transcript", ""),
+        updated=int(time.time()),
+    )
+    write_json(path, rec)
+    if event == "SessionStart":
+        snapshot()                   # a new chat counts before the next timer tick
+
+
+# --- restore ------------------------------------------------------------------
+def claude_interrupted(path):
+    """Claude Code fires no Stop hook when you interrupt a turn with Esc; its
+    transcript then ends with an "[Request interrupted by user]" message."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 262144))
+            lines = f.read().splitlines()
+    except (OSError, TypeError, ValueError):
+        return False
+    for line in reversed(lines):
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue                 # a line torn by the power cut, or the cut-off first line
+        if not isinstance(e, dict) or e.get("isSidechain") or e.get("type") not in ("user", "assistant"):
+            continue
+        if e["type"] == "assistant":
+            return False
+        content = (e.get("message") or {}).get("content")
+        texts = [content] if isinstance(content, str) else [
+            c.get("text") for c in content if isinstance(c, dict)] if isinstance(content, list) else []
+        return any(isinstance(t, str) and t.startswith("[Request interrupted by user") for t in texts)
+    return False
+
+
+def load_records(directory):
+    records = {}
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return records
+    for name in names:
+        rec = read_json(os.path.join(directory, name))
+        if (not name.endswith(".json") or not isinstance(rec, dict)
+                or rec.get("agent") not in AGENT_HOSTS
+                or not isinstance(rec.get("session_id"), str)
+                or not ID_RE.fullmatch(rec["session_id"])
+                or not isinstance(rec.get("pane_pid"), int)):
+            continue
+        records[("%" + name[:-5], rec["pane_pid"])] = rec
+    return records
+
+
+def pane_spawn(pane, records):
+    """tmux -c/-e arguments for one saved pane, plus the chat it should reopen."""
+    rec = records.get((pane.get("id"), pane.get("pid")))
+    busy = False
+    if rec:
+        busy = rec.get("state") == "busy" and not (
+            rec["agent"] == "claude" and claude_interrupted(rec.get("transcript")))
+    cwd = rec.get("cwd") if rec and is_dir(rec.get("cwd")) else pane.get("path")
+    if not is_dir(cwd):
+        cwd = os.path.expanduser("~")
+    env = {}
+    profile = (rec or {}).get("profile") or pane.get("profile") or ""
+    if isinstance(profile, str) and NAME_RE.fullmatch(profile):
+        env["AGENT_ENV_PROFILE"] = profile
+    if rec:
+        env.update(WB_RESUME_AGENT=rec["agent"], WB_RESUME_ID=rec["session_id"],
+                   WB_RESUME_DIR=rec.get("cwd") if isinstance(rec.get("cwd"), str) else "",
+                   WB_RESUME_BUSY="1" if busy else "0")
+    args = ["-c", cwd]
+    for key, value in env.items():
+        args += ["-e", f"{key}={value}"]
+    return args, list(env), rec, busy
+
+
+def window_name_args(w):
+    name = w.get("name")
+    if w.get("autoname", True) or not isinstance(name, str) or not name.isprintable() or len(name) > 128:
+        return []
+    return ["-n", name]
+
+
+def restore_session(s, records, existing):
+    name = s.get("name")
+    if not isinstance(name, str) or not NAME_RE.fullmatch(name) or name in existing:
+        return
+    windows = [w for w in s.get("windows") or []
+               if isinstance(w, dict) and as_int(w.get("index"), 0, 9999) is not None
+               and isinstance(w.get("panes"), list) and w["panes"]]
+    fmt = ["-P", "-F", SEP.join(("#{pane_id}", "#{pane_pid}", "#{window_index}"))]
+    created_session = False
+    active_window = None
+    for w in windows:
+        target = f"={name}:{w['index']}"
+        made = []
+        for i, pane in enumerate(w["panes"]):
+            if not isinstance(pane, dict):
+                break
+            args, env_keys, rec, busy = pane_spawn(pane, records)
+            if not created_session:
+                cmd = ["new-session", "-d", "-s", name,
+                       "-x", str(as_int(w.get("width"), 10, 2000, 200)),
+                       "-y", str(as_int(w.get("height"), 5, 1000, 50))]
+                cmd += window_name_args(w) + args + fmt
+            elif i == 0:
+                cmd = ["new-window", "-d", "-t", target] + window_name_args(w) + args + fmt
+            else:
+                # Split the newest pane each time so pane indexes come out in the
+                # saved order, which is the order select-layout fills its cells.
+                cmd = ["split-window", "-d", "-t", made[-1]] + args + fmt
+            r = tmux(*cmd)
+            out = r.stdout.strip().split(SEP)
+            if r.returncode != 0 or len(out) != 3:
+                if not created_session:
+                    return
+                break
+            pane_id, pane_pid, widx = out
+            if not created_session:
+                created_session = True
+                # new-session's -e lands in the SESSION environment, which every
+                # later window would inherit; keep it on this first pane only.
+                for key in env_keys:
+                    tmux("set-environment", "-t", f"={name}", "-u", key)
+                if widx != str(w["index"]):
+                    tmux("move-window", "-s", f"={name}:{widx}", "-t", target)
+            made.append(pane_id)
+            if i:
+                # Re-tile so the next split has room: halving the newest pane each
+                # time runs out of space after ~6 panes. The saved layout follows.
+                tmux("select-layout", "-t", target, "tiled")
+            if rec:
+                seeded = dict(rec, pane_pid=as_int(pane_pid, 1, 1 << 22, 0),
+                              state="busy" if busy else "idle", updated=int(time.time()))
+                write_json(os.path.join(PANES, pane_id[1:] + ".json"), seeded)
+        if not made:
+            continue
+        if len(made) == len(w["panes"]) and isinstance(w.get("layout"), str):
+            tmux("select-layout", "-t", target, w["layout"])
+        for pane, pane_id in zip(w["panes"], made):
+            if isinstance(pane, dict) and pane.get("active"):
+                tmux("select-pane", "-t", pane_id)
+        if w.get("active"):
+            active_window = target
+    if active_window:
+        tmux("select-window", "-t", active_window)
+
+
+def restore():
+    shutil.rmtree(RESTORED, ignore_errors=True)
+    if os.path.isdir(NOW):
+        os.rename(NOW, RESTORED)
+    os.makedirs(PANES, mode=0o700, exist_ok=True)
+    saved = read_json(os.path.join(RESTORED, "layout.json"))
+    sessions = saved.get("sessions") if isinstance(saved, dict) else None
+    if not isinstance(sessions, list):
+        return
+    # This process may start the tmux server; keep systemd's per-unit variables
+    # out of every pane it will ever spawn.
+    for key in ("INVOCATION_ID", "JOURNAL_STREAM", "SYSTEMD_EXEC_PID"):
+        os.environ.pop(key, None)
+    r = tmux("list-sessions", "-F", "#{session_name}")
+    existing = set(r.stdout.split()) if r.returncode == 0 else set()
+    records = load_records(os.path.join(RESTORED, "panes"))
+    for s in sessions:
+        if isinstance(s, dict):
+            try:
+                restore_session(s, records, existing)
+            except (OSError, subprocess.SubprocessError, ValueError):
+                continue             # one broken entry must not cost the others
+    snapshot()
+
+
+def wait_net(agent):
+    host = AGENT_HOSTS.get(agent, "api.anthropic.com")
+    deadline = time.monotonic() + 300
+    told = False
+    try:
+        while True:
+            try:
+                socket.create_connection((host, 443), timeout=5).close()
+                return
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                print("waterbox: still no network after 5 minutes; continuing anyway.", flush=True)
+                return
+            if not told:
+                print("waterbox: waiting for the network before continuing (up to 5 minutes; Ctrl-C skips)...",
+                      flush=True)
+                told = True
+            time.sleep(3)
+    except KeyboardInterrupt:
+        print()
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else ""
+    if cmd == "hook" and len(argv) == 3:
+        try:
+            hook(argv[2])
+        except Exception:            # an agent hook must never fail, print, or block the agent
+            pass
+        return 0
+    if cmd == "snapshot" and len(argv) == 2:
+        snapshot()
+    elif cmd == "restore" and len(argv) == 2:
+        restore()
+    elif cmd == "discard" and len(argv) == 2:
+        shutil.rmtree(NOW, ignore_errors=True)
+    elif cmd == "wait-net" and len(argv) == 3:
+        wait_net(argv[2])
+    else:
+        print("usage: waterbox-resume hook <agent> | snapshot | restore | discard | wait-net <agent>",
+              file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
+RESUMEPY
+    sudo chmod 0755 "$JAIL_ROOT/usr/local/bin/waterbox-resume"
+
+    # Restore must leave the tmux server it starts running after the oneshot exits,
+    # hence RemainAfterExit + KillMode=process. The snapshot timer starts only with a
+    # restore/discard, i.e. only on boots the host classified: an unattended
+    # wake-claude boot never records an empty layout over the one a crash left.
+    printf '%s\n' \
+        "# Managed by Waterbox; rewritten on config refresh." \
+        "[Unit]" "Description=Waterbox session restore (%i)" \
+        "Wants=waterbox-resume-snapshot.timer" "Before=waterbox-resume-snapshot.timer" \
+        "Wants=user@1000.service" "After=user@1000.service" "" \
+        "[Service]" "Type=oneshot" "RemainAfterExit=yes" "KillMode=process" \
+        "User=$USER_NAME" "Group=$USER_NAME" "WorkingDirectory=/home/$USER_NAME" \
+        "Environment=HOME=/home/$USER_NAME" \
+        "Environment=PATH=/usr/local/bin:/usr/bin:/home/$USER_NAME/.local/bin" \
+        "Environment=TMUX_TMPDIR=/tmp" \
+        "Environment=XDG_RUNTIME_DIR=/run/user/1000" \
+        "Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus" \
+        "EnvironmentFile=-/etc/locale.conf" \
+        "ExecStart=/usr/local/bin/waterbox-resume %i" \
+        "TimeoutStartSec=60" \
+        | wb_tee "$units/waterbox-resume@.service"
+    printf '%s\n' \
+        "# Managed by Waterbox; rewritten on config refresh." \
+        "[Unit]" "Description=Waterbox session snapshot" "" \
+        "[Service]" "Type=oneshot" "User=$USER_NAME" "Group=$USER_NAME" \
+        "Environment=HOME=/home/$USER_NAME" \
+        "Environment=PATH=/usr/local/bin:/usr/bin:/home/$USER_NAME/.local/bin" \
+        "Environment=TMUX_TMPDIR=/tmp" \
+        "ExecStart=/usr/local/bin/waterbox-resume snapshot" \
+        "LogLevelMax=warning" \
+        | wb_tee "$units/waterbox-resume-snapshot.service"
+    printf '%s\n' \
+        "# Managed by Waterbox; rewritten on config refresh." \
+        "[Unit]" "Description=Waterbox session snapshot (every 30 s)" "" \
+        "[Timer]" "OnActiveSec=30s" "OnUnitActiveSec=30s" "AccuracySec=5s" \
+        | wb_tee "$units/waterbox-resume-snapshot.timer"
+
+    # Only the four long-standing Claude Code events: an event name a given Claude
+    # Code version does not know could invalidate the whole managed file.
+    wb_tee "$etc/claude-code/managed-settings.json" <<EOF
+{
+  "hooks": {
+    "SessionStart": [{"hooks": [{"type": "command", "command": "$hook_cmd claude", "timeout": 5}]}],
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "$hook_cmd claude", "timeout": 5}]}],
+    "Stop": [{"hooks": [{"type": "command", "command": "$hook_cmd claude", "timeout": 5}]}],
+    "SessionEnd": [{"hooks": [{"type": "command", "command": "$hook_cmd claude", "timeout": 5}]}]
+  }
+}
+EOF
+    {
+        echo "# Managed by Waterbox; rewritten on config refresh. Session-restore hooks."
+        local ev
+        for ev in SessionStart UserPromptSubmit Stop Interrupt SessionEnd; do
+            printf '\n[[hooks.%s]]\n[[hooks.%s.hooks]]\ntype = "command"\ncommand = "%s codex"\ntimeout = 3\n' \
+                "$ev" "$ev" "$hook_cmd"
+        done
+    } | wb_tee "$etc/codex/managed_config.toml"
+}
+
 # Next free schedule-command suffix. Ids are simple sequential handles for `del`;
 # the list output carries the human detail (who, time, mode, command).
 _next_task_id() {
@@ -5985,7 +6704,7 @@ _waterbox_time() {
 _waterbox() {
     local root="$HOME/.waterbox/root"
     local -a cmds items
-    cmds=(start stop restart status reset update share
+    cmds=(start stop restart status reset autostart update share
           wake-claude schedule-command version help)
 
     if (( CURRENT == 2 )); then
@@ -6002,6 +6721,8 @@ _waterbox() {
         restart)
             items=(--gui --no-gui --x11 --no-gpu --usb)
             compadd -a items ;;
+        autostart)
+            (( CURRENT == 3 )) && { items=(on off status); compadd -a items; } ;;
         share)
             if (( CURRENT == 3 )); then items=(add detach list); compadd -a items
             else _files -/; fi ;;
@@ -6088,6 +6809,7 @@ case "${2:-}" in
             share)            help_share ;;
             wake-claude)      help_wake ;;
             schedule-command) help_schedule ;;
+            autostart)        help_autostart ;;
             *)                show_help ;;   # stop/restart/status/reset/update/…
         esac
         exit 0 ;;
@@ -6121,6 +6843,14 @@ case "$_cmd" in
         [ "$#" -eq 1 ] || log_error "Unexpected argument '${2:-}' after '$_cmd'. See 'waterbox --help'."
         [ "${#CLI_FLAGS_SEEN[@]}" -eq 0 ] \
             || log_error "Option '${CLI_FLAGS_SEEN[0]}' is not valid with '$_cmd'."
+        ;;
+    autostart)
+        [ "${#CLI_FLAGS_SEEN[@]}" -eq 0 ] \
+            || log_error "Option '${CLI_FLAGS_SEEN[0]}' is not valid with autostart."
+        case "$#:${2:-}" in
+            1:|2:on|2:off|2:status) ;;
+            *) log_error "Usage: waterbox autostart [on|off|status]" ;;
+        esac
         ;;
     completion)
         [ "$#" -le 2 ] || log_error "Usage: waterbox completion [zsh]"
@@ -6212,6 +6942,7 @@ case "${1:-start}" in
     restart)  restart_sandbox ;;
     status)   status_sandbox ;;
     reset)    reset_sandbox ;;
+    autostart) manage_autostart "$2" ;;
     setup)    ensure_host_privs ;;         # normally automatic on start/reset
     refresh-config) refresh_config ;;      # internal; not shown in help
     completion)     emit_completion "$2" ;; # internal; installed automatically
