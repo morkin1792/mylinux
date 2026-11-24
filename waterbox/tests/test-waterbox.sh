@@ -54,6 +54,10 @@ extract "<<'RESUMEPY'" '^RESUMEPY$' "$TMP/waterbox-resume"
 python3 -m py_compile "$TMP/waterbox-resume"
 ok "generated session-restore helper Python syntax"
 
+extract "<<'WBRC'" '^WBRC$' "$TMP/waterbox-rc"
+bash -n "$TMP/waterbox-rc"
+ok "generated waterbox-rc Bash syntax"
+
 extract "wb_tee .*[.]zshrc.*<<'EOF'" '^EOF$' "$TMP/zshrc"
 if command -v zsh >/dev/null 2>&1; then
     zsh -n "$TMP/zshrc"
@@ -772,6 +776,16 @@ AGENT
         [[ "$(penv =beta:0.0)" == *"WB_RESUME_BUSY=0"*"WB_RESUME_ID=cccc-3 " ]] || { echo "idle pane env"; exit 1; }
         [[ -z "$(penv =alpha:0.0)" ]] || { echo "nested agent was recorded"; exit 1; }
         [[ -z "$(penv =alpha:1.0)" ]] || { echo "plain pane got a chat"; exit 1; }
+        # waterbox-rc: own window in the new folder, same profile, args kept intact.
+        rm "$rt/bin/claude"     # the restore check above is done; now a fake that prints its args
+        printf '#!/bin/sh\nprintf "<%%s>" "$@"; echo; exec sleep 60\n' > "$rt/bin/claude"; chmod +x "$rt/bin/claude"
+        tmux send-keys -t =beta:0.0 "AGENT_ENV_PROFILE=work WATERBOX_RC_WAIT=1 bash '$TMP/waterbox-rc' '$rt/p q' --spawn worktree > '$rt/rc.out' 2>&1" Enter
+        for _ in {1..50}; do grep -q '<remote-control>' "$rt/rc.out" 2>/dev/null && break; sleep 0.1; done
+        grep -qF '<remote-control><--name><p q><--permission-mode><bypassPermissions><--spawn><worktree>' "$rt/rc.out" \
+            || { echo "waterbox-rc output: $(cat "$rt/rc.out")"; exit 1; }
+        [[ "$(tmux display -p -t '=beta:rc-p q' '#{pane_current_path}')" == "$rt/p q" ]] || { echo "waterbox-rc window"; exit 1; }
+        [[ "$(penv '=beta:rc-p q')" == "AGENT_ENV_PROFILE=work " ]] || { echo "waterbox-rc profile"; exit 1; }
+        tmux kill-window -t '=beta:rc-p q'
         [[ "$(penv =delta:0.0)" == "WB_RESUME_AGENT=claude WB_RESUME_BUSY=0 WB_RESUME_DIR=$rt/rc WB_RESUME_RUN=remote-control --name 'x y' " ]] \
             || { echo "remote control pane env: $(penv =delta:0.0)"; exit 1; }
         ! tmux show-environment -t =beta | grep -q '^WB_RESUME' || { echo "restore vars leaked into the session env"; exit 1; }

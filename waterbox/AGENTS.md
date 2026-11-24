@@ -390,6 +390,13 @@ Split of responsibilities:
   `claude remote-control <same args>` in that directory after waiting for the
   network. Keep this an exact allowlist: re-running arbitrary pane commands could
   repeat one with side effects.
+- `claude rc` cannot choose a folder per chat; every chat it spawns has the
+  daemon's folder as project root (history, `CLAUDE.md`, memory). The in-box
+  `waterbox-rc <folder> [rc options]` creates the folder and starts one daemon
+  there in a new tmux window (same agent-env profile, `--name` defaulting to the
+  folder name and `--permission-mode` to `bypassPermissions`, because Remote
+  Control does not start its sessions in the account's `defaultMode`), typed into the window's shell so restore sees and restarts it.
+  It is guest-side convenience only; the host never runs it.
 - Claude Code fires no Stop hook on an Esc interrupt, so restore downgrades a busy
   Claude chat whose transcript ends with "[Request interrupted by user" to idle.
 - A snapshot timer saves the layout every 30 s, writing only when it changed. It
