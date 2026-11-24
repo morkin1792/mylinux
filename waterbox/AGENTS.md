@@ -383,6 +383,13 @@ Split of responsibilities:
   from Claude's Bash tool) inherits `TMUX_PANE` and must not replace the pane's
   chat. Records are keyed by pane id **and** pane shell pid, because pane ids
   restart at `%0` with every tmux server.
+- `claude remote-control` (alias `rc`) is a server, not one chat: the hooks cannot
+  reopen it, and the sessions it spawns are agents run by an agent. The snapshot
+  therefore reads each pane's foreground job from `/proc` and, only when it is
+  exactly `claude rc|remote-control ...`, saves its arguments; restore re-runs
+  `claude remote-control <same args>` in that directory after waiting for the
+  network. Keep this an exact allowlist: re-running arbitrary pane commands could
+  repeat one with side effects.
 - Claude Code fires no Stop hook on an Esc interrupt, so restore downgrades a busy
   Claude chat whose transcript ends with "[Request interrupted by user" to idle.
 - A snapshot timer saves the layout every 30 s, writing only when it changed. It
@@ -814,8 +821,8 @@ Before considering a security change complete, inspect these regressions:
 - USB sharing covers devices present at boot; hotplugged devices need another
   `--usb` boot for access (raw usbfs) or for the bind itself (serial nodes).
 - Disk usage has no equivalent simple hard quota yet.
-- Session restore brings back panes, directories and agent chats, not other
-  programs running in a pane (editors, dev servers) or background processes an
+- Session restore brings back panes, directories, agent chats and a running
+  `claude rc`, not other programs running in a pane (editors, dev servers) or background processes an
   agent had started. Chats started before the hooks existed are not recorded.
 - Codex restore depends on Codex honouring `/etc/codex/managed_config.toml`; if a
   future Codex drops that file, its chats stop being recorded (Claude is unaffected).

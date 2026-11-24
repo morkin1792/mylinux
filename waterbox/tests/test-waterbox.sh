@@ -72,7 +72,7 @@ assert_has "$(cat "$TMP/zshrc")" 'known_marketplaces.json' \
     "zshrc self-heals pre-1.9 marketplace installLocation paths"
 assert_has "$(cat "$TMP/zshrc")" 'cmd=(claude --resume "$id")' "zshrc reopens a restored Claude chat"
 assert_has "$(cat "$TMP/zshrc")" 'cmd=(codex resume "$id")' "zshrc reopens a restored Codex chat"
-assert_has "$(cat "$TMP/zshrc")" 'unset WB_RESUME_AGENT WB_RESUME_ID WB_RESUME_DIR WB_RESUME_BUSY' \
+assert_has "$(cat "$TMP/zshrc")" 'unset WB_RESUME_AGENT WB_RESUME_ID WB_RESUME_DIR WB_RESUME_BUSY WB_RESUME_RUN' \
     "zshrc consumes the restore variables so later shells do not reopen the chat"
 
 extract "cat <<'AGENTENV_HEAD'" '^AGENTENV_HEAD$' "$TMP/agent-head.zsh"
@@ -717,7 +717,10 @@ ok "session restore: marker lifecycle, unattended-boot limits, and managed agent
 # "crash", restore, and check layout, directories and what each pane reopens.
 if command -v tmux >/dev/null 2>&1; then
     rt="$TMP/rt"
-    mkdir -p "$rt/home" "$rt/a" "$rt/b c"
+    mkdir -p "$rt/home" "$rt/a" "$rt/b c" "$rt/bin" "$rt/rc"
+    # Fake `claude rc`: python3 under the name claude runs the script file "rc".
+    ln -s "$(command -v python3)" "$rt/bin/claude"
+    echo 'import time; time.sleep(60)' > "$rt/rc/rc"
     cat > "$rt/agent.py" <<'AGENT'
 # Fake agent: fires the hook the way an agent does. argv: resume event sid [nested]
 import json, os, subprocess, sys
@@ -731,13 +734,14 @@ else:
 AGENT
     (
         unset TMUX TMUX_PANE AGENT_ENV_PROFILE
-        export HOME="$rt/home" TMUX_TMPDIR="$rt" SHELL=/bin/sh
+        export HOME="$rt/home" TMUX_TMPDIR="$rt" SHELL=/bin/sh PATH="$rt/bin:$PATH"
         R="$TMP/waterbox-resume"
         trap 'tmux kill-server 2>/dev/null || true' EXIT
         tmux -f /dev/null new-session -d -s alpha -x 120 -y 40 -c "$rt/a"
         tmux new-window -t =alpha: -c "$rt/b c"
         tmux split-window -h -t =alpha:1 -c "$rt/a"
         tmux new-session -d -s beta -c "$rt/a"
+        tmux new-session -d -s delta -c "$rt/rc"
         # Eight panes in one window: splitting without re-tiling runs out of room.
         tmux new-session -d -s gamma -x 120 -y 40 -c "$rt/a"
         for _ in {1..7}; do tmux split-window -t =gamma:0 -c "$rt/a" && tmux select-layout -t =gamma:0 tiled; done
@@ -745,6 +749,7 @@ AGENT
         tmux send-keys -t =alpha:1.1 "AGENT_ENV_PROFILE=work python3 '$rt/agent.py' '$R' UserPromptSubmit aaaa-1" Enter
         tmux send-keys -t =alpha:0.0 "python3 '$rt/agent.py' '$R' UserPromptSubmit bbbb-2 nested" Enter
         tmux send-keys -t =beta:0.0 "python3 '$rt/agent.py' '$R' Stop cccc-3" Enter
+        tmux send-keys -t =delta:0.0 "claude rc --name 'x y'" Enter
         for _ in {1..50}; do
             [[ $(ls "$rt/home/.local/state/waterbox-resume/now/panes" 2>/dev/null | wc -l) -ge 2 ]] && break
             sleep 0.1
@@ -767,9 +772,17 @@ AGENT
         [[ "$(penv =beta:0.0)" == *"WB_RESUME_BUSY=0"*"WB_RESUME_ID=cccc-3 " ]] || { echo "idle pane env"; exit 1; }
         [[ -z "$(penv =alpha:0.0)" ]] || { echo "nested agent was recorded"; exit 1; }
         [[ -z "$(penv =alpha:1.0)" ]] || { echo "plain pane got a chat"; exit 1; }
+        [[ "$(penv =delta:0.0)" == "WB_RESUME_AGENT=claude WB_RESUME_BUSY=0 WB_RESUME_DIR=$rt/rc WB_RESUME_RUN=remote-control --name 'x y' " ]] \
+            || { echo "remote control pane env: $(penv =delta:0.0)"; exit 1; }
         ! tmux show-environment -t =beta | grep -q '^WB_RESUME' || { echo "restore vars leaked into the session env"; exit 1; }
     ) || fail "tmux session restore did not reproduce the saved layout and chats"
-    ok "session restore rebuilds the tmux layout and reopens only the pane's own chats"
+    ok "session restore rebuilds the tmux layout and reopens only the pane's own chats and claude rc"
+    if command -v zsh >/dev/null 2>&1; then
+        run=$(python3 -c 'import shlex, sys; print(shlex.join(sys.argv[1:]))' remote-control --name "x 'y" '' '$HOME')
+        assert_eq $'claude\nremote-control\n--name\nx \'y\n\n$HOME' \
+            "$(zsh -fc 'cmd=(claude "${(@Q)${(z)1}}"); print -rl -- "${cmd[@]}"' _ "$run")" \
+            "zshrc splits the saved claude rc arguments back exactly"
+    fi
 else
     skip_test "functional tmux session restore (tmux unavailable)"
 fi

@@ -4,7 +4,7 @@
 
 set -e
 
-WATERBOX_VERSION="1.19"
+WATERBOX_VERSION="1.20"
 
 # Absolute path to this script, recorded so the shell-completion snippet can fall
 # back to it when 'waterbox' isn't on $PATH (e.g. run by ./waterbox, or moved).
@@ -443,7 +443,8 @@ ${C_HEAD}Usage:${C_OFF} ${C_CMD}waterbox autostart${C_OFF} [on|off|status]
 ${C_HEAD}Session restore${C_OFF} ${C_DIM}(always on, no setup)${C_OFF}
 If the box goes down without '${C_CMD}waterbox stop${C_OFF}', '${C_CMD}restart${C_OFF}' or '${C_CMD}reset${C_OFF}' (power cut,
 host crash or reboot), its next boot recreates the tmux sessions, windows, panes and
-their directories, and reopens the Claude Code or Codex chat that ran in each pane.
+their directories, and reopens the Claude Code or Codex chat that ran in each pane
+(or restarts 'claude remote-control' / 'claude rc' when that was running there).
 A chat that was mid-task continues on its own: the agent gets one prompt telling it
 to check the interrupted work, then carries on. After a clean stop nothing is restored.
 
@@ -976,17 +977,27 @@ fi
 if [[ -o interactive && -n "$WB_RESUME_AGENT" ]]; then
     () {
         local agent="$WB_RESUME_AGENT" id="$WB_RESUME_ID" dir="$WB_RESUME_DIR" busy="$WB_RESUME_BUSY"
+        local run="$WB_RESUME_RUN"
         local -a cmd
-        unset WB_RESUME_AGENT WB_RESUME_ID WB_RESUME_DIR WB_RESUME_BUSY
-        [[ "$agent" == (claude|codex) && -n "$id" && "$id" != *[^A-Za-z0-9-]* ]] || return 0
+        unset WB_RESUME_AGENT WB_RESUME_ID WB_RESUME_DIR WB_RESUME_BUSY WB_RESUME_RUN
+        if [[ -n "$run" ]]; then
+            # A Remote Control server (`claude rc`): its arguments, shell-quoted.
+            cmd=(claude "${(@Q)${(z)run}}")
+            [[ "$agent" == claude && "$cmd[2]" == remote-control ]] || return 0
+        else
+            [[ "$agent" == (claude|codex) && -n "$id" && "$id" != *[^A-Za-z0-9-]* ]] || return 0
+            if [[ "$agent" == claude ]]; then cmd=(claude --resume "$id"); else cmd=(codex resume "$id"); fi
+        fi
         (( $+commands[$agent] )) || return 0
         if [[ -n "$dir" ]] && ! builtin cd -q -- "$dir" 2>/dev/null; then
-            print -r -- "waterbox: this $agent chat ran in '$dir', which no longer exists, so it was not reopened (chat id $id)."
+            print -r -- "waterbox: '${(q)cmd}' ran in '$dir', which no longer exists, so it was not run again."
             return 0
         fi
-        if [[ "$agent" == claude ]]; then cmd=(claude --resume "$id"); else cmd=(codex resume "$id"); fi
         print -rs -- ${(q)cmd}   # in history, for a manual re-run
-        if [[ "$busy" == 1 ]]; then
+        if [[ -n "$run" ]]; then
+            print -r -- "waterbox: restarting Remote Control, which ran here before the unexpected shutdown."
+            waterbox-resume wait-net claude
+        elif [[ "$busy" == 1 ]]; then
             print -r -- "waterbox: this chat was mid-task when the box went down unexpectedly; continuing it."
             waterbox-resume wait-net "$agent"
             cmd+=("The machine running this session went down unexpectedly (power loss, crash or reboot) while you were working. Your last step may have been cut off, and any background processes you started are gone. Check the current state first (partially written files, half-finished commands, stale locks such as .git/index.lock), then continue the task.")
@@ -5723,6 +5734,7 @@ write_resume_helper() {
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -5740,7 +5752,6 @@ SHELLS = {"sh", "bash", "dash", "zsh", "fish"}
 ID_RE = re.compile(r"[A-Za-z0-9-]{1,128}")
 NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
 PANE_RE = re.compile(r"%[0-9]{1,9}")
-RESUME_VARS = ("WB_RESUME_AGENT", "WB_RESUME_ID", "WB_RESUME_DIR", "WB_RESUME_BUSY")
 SEP = "\x1f"
 FIELDS = ("session_name", "window_index", "window_active", "automatic-rename",
           "window_name", "window_layout", "window_width", "window_height",
@@ -5784,6 +5795,26 @@ def is_dir(path):
 
 
 # --- layout -------------------------------------------------------------------
+def remote_control(pane_pid):
+    """`claude remote-control` (alias `rc`) running in the pane's foreground, as the
+    arguments to start it again; None for anything else. It is a server rather than
+    one chat, so the chat hooks cannot reopen it, and the sessions it spawns are
+    agents started by an agent, which the hooks ignore by design. Only this exact
+    command is restarted: re-running arbitrary pane commands could repeat one with
+    side effects."""
+    try:
+        with open(f"/proc/{pane_pid}/stat", encoding="utf-8", errors="replace") as f:
+            fg = int(f.read().rsplit(")", 1)[1].split()[5])   # tpgid: foreground job
+        with open(f"/proc/{fg}/cmdline", "rb") as f:
+            argv = f.read(65536).decode("utf-8", "replace").split("\0")[:-1]
+    except (OSError, ValueError, IndexError):
+        return None
+    if (len(argv) < 2 or os.path.basename(argv[0]) != "claude"
+            or argv[1] not in ("rc", "remote-control") or not all(a.isprintable() for a in argv)):
+        return None
+    return ["remote-control", *argv[2:]]
+
+
 def live_layout():
     """The live tmux layout; [] when no server runs; None when it is unknown."""
     r = tmux("list-panes", "-a", "-F", SEP.join("#{%s}" % f for f in FIELDS))
@@ -5815,12 +5846,16 @@ def live_layout():
             "height": as_int(f["window_height"], 5, 1000, 50),
             "panes": [],
         })
-        w["panes"].append({
+        pane = {
             "index": pidx, "id": f["pane_id"], "pid": ppid,
             "active": f["pane_active"] == "1",
             "profile": f["@ce_name"] if NAME_RE.fullmatch(f["@ce_name"]) else "",
             "path": f["pane_current_path"],
-        })
+        }
+        run = remote_control(ppid)
+        if run:
+            pane["run"] = run
+        w["panes"].append(pane)
     out = []
     for s in sessions.values():
         windows = sorted(s["windows"].values(), key=lambda w: w["index"])
@@ -6001,7 +6036,12 @@ def load_records(directory):
 
 def pane_spawn(pane, records):
     """tmux -c/-e arguments for one saved pane, plus the chat it should reopen."""
-    rec = records.get((pane.get("id"), pane.get("pid")))
+    run = pane.get("run")
+    if not (isinstance(run, list) and run and run[0] == "remote-control"
+            and all(isinstance(a, str) and a.isprintable() for a in run)):
+        run = None
+    # The foreground command at the last snapshot wins over an older chat record.
+    rec = None if run else records.get((pane.get("id"), pane.get("pid")))
     busy = False
     if rec:
         busy = rec.get("state") == "busy" and not (
@@ -6017,6 +6057,10 @@ def pane_spawn(pane, records):
         env.update(WB_RESUME_AGENT=rec["agent"], WB_RESUME_ID=rec["session_id"],
                    WB_RESUME_DIR=rec.get("cwd") if isinstance(rec.get("cwd"), str) else "",
                    WB_RESUME_BUSY="1" if busy else "0")
+    elif run:
+        env.update(WB_RESUME_AGENT="claude", WB_RESUME_RUN=shlex.join(run),
+                   WB_RESUME_DIR=pane.get("path") if isinstance(pane.get("path"), str) else "",
+                   WB_RESUME_BUSY="0")
     args = ["-c", cwd]
     for key, value in env.items():
         args += ["-e", f"{key}={value}"]
