@@ -427,6 +427,18 @@ helper, runs `waterbox-helper autostart --user <uid>` after `network-online.targ
 It always boots the secure mode, without GUI or USB. A box that only boots in
 explicit unsafe mode simply fails to autostart. Do not add an unsafe or GUI variant.
 
+- The unit has `DefaultDependencies=no` and `Type=simple`. A target waits for every
+  unit it pulls in unless that unit opts out, so the default oneshot held the host's
+  `multi-user.target`, and with it the login screen, behind network-online plus
+  the box's boot and restore. Keep the restated `Conflicts=`/`Before=shutdown.target`.
+- The home may be mounted after the host boots (an encrypted volume unlocked over
+  SSH). The helper's `autostart` verb waits for `~/.waterbox/root/.waterbox-ready`,
+  checking once a minute, before it takes the unattended lock, so a long wait never
+  starves a wake. Shutdown stops the wait.
+- `waterbox start` (via `ensure_host_privs`) re-runs `autostart-enable` when the unit
+  is enabled; the helper rewrites the unit only when its body changed. That is how
+  an enabled unit from an older release gets the current body.
+
 ### Self-update is atomic
 
 The canonical update URL is:

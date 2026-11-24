@@ -4,7 +4,7 @@
 
 set -e
 
-WATERBOX_VERSION="1.21"
+WATERBOX_VERSION="1.22"
 
 # Absolute path to this script, recorded so the shell-completion snippet can fall
 # back to it when 'waterbox' isn't on $PATH (e.g. run by ./waterbox, or moved).
@@ -453,6 +453,9 @@ Boots the box together with the host, so the restore happens with nobody there,
 and the resumed agents keep working unattended. It always uses the secure mode and
 never forwards GUI or USB; restart with those flags when you are back. A share that
 cannot be mounted at boot keeps the box down, as it would for a manual start.
+The host's boot never waits for it. If your home is not there yet (an encrypted
+volume you unlock later, over SSH for example), it checks once a minute and boots
+the box within a minute of the home being mounted.
 
   ${C_DIM}(no args)${C_OFF} / ${C_CMD}status${C_OFF}   Show whether autostart is on.
   ${C_CMD}on${C_OFF}                   Boot the box with the host.
@@ -2599,6 +2602,8 @@ self_update() {
         fi
     fi
     rm -f "$tmp"
+    # New shells pick up the new version's Tab-completion without waiting for a start.
+    [ -f "$CONFIG_DIR/completion.zsh" ] && _refresh_completion_cache "$SELF_PATH" completion
     log_success "Updated waterbox: v$WATERBOX_VERSION → v$remote. The next 'waterbox start' syncs the box to it."
 }
 
@@ -3369,15 +3374,21 @@ refresh_config() {
 # absolute path, else does nothing — so an uninstalled or off-$PATH waterbox never
 # spews "command not found" at shell start. Idempotent + self-healing (rewrites the
 # marked block if SELF_PATH changed); strips any older unguarded lines too.
+# Rewrite the cached completion whenever its CONTENT differs. Not by date: with two
+# copies of waterbox on a host, an older one could write the cache last and leave it
+# newer than the current script, which then never replaced it.
+_refresh_completion_cache() {   # [command that prints the completion for "zsh"]
+    local cache="$CONFIG_DIR/completion.zsh" new
+    [ "$#" -gt 0 ] || set -- emit_completion
+    new=$("$@" zsh 2>/dev/null) && [ -n "$new" ] || return 0
+    [ -f "$cache" ] && [ "$new" = "$(cat "$cache")" ] || printf '%s\n' "$new" > "$cache"
+}
 enable_completion() {
     local rc="$HOME/.zshrc" cache="$CONFIG_DIR/completion.zsh"
     [ -f "$rc" ] || : > "$rc"
     # Cache the generated completion to a file, so every new shell just SOURCES it
     # instead of spawning the whole waterbox script (which made zsh startup slow).
-    # Refresh the cache whenever this script is newer than it.
-    if [ ! -f "$cache" ] || [ "$SELF_PATH" -nt "$cache" ]; then
-        emit_completion zsh > "$cache" 2>/dev/null || : > "$cache"
-    fi
+    _refresh_completion_cache
     # Ensure ~/.zshrc sources the cache (guarded, self-healing — strips any older
     # block or unguarded lines). If waterbox later isn't on $PATH, Tab-completion of
     # live sessions just goes quiet; nothing errors at shell start.
@@ -3473,6 +3484,19 @@ verb="${1:-}"; shift || true
 # other uid) to make the helper read/write another user's home as root.
 [ -n "${SUDO_UID:-}" ] && wb_uid="$SUDO_UID"
 case "$wb_uid" in ''|*[!0-9]*) echo "helper: no valid target user"; exit 2 ;; esac
+# Autostart runs at host boot, possibly before the user's home is unlocked and
+# mounted (an encrypted volume opened over SSH, for example). Wait for the built
+# box, checking once a minute. The unit holds up nothing else in the host's boot,
+# and a host shutdown stops the wait.
+if [ "$verb" = autostart ]; then
+    wb_waited=0
+    until wb_home="$(getent passwd "$wb_uid" | cut -d: -f6)" \
+            && [ -n "$wb_home" ] && [ -f "$wb_home/.waterbox/root/.waterbox-ready" ]; do
+        [ "$wb_waited" = 1 ] || echo "helper: no built box under the home of uid $wb_uid yet (not mounted?); checking every minute"
+        wb_waited=1
+        sleep 60
+    done
+fi
 wb_home="$(getent passwd "$wb_uid" | cut -d: -f6)"
 [ -n "$wb_home" ] && [ -d "$wb_home" ] || { echo "helper: no home for uid $wb_uid"; exit 2; }
 JAIL_ROOT="$wb_home/.waterbox/root"
@@ -4848,14 +4872,26 @@ case "$verb" in
         if [ "$BOOT_COLD" = 1 ]; then resume_after_boot; fi
         ;;
     autostart-enable)
-        # Fixed unit body; only the validated numeric uid varies.
+        # Fixed unit body; only the validated numeric uid varies. DefaultDependencies=no
+        # keeps multi-user.target (and so the login screen) from waiting for this unit:
+        # with the defaults, a target waits for every unit it pulls in, so the host's
+        # boot stalled behind network-online plus the box's whole boot and restore.
+        # The shutdown ordering the defaults gave is restated; a host shutdown stops
+        # a wait for the home (see the top of this helper) within seconds.
         unit="$HW_ETC/waterbox-autostart.service"
-        printf '%s\n' \
+        body=$(printf '%s\n' \
+            "# Managed by Waterbox ('waterbox autostart on|off'); rewritten on start." \
             "[Unit]" "Description=Waterbox: boot the box with the host and restore its sessions" \
-            "Wants=network-online.target" "After=network-online.target" "" \
-            "[Service]" "Type=oneshot" "ExecStart=$0 autostart --user $wb_uid" "TimeoutStartSec=10min" "" \
-            "[Install]" "WantedBy=multi-user.target" \
-            > "$unit"
+            "DefaultDependencies=no" \
+            "Wants=network-online.target" "After=basic.target network-online.target" \
+            "Conflicts=shutdown.target" "Before=shutdown.target" "" \
+            "[Service]" "Type=simple" "ExecStart=$0 autostart --user $wb_uid" "TimeoutStopSec=20s" "" \
+            "[Install]" "WantedBy=multi-user.target")
+        if [ "$(cat "$unit" 2>/dev/null)" = "$body" ] \
+                && systemctl is-enabled --quiet waterbox-autostart.service 2>/dev/null; then
+            exit 0
+        fi
+        printf '%s\n' "$body" > "$unit"
         systemctl daemon-reload
         if ! systemctl enable waterbox-autostart.service >/dev/null 2>&1; then
             rm -f "$unit"
@@ -5181,6 +5217,10 @@ run_priv() { sudo "$HELPER_PATH" "$@"; }
 ensure_host_privs() {
     ensure_helper
     enable_completion
+    # Rewrites an enabled autostart unit from an older release (no-op when current).
+    if systemctl is-enabled --quiet "$AUTOSTART_UNIT" 2>/dev/null; then
+        run_priv autostart-enable || log_warn "Could not update the autostart unit; run 'waterbox autostart on' again."
+    fi
 }
 
 # --- Shares (req 7 safety: refuse paths a sandboxed root could use to escape) --

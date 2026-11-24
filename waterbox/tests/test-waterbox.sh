@@ -308,10 +308,12 @@ awk '
     copying && /^attach_session\(\)/ { exit }
     copying { print }
 ' "$WB" > "$TMP/update-functions.bash"
+awk '/^_refresh_completion_cache\(\)/,/^}/' "$WB" >> "$TMP/update-functions.bash"
 old="$TMP/update-target"
 remote="$TMP/update-remote"
 cache="$TMP/update-cache"
 printf '#!/usr/bin/env bash\nWATERBOX_VERSION="1.0"\necho old\n' > "$old"
+mkdir -p "$TMP/update-cfg"; echo stale > "$TMP/update-cfg/completion.zsh"
 printf '#!/usr/bin/env bash\nWATERBOX_VERSION="9.9"\necho new\n' > "$remote"
 chmod 0751 "$old"
 (
@@ -322,6 +324,7 @@ chmod 0751 "$old"
     PROJECT_URL=https://example.invalid/project
     UPDATE_CHECK_FILE="$cache"
     SELF_PATH="$old"
+    CONFIG_DIR="$TMP/update-cfg"
     log_info() { :; }
     log_success() { :; }
     log_warn() { :; }
@@ -329,6 +332,7 @@ chmod 0751 "$old"
     self_update
 )
 cmp -s "$old" "$remote" || fail "self-update did not install exact remote bytes"
+assert_eq new "$(cat "$TMP/update-cfg/completion.zsh")" "self-update refreshes the cached completion from the new script"
 assert_eq 751 "$(stat -c %a "$old")" "updated script mode"
 before=$(cksum "$old")
 printf '<html>not a script</html>\n' > "$remote"
@@ -341,6 +345,7 @@ set +e
     PROJECT_URL=https://example.invalid/project
     UPDATE_CHECK_FILE="$cache"
     SELF_PATH="$old"
+    CONFIG_DIR="$TMP/update-cfg"
     log_info() { :; }
     log_success() { :; }
     log_warn() { :; }
@@ -690,6 +695,43 @@ assert_eq 1 "$(grep -c 'RESUME_MARK_DIR="/var/lib/waterbox"' "$TMP/helper.bash")
 assert_has "$(grep -B3 -A1 'ensure_helper$' "$WB" | grep -A1 'outdated helper')" 'ensure_helper' \
     "reset of a stopped box refreshes the helper before clearing the marker"
 assert_has "$(grep -A3 '^        on)' "$WB")" '.waterbox-ready' "autostart refuses an unbuilt box"
+# Autostart unit: must not hold up the host's boot, and stops at shutdown.
+au_body=$(awk '/^        body=\$\(printf/,/WantedBy=multi-user.target"\)$/' "$TMP/helper.bash")
+au_unit=$(wb_uid=1000; eval "$(sed 's/^ *//' <<< "$au_body")"; printf '%s\n' "$body")
+for line in DefaultDependencies=no Type=simple Conflicts=shutdown.target Before=shutdown.target \
+        'ExecStart=* autostart --user 1000' WantedBy=multi-user.target; do
+    grep -qx -- "$line" <<< "$au_unit" || [[ "$line" == *'*'* && "$au_unit" == *"autostart --user 1000"* ]] \
+        || fail "autostart unit lacks '$line'"
+done
+! grep -q '^Type=oneshot' <<< "$au_unit" || fail "autostart unit is a oneshot again (blocks multi-user.target)"
+assert_has "$(grep -A12 '^ensure_host_privs()' "$WB")" 'run_priv autostart-enable' \
+    "start regenerates an enabled autostart unit"
+# Autostart waits for a home that is mounted after the host boots.
+(
+    home="$TMP/late-home"; mkdir -p "$home"
+    verb=autostart wb_uid=1000 n=0
+    getent() { echo "u:x:1000:1000::$home:/bin/zsh"; }
+    sleep() { n=$((n + 1)); mkdir -p "$home/.waterbox/root"; : > "$home/.waterbox/root/.waterbox-ready"; }
+    eval "$(awk '/^if \[ "\$verb" = autostart \]; then$/,/^fi$/' "$TMP/helper.bash")"
+    [[ "$n" == 1 && "$wb_home" == "$home" ]] || { echo "waited $n, home $wb_home"; exit 1; }
+) >/dev/null || fail "autostart does not wait for a home mounted later"
+[[ "$(grep -n 'unattended_lock$' "$TMP/helper.bash" | head -1 | cut -d: -f1)" -gt \
+   "$(grep -n '^if \[ "$verb" = autostart \]; then$' "$TMP/helper.bash" | cut -d: -f1)" ]] \
+    || fail "autostart must wait for the home before taking the unattended lock"
+ok "autostart never blocks the host boot and waits for a late-mounted home"
+# Completion cache follows content, not dates.
+(
+    CONFIG_DIR="$TMP/cc"; mkdir -p "$CONFIG_DIR"
+    eval "$(awk '/^_refresh_completion_cache\(\)/,/^}/' "$WB")"
+    emit_completion() { echo "new $1"; }
+    echo old > "$CONFIG_DIR/completion.zsh"; touch -d '+1 day' "$CONFIG_DIR/completion.zsh"
+    _refresh_completion_cache
+    [[ "$(cat "$CONFIG_DIR/completion.zsh")" == "new zsh" ]] || exit 1
+    other() { echo "other $*"; }
+    _refresh_completion_cache other completion
+    [[ "$(cat "$CONFIG_DIR/completion.zsh")" == "other completion zsh" ]]
+) || fail "completion cache is not refreshed by content"
+ok "completion cache refreshes when its content differs, even if it looks newer"
 awk '/^write_resume_helper\(\)/ { copying=1 } /^# Next free schedule-command suffix/ { exit } copying { print }' \
     "$WB" > "$TMP/write-resume.bash"
 (
