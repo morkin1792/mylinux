@@ -1032,12 +1032,16 @@ configure_audio_units() {
         "[Unit]" "ConditionPathExists=/tmp/.waterbox-pipewire" "" \
         "[Service]" "Environment=PIPEWIRE_REMOTE=/tmp/.waterbox-pipewire" \
         | wb_tee "$u/pipewire-pulse.service.d/waterbox.conf"
+    # These leaves are symlinks with absolute targets (a mask to /dev/null; Arch's
+    # own preset links), so resolving the leaf would follow them on the HOST and
+    # wrongly refuse. Guard the directory instead and replace the leaf itself:
+    # ln -T never follows or writes through an existing leaf.
     for unit in pipewire.service pipewire.socket wireplumber.service; do
-        _guard_jail_path "$u/$unit"
-        sudo ln -sfn /dev/null "$u/$unit"
+        _guard_jail_path "$u"
+        sudo ln -sfnT /dev/null "$u/$unit"
     done
-    _guard_jail_path "$u/sockets.target.wants/pipewire-pulse.socket"
-    sudo ln -sfn /usr/lib/systemd/user/pipewire-pulse.socket "$u/sockets.target.wants/pipewire-pulse.socket"
+    _guard_jail_path "$u/sockets.target.wants"
+    sudo ln -sfnT /usr/lib/systemd/user/pipewire-pulse.socket "$u/sockets.target.wants/pipewire-pulse.socket"
 }
 
 # Dotfiles, claude defaults, git identity — all per-user, written once.

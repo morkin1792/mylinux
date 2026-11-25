@@ -1063,8 +1063,28 @@ assert_has "$units" 'Environment=PIPEWIRE_REMOTE=/tmp/.waterbox-pipewire' "in-bo
 for unit in pipewire.service pipewire.socket wireplumber.service; do
     assert_has "$units" "$unit" "in-box $unit is masked"
 done
-assert_eq "$(grep -c 'sudo ln -sfn' <<< "$units")" "$(grep -c '_guard_jail_path "\$u/\$unit"\|_guard_jail_path "\$u/sockets.target.wants/pipewire-pulse.socket"' <<< "$units")" \
-    "every in-rootfs symlink is guarded"
+# Functional: Arch's preset links and our masks have absolute targets that exist
+# on the host; refresh must replace them in place (repeatedly) without following
+# them, and still refuse a redirected directory.
+(
+    log_error() { echo "ERR:$1"; exit 64; }
+    eval "$(awk '/^_in_jail\(\)/,/^}/' "$WB")"
+    eval "$(awk '/^_guard_jail_path\(\)/,/^}/' "$WB")"
+    eval "$(awk '/^wb_tee\(\)/,/^}/' "$WB")"
+    eval "$(awk '/^configure_audio_units\(\)/,/^}/' "$WB")"
+    sudo() { "$@"; }
+    JAIL_ROOT="$TMP/audio-root"; u="$JAIL_ROOT/etc/systemd/user"
+    mkdir -p "$u/sockets.target.wants"
+    ln -s /usr/lib/systemd/user/pipewire-pulse.socket "$u/sockets.target.wants/pipewire-pulse.socket"
+    configure_audio_units; configure_audio_units
+    [[ "$(readlink "$u/pipewire.service")" == /dev/null && "$(readlink "$u/wireplumber.service")" == /dev/null ]]
+    [[ "$(readlink "$u/sockets.target.wants/pipewire-pulse.socket")" == /usr/lib/systemd/user/pipewire-pulse.socket ]]
+    grep -qx 'Environment=PIPEWIRE_REMOTE=/tmp/.waterbox-pipewire' "$u/pipewire-pulse.service.d/waterbox.conf"
+    rm -rf "$JAIL_ROOT/etc/systemd/user"; mkdir -p "$TMP/audio-outside"
+    ln -s "$TMP/audio-outside" "$JAIL_ROOT/etc/systemd/user"
+    [[ "$( (configure_audio_units) 2>&1)" == ERR:Refusing* ]]
+    [[ -z "$(ls -A "$TMP/audio-outside")" ]]
+) || fail "in-box audio unit links must survive refresh and refuse a redirected directory"
 boot_env=$(awk '/^write_boot_env\(\)/,/^}/' "$TMP/helper.bash")
 assert_has "$boot_env" '_in_jail "$target"' "boot-env write is contained"
 ok "audio is PipeWire-only, fixed-path, and served by the box's own pipewire-pulse"
