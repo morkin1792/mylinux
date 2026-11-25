@@ -41,6 +41,8 @@ ok "outer Bash syntax"
 extract "cat <<'HELPER'" '^HELPER$' "$TMP/helper.bash"
 bash -n "$TMP/helper.bash"
 ok "generated privileged helper Bash syntax"
+awk '/^_valid_env_id\(\)/ { c=1 } c && /^# --- end env identity/ { exit } c { print }' "$WB" > "$TMP/env.bash"
+[[ -s "$TMP/env.bash" ]] || fail "could not extract env identity block"
 
 extract "cat <<'FIRE'" '^FIRE$' "$TMP/fire.sh"
 sh -n "$TMP/fire.sh"
@@ -148,11 +150,17 @@ ok "read-only CLI inspection has no configuration side effects"
 # arity, conflicts, and preservation of option-like literal values.
 awk '/^# --- Argument parsing/{copying=1} copying{print}' "$WB" > "$TMP/parser.bash"
 run_parser() {
-    bash -c '
+    CONFIG_DIR="$TMP/parser-cfg" bash -c '
         set -e
         WATERBOX_GUI=0 WATERBOX_X11=0 WATERBOX_NO_GPU=0 WATERBOX_HERE=0
         WATERBOX_UNSAFE_HOST_ROOT=0 WATERBOX_VERSION=test
         _ensure_user_config() { echo INIT; }
+        _valid_env_name() { case "$1" in ""|-*|*[!A-Za-z0-9._-]*) return 1 ;; esac; }
+        _resolve_env() { echo "RESOLVE:${CLI_ENV_NAME:-}"; }
+        _helper_current() { return 0; }
+        env_cmd() { printf "CALL:env"; printf " <%s>" "$@"; echo; }
+        status_all() { echo CALL:status-all; }
+        help_env() { echo CALL:help-env; }
         log_error() { echo "ERR:$1"; exit 64; }
         show_help() { echo CALL:help; }
         help_start() { echo CALL:help-start; }
@@ -227,6 +235,29 @@ assert_has "$(run_parser wake-claude del 12:00)" \
     "CALL:wake <add> <del> <12:00>" "profile named del"
 assert_has "$(run_parser wake-claude del wake-7)" \
     "CALL:wake <del> <wake-7>" "wake deletion dispatch"
+assert_has "$(run_parser env)" "CALL:env" "bare env opens the menu"
+assert_has "$(run_parser env list)" "CALL:env <list>" "env list"
+assert_has "$(run_parser env create gaming)" "CALL:env <create> <gaming>" "env create"
+assert_has "$(run_parser env rename a b)" "CALL:env <rename> <a> <b>" "env rename"
+assert_has "$(run_parser env delete gaming)" "CALL:env <delete> <gaming>" "env delete"
+assert_has "$(run_parser env --help)" "CALL:help-env" "env help"
+assert_has "$(run_parser --env gaming stop)" "RESOLVE:gaming" "--env before the command"
+assert_has "$(run_parser stop --env=gaming)" "RESOLVE:gaming" "--env= after the command"
+assert_has "$(run_parser stop)" "RESOLVE:" "per-box commands always resolve an environment"
+assert_has "$(run_parser status)" "CALL:status-all" "bare status summarizes every environment"
+assert_has "$(run_parser status --env gaming)" "RESOLVE:gaming" "status --env shows one"
+assert_has "$(run_parser start --env gaming alpha)" "CALL:start:<alpha>" "start keeps the session with --env"
+assert_has "$(run_parser schedule-command --env g sess 12:00 pwd)" "RESOLVE:g" "schedule-command takes --env"
+parser_fails env create
+parser_fails env rename a
+parser_fails env delete a b
+parser_fails env bogus
+parser_fails env list --gui
+parser_fails env --env x list
+parser_fails --env gaming update
+parser_fails stop --env
+parser_fails stop --env=
+parser_fails stop --env -bad
 ok "CLI parser rejects ignored/ambiguous arguments and preserves literals after --"
 
 # Account/profile names are embedded in helper argument vectors and systemd unit
@@ -490,6 +521,7 @@ awk '
             CPUQuotaPerSecUSec) echo infinity ;;
         esac
     }
+    slice_property() { unit_property "$@"; }
     resource_status 0
 ) > "$TMP/status.out"
 assert_has "$(cat "$TMP/status.out")" "4.0 GiB / 12.0 GiB max" "status RAM use/max"
@@ -516,7 +548,12 @@ awk '
     net_up
     sysctl() { return 1; }
     ! net_up
-) || fail "net_up swallowed a critical setup failure"
+    # The inter-environment DROP is inserted last, so it sits above every ACCEPT.
+    sysctl() { return 0; }
+    iptables() { printf '%s\n' "$*" >> "$TMP/ipt.log"; [[ "$1" != -C && "$1" != -D ]]; }
+    : > "$TMP/ipt.log"; net_up
+    [[ "$(grep -- '^-I ' "$TMP/ipt.log" | tail -n1)" == '-I FORWARD 1 -i ve-waterbox+ -o ve-waterbox+ -j DROP' ]]
+) || fail "net_up swallowed a critical setup failure, or environments can reach each other"
 assert_eq 0 "$(grep -c 'net_up || true' "$TMP/helper.bash" || true)" "ignored net_up call count"
 ok "network setup failures propagate instead of reporting a broken boot as successful"
 
@@ -531,8 +568,11 @@ awk '
     # shellcheck disable=SC1090
     source "$TMP/host-wake.bash"
     HW_ETC="$TMP/wake-units"
-    wb_uid=1000
+    wb_uid=1000 wb_env=4
     mkdir -p "$HW_ETC"
+    systemctl() { return 0; }
+    _write_host_wake 2 personal '*-*-* 12:00:00' 'personal @ 12:00 daily'
+    grep -qx "ExecStart=$0 --env 4 wake personal --user 1000" "$HW_ETC/waterbox-hostwake-2.service"
     systemctl() {
         [[ "$1" == enable ]] && return 1
         return 0
@@ -540,7 +580,7 @@ awk '
     ! _write_host_wake 1 personal '*-*-* 12:00:00' 'personal @ 12:00 daily' 2>/dev/null
     [[ ! -e "$HW_ETC/waterbox-hostwake-1.timer" ]]
     [[ ! -e "$HW_ETC/waterbox-hostwake-1.service" ]]
-) || fail "failed host wake left orphan unit files"
+) || fail "failed host wake left orphan unit files (or lost its environment)"
 ok "host wake creation rolls back when systemd cannot enable the timer"
 
 # Schedule deletion must preserve failure, not print a false success.
@@ -678,17 +718,19 @@ ok "session rename reports schedule retargeting failures truthfully"
 # Session restore. The host side only classifies the shutdown: a root-owned marker
 # outside the rootfs, set by a successful COLD boot and cleared by a verified stop.
 # Unattended paths never boot unsafely, and a wake boot never consumes a restore.
-assert_has "$(grep -A3 '^    down)' "$TMP/helper.bash")" 'rm -f "$RESUME_MARK_DIR/live-$wb_uid"' \
+assert_has "$(grep -A3 '^    down)' "$TMP/helper.bash")" 'rm -f "$RESUME_MARK"' \
     "verified stop clears the unclean-shutdown marker"
+assert_has "$(grep -A2 '^RESUME_MARK=' "$TMP/helper.bash")" 'RESUME_MARK="$RESUME_MARK-$wb_env"' \
+    "each environment has its own restore marker (env 0 keeps live-<uid>)"
 assert_eq "power_off" "$(grep -A1 '^    down)' "$TMP/helper.bash" | tail -n1 | tr -d ' ')" \
     "marker is cleared only after power_off succeeded"
 assert_eq 2 "$(grep -c 'if \[ "$BOOT_COLD" = 1 \]; then resume_after_boot; fi' "$TMP/helper.bash")" \
     "restore/discard runs after cold boots only"
 assert_eq 0 "$(awk '/^boot_min\(\)/,/^}/' "$TMP/helper.bash" | grep -c resume_after_boot || true)" \
     "wake boots never consume a pending restore"
-assert_has "$(grep -A5 '^    autostart)' "$TMP/helper.bash")" 'boot_full 0 0 0 0' \
-    "autostart boots secure, without GUI or USB"
-assert_has "$(grep -B1 'boot_full 0 0 0 0' "$TMP/helper.bash")" 'unattended_lock' "autostart waits for a wake"
+assert_has "$(grep -A5 '^    autostart)' "$TMP/helper.bash")" 'boot_full 0 0 0 0 0 0' \
+    "autostart boots secure, without GUI, USB, audio or gamepads"
+assert_has "$(grep -B1 'boot_full 0 0 0 0 0 0' "$TMP/helper.bash")" 'unattended_lock' "autostart waits for a wake"
 assert_has "$(awk '/^    wake\)/,/boot_min/' "$TMP/helper.bash")" 'unattended_lock' \
     "wake takes the lock before it can boot"
 assert_eq 1 "$(grep -c 'RESUME_MARK_DIR="/var/lib/waterbox"' "$TMP/helper.bash")" "root-owned marker directory"
@@ -697,10 +739,10 @@ assert_has "$(grep -B3 -A1 'ensure_helper$' "$WB" | grep -A1 'outdated helper')"
 assert_has "$(grep -A3 '^        on)' "$WB")" '.waterbox-ready' "autostart refuses an unbuilt box"
 # Autostart unit: must not hold up the host's boot, and stops at shutdown.
 au_body=$(awk '/^        body=\$\(printf/,/WantedBy=multi-user.target"\)$/' "$TMP/helper.bash")
-au_unit=$(wb_uid=1000; eval "$(sed 's/^ *//' <<< "$au_body")"; printf '%s\n' "$body")
+au_unit=$(wb_uid=1000 wb_env=2; eval "$(sed 's/^ *//' <<< "$au_body")"; printf '%s\n' "$body")
 for line in DefaultDependencies=no Type=simple Conflicts=shutdown.target Before=shutdown.target \
-        'ExecStart=* autostart --user 1000' WantedBy=multi-user.target; do
-    grep -qx -- "$line" <<< "$au_unit" || [[ "$line" == *'*'* && "$au_unit" == *"autostart --user 1000"* ]] \
+        'ExecStart=* --env 2 autostart --user 1000' WantedBy=multi-user.target; do
+    grep -qx -- "$line" <<< "$au_unit" || [[ "$line" == *'*'* && "$au_unit" == *" --env 2 autostart --user 1000"* ]] \
         || fail "autostart unit lacks '$line'"
 done
 ! grep -q '^Type=oneshot' <<< "$au_unit" || fail "autostart unit is a oneshot again (blocks multi-user.target)"
@@ -709,9 +751,10 @@ assert_has "$(grep -A12 '^ensure_host_privs()' "$WB")" 'run_priv autostart-enabl
 # Autostart waits for a home that is mounted after the host boots.
 (
     home="$TMP/late-home"; mkdir -p "$home"
-    verb=autostart wb_uid=1000 n=0
+    source "$TMP/env.bash"
+    verb=autostart wb_uid=1000 n=0 wb_env=2
     getent() { echo "u:x:1000:1000::$home:/bin/zsh"; }
-    sleep() { n=$((n + 1)); mkdir -p "$home/.waterbox/root"; : > "$home/.waterbox/root/.waterbox-ready"; }
+    sleep() { n=$((n + 1)); [[ "$n" -lt 3 ]] || exit 1; mkdir -p "$home/.waterbox/envs/2/root"; : > "$home/.waterbox/envs/2/root/.waterbox-ready"; }
     eval "$(awk '/^if \[ "\$verb" = autostart \]; then$/,/^fi$/' "$TMP/helper.bash")"
     [[ "$n" == 1 && "$wb_home" == "$home" ]] || { echo "waited $n, home $wb_home"; exit 1; }
 ) >/dev/null || fail "autostart does not wait for a home mounted later"
@@ -851,10 +894,23 @@ assert_eq 2 "$(grep -c -- '--property=DevicePolicy=closed' "$WB")" "closed devic
     || fail "private-user isolation missing from a secure path"
 assert_eq 0 "$(grep -E '^[[:space:]]*nsenter ' "$WB" | grep -vc -- '--all' || true)" "partial nsenter count"
 assert_eq 0 "$(grep -Ec '^[[:space:]]*machinectl status' "$TMP/helper.bash" || true)" "raw guest process-tree status count"
-for setting in MemoryHigh MemoryMax MemorySwapMax TasksMax OOMPolicy; do
+for setting in TasksMax OOMPolicy; do
     [[ "$(grep -c -- "--property=$setting" "$WB")" -ge 2 ]] \
         || fail "$setting missing from a boot path"
 done
+# Memory, CPU and I/O limits live on the slice every environment shares, so two
+# running boxes together stay inside the single-box budget.
+assert_eq 2 "$(grep -c -- '--slice=waterbox.slice' "$TMP/helper.bash")" "both boot paths join the shared slice"
+assert_eq 0 "$(grep -cE -- '--property=(MemoryHigh|MemoryMax|MemorySwapMax|CPUWeight|IOWeight)=' "$TMP/helper.bash" || true)" \
+    "per-unit memory/CPU/IO limits would bypass the shared cap"
+slice_fn=$(awk '/^ensure_slice\(\)/,/^}/' "$TMP/helper.bash")
+for setting in MemoryHigh MemoryMax MemorySwapMax CPUWeight IOWeight; do
+    assert_has "$slice_fn" "\"$setting=" "shared slice sets $setting"
+done
+assert_eq 2 "$(grep -c '^    ensure_slice \\$' "$TMP/helper.bash")" "both boot paths fail closed without the slice"
+assert_has "$(sed -n '1,/^verb=/p' "$TMP/helper.bash")" 'if [ "${1:-}" = --env ]; then' "helper takes --env first"
+assert_has "$(grep -A4 'cat <<EOF' "$WB" | head -0; grep -F 'declare -f _valid_env_id _env_ids_apply _env_dir_for' "$WB")" \
+    'declare -f' "helper receives the CLI's environment identity verbatim"
 assert_has "$(grep -n 'MOUNT_ATTR_NOSUID.*MOUNT_ATTR_NODEV' "$TMP/helper.bash")" \
     "MOUNT_ATTR_NOSUID" "share mount nosuid/nodev attributes"
 assert_has "$(grep -A25 'del|detach)' "$WB")" "is_running && ensure_helper" \
@@ -863,6 +919,15 @@ assert_has "$(grep -A40 'del|detach)' "$WB")" "it remains shared" \
     "live detach rollback"
 assert_has "$(grep -F -A8 'if [ "$keep_shares" != 1 ]; then' "$WB")" \
     ': > "$PENDING_SHARE_LIST"' "reset pending-share cleanup"
+{ cat "$TMP/env.bash"; cat "$TMP/helper.bash"; } > "$TMP/helper-run.bash"
+assert_has "$(env -u SUDO_UID bash "$TMP/helper-run.bash" --env 16 state 2>&1 || true)" "bad environment id" \
+    "helper rejects an out-of-range environment"
+assert_has "$(env -u SUDO_UID bash "$TMP/helper-run.bash" state --env 3 2>&1 || true)" "no valid target user" \
+    "helper ignores --env anywhere but first"
+assert_has "$(env -u SUDO_UID bash "$TMP/helper-run.bash" --env 3 state 2>&1 || true)" "no valid target user" \
+    "helper accepts a valid leading --env"
+assert_eq 0 "$(grep -E 'sudo (-n )?"\$HELPER_PATH"' "$WB" | grep -vc '"\$HELPER_PATH" --env "\$WB_ENV"' || true)" \
+    "every helper invocation names the active environment"
 ok "primary isolation, device, namespace, resource, and share-mount invariants"
 
 # USB sharing is opt-in: the flag must reach the helper, the raw-usbfs bind and
@@ -884,6 +949,201 @@ assert_has "$(grep -F -A3 '_guard_jail_path "$JAIL_ROOT/etc/pacman.conf"' "$WB")
 assert_has "$(grep -F -A18 'if ! ( bootstrap_sandbox ); then' "$WB")" \
     "Your original home is safe at" "failed reset home recovery"
 ok "bootstrap retry and post-package host-root writes fail closed"
+
+# --- Environments --------------------------------------------------------------
+# Env identity is a pure function of the id; env 0 keeps every single-box name.
+(
+    log_warn() { :; }
+    # shellcheck disable=SC1090
+    source "$TMP/env.bash"
+    HOME="$TMP/envhome"; CONFIG_DIR="$HOME/.waterbox"; ENV_REGISTRY="$CONFIG_DIR/envs.list"
+    _env_ids_apply 0
+    [[ "$MACHINE_NAME $VE_IFACE $HOST_IP $CONTAINER_IP" == "waterbox ve-waterbox 10.20.30.1 10.20.30.2" ]]
+    _env_ids_apply 15
+    [[ "$MACHINE_NAME $VE_IFACE $HOST_IP" == "waterbox-15 ve-waterbox-15 10.20.45.1" ]]
+    [[ "${#VE_IFACE}" -le 15 ]]
+    ! _valid_env_id 16 && ! _valid_env_id 01 && ! _valid_env_id '' && _valid_env_id 7
+    _use_env 3; [[ "$JAIL_ROOT" == "$HOME/.waterbox/envs/3/root" && "$AUTOSTART_UNIT" == waterbox-autostart-3.service ]]
+    _use_env 0
+    [[ "$JAIL_ROOT" == "$HOME/.waterbox/root" && "$SHARE_LIST" == "$HOME/.waterbox/shared_paths" ]]
+    [[ "$AUTOSTART_UNIT" == waterbox-autostart.service ]]
+    _env_registry_init; [[ "$(_env_rows)" == "0 main" ]]
+    id=$(_env_create gaming); [[ "$id" == 1 ]]
+    ! _env_create gaming >/dev/null 2>&1
+    ! _env_create 'bad name' >/dev/null 2>&1
+    ! _env_create -x >/dev/null 2>&1
+    mkdir -p "$HOME/.waterbox/envs/2/root"                 # leftover rootfs: slot skipped
+    mkdir -p "$HOME/.waterbox/envs/3"; : > "$HOME/.waterbox/envs/3/shared_paths"   # leftover config too
+    [[ "$(_env_create third)" == 4 ]]
+    _env_rename main agents
+    [[ "$(_env_id_of agents)" == 0 && "$(_env_name_of 1)" == gaming ]]
+    ! _env_rename agents gaming >/dev/null 2>&1
+    printf 'junk\n99 x\n2 ok extra\n' >> "$ENV_REGISTRY"
+    [[ "$(_env_rows | wc -l)" == 3 && "$(_env_names)" == "agents gaming third" ]]
+    out=$(_env_create 'b d' 2>/dev/null) || true; [[ -z "$out" ]]   # warnings never land in the id
+) || fail "environment identity/registry"
+ok "environment identity, registry migration, create and rename"
+
+# Environment resolution for per-box commands and the cross-environment picker.
+awk '/^_env_label\(\)/ { c=1 } c && /^# `waterbox env \[list/ { exit } c { print }' "$WB" > "$TMP/env-select.bash"
+awk '/^_session_rows\(\)/ { c=1 } c && /^# Name a new session in the active/ { exit } c { print }' "$WB" > "$TMP/session-rows.bash"
+(
+    log_warn() { :; }; log_info() { :; }
+    log_error() { echo "ERR:$1"; exit 64; }
+    # shellcheck disable=SC1090
+    source "$TMP/env.bash"; source "$TMP/env-select.bash"; source "$TMP/session-rows.bash"
+    HOME="$TMP/selhome"; CONFIG_DIR="$HOME/.waterbox"; ENV_REGISTRY="$CONFIG_DIR/envs.list"
+    mkdir -p "$CONFIG_DIR"; printf '0 main\n' > "$ENV_REGISTRY"
+    RUNNING=" "
+    is_running() { [[ "$RUNNING" == *" $WB_ENV "* ]]; }
+    # One environment: always it, no question asked.
+    CLI_ENV_NAME=""; WB_ENV_RESOLVED=0; _resolve_env </dev/null; [[ "$WB_ENV" == 0 ]]
+    printf '0 main\n1 gaming\n2 spare\n' > "$ENV_REGISTRY"
+    # The only running one wins.
+    RUNNING=" 1 "; WB_ENV_RESOLVED=0; _resolve_env </dev/null; [[ "$WB_ENV" == 1 ]]
+    # Ambiguous without a terminal: an error naming --env, never a guess.
+    RUNNING=" 0 1 "; WB_ENV_RESOLVED=0
+    [[ "$( (_resolve_env </dev/null) )" == ERR:*--env* ]]
+    # --env wins; an unknown name is an error.
+    CLI_ENV_NAME=spare; WB_ENV_RESOLVED=0; _resolve_env; [[ "$WB_ENV" == 2 ]]
+    # A later loop over environments must not leak into the resolved choice.
+    _use_env 0; _resolve_env; [[ "$WB_ENV" == 2 ]]
+    CLI_ENV_NAME=nope; WB_ENV_RESOLVED=0; [[ "$( (_resolve_env) )" == ERR:*nope* ]]
+    # The picker lists running environments' sessions with the environment name.
+    CLI_ENV_NAME=""
+    _live_sessions() { [[ "$WB_ENV" == 0 ]] && printf 'work\nbox\n'; [[ "$WB_ENV" == 1 ]] && echo box; return 0; }
+    _session_rows
+    [[ "${#SR_NAME[@]}" == 3 && "${SR_ENV[2]}" == 1 && "${SR_LABEL[2]}" == *"[gaming]"* ]]
+    CLI_ENV_NAME=gaming; _session_rows; [[ "${#SR_NAME[@]}" == 1 ]]
+    # A named start finds the environment that already has that session.
+    CLI_ENV_NAME=""
+    container_tmux() { [[ "$3" == "=only-gaming" && "$WB_ENV" == 1 ]] || [[ "$3" == "=box" ]]; }
+    [[ "$(_session_matches only-gaming)" == 1 ]]
+    [[ "$(_session_matches box | paste -sd' ')" == "0 1" ]]
+    # Host wakes record their environment; units older than environments mean env 0.
+    HOSTWAKE_GLOB="$TMP/selwake/waterbox-hostwake-"; mkdir -p "$TMP/selwake"
+    echo 'ExecStart=/h --env 2 wake p --user 1000' > "${HOSTWAKE_GLOB}5.service"
+    echo 'ExecStart=/h wake p --user 1000' > "${HOSTWAKE_GLOB}6.service"
+    [[ "$(_hostwake_env 5)" == 2 && "$(_hostwake_env 6)" == 0 ]]
+) || fail "environment resolution and cross-environment session rows"
+start_body=$(awk '/^start_sandbox\(\)/,/^}/' "$WB")
+assert_has "$start_body" '_env_ensure_one' "first start creates an environment"
+assert_has "$start_body" 'exists in several environments' "an ambiguous named session is refused"
+assert_has "$(awk '/^_pick_session\(\)/,/^}/' "$WB")" \
+    'Select a session (↑/↓ move · Enter attach · a new · r rename · d kill · q quit):' "picker prompt kept"
+assert_has "$(awk '/^_env_menu\(\)/,/^}/' "$WB")" \
+    'Select an environment (↑/↓ move · Enter $verb · a new · r rename · d delete · q quit):' "environment menu"
+assert_has "$(awk '/^restart_sandbox\(\)/,/^}/' "$WB")" 'CLI_ENV_NAME=' "restart comes back in its environment"
+del_body=$(awk '/^_env_delete\(\)/,/^}/' "$WB")
+assert_has "$del_body" 'Stop it first' "delete refuses a running environment"
+assert_has "$del_body" 'Type the environment name' "delete requires the name typed back"
+assert_has "$del_body" 'realpath -e -- "$JAIL_ROOT"' "delete refuses a redirected rootfs path"
+[[ "$(grep -n '_remove_env_hostwakes \\' <<< "$del_body" | cut -d: -f1)" -lt \
+   "$(grep -n 'sudo rm -rf -- "$JAIL_ROOT"' <<< "$del_body" | cut -d: -f1)" ]] \
+    || fail "delete must drop the environment's wakes before its rootfs"
+assert_has "$(awk '/^reset_sandbox\(\)/,/^}/' "$WB")" '_remove_env_hostwakes' "reset removes only its environment's wakes"
+ok "environment resolution, cross-environment picker and delete safeguards"
+
+# --audio: PipeWire only, fixed host path, the host Pulse socket never exposed;
+# the guest runs its own pipewire-pulse against it.
+assert_has "$(run_parser start --audio)" "CALL:start" "start accepts --audio"
+assert_has "$(run_parser restart --gamepad)" "CALL:restart" "restart accepts --gamepad"
+parser_fails status --audio
+parser_fails reset --gamepad
+parser_fails share list --audio
+audio_fn=$(awk '/^collect_audio_mount\(\)/,/^}/' "$TMP/helper.bash")
+assert_has "$audio_fn" 'sock="/run/user/$wb_uid/pipewire-0"' "audio accepts only the host user's PipeWire socket"
+assert_has "$audio_fn" '[ ! -L "$sock" ]' "audio rejects a symlinked socket"
+assert_has "$audio_fn" '[ ! -L "$dir" ]' "audio rejects a symlinked runtime dir"
+assert_eq 0 "$(grep -c 'pulse/native' "$WB" || true)" "the host Pulse socket is never mounted"
+assert_has "$(grep -F -A4 'allowed_gui = {' "$TMP/helper.bash")" '/tmp/.waterbox-pipewire' "mount shim allows only the fixed audio target"
+assert_has "$(cat "$TMP/zshrc")" '[ -f /etc/waterbox/boot-env ] && source /etc/waterbox/boot-env' "shell sources the boot env"
+units=$(awk '/^configure_audio_units\(\)/,/^}/' "$WB")
+assert_has "$units" 'Environment=PIPEWIRE_REMOTE=/tmp/.waterbox-pipewire' "in-box pipewire-pulse targets the host graph"
+for unit in pipewire.service pipewire.socket wireplumber.service; do
+    assert_has "$units" "$unit" "in-box $unit is masked"
+done
+assert_eq "$(grep -c 'sudo ln -sfn' <<< "$units")" "$(grep -c '_guard_jail_path "\$u/\$unit"\|_guard_jail_path "\$u/sockets.target.wants/pipewire-pulse.socket"' <<< "$units")" \
+    "every in-rootfs symlink is guarded"
+boot_env=$(awk '/^write_boot_env\(\)/,/^}/' "$TMP/helper.bash")
+assert_has "$boot_env" '_in_jail "$target"' "boot-env write is contained"
+ok "audio is PipeWire-only, fixed-path, and served by the box's own pipewire-pulse"
+
+# --gamepad: joysticks and their own hidraw only, exact-path DeviceAllow, and a
+# guard that revokes a node once it is unplugged (its number may go to a keyboard).
+awk '/^_is_chardev\(\)/ { c=1 } c && /^# --- end gamepad collect/ { exit } c { print }' "$TMP/helper.bash" > "$TMP/pad.bash"
+[[ -s "$TMP/pad.bash" ]] || fail "could not extract gamepad selection"
+(
+    # shellcheck disable=SC1090
+    source "$TMP/pad.bash"
+    S="$TMP/pad/sys" U="$TMP/pad/udev" D="$TMP/pad/dev"
+    mkdir -p "$S/class/input" "$S/class/hidraw" "$U" "$D/input"
+    mk() {  # node minor hid-device udev-props...
+        local n=$1 m=$2 hid=$3 in="$S/devices/$3/input/input$2"; shift 3
+        mkdir -p "$in/$n"
+        ln -s "../../devices/$hid/input/input$m/$n" "$S/class/input/$n"
+        ln -s ../.. "$in/device"; ln -s .. "$in/$n/device"
+        echo "13:$m" > "$in/$n/dev"
+        printf 'E:%s\n' "$@" > "$U/c13:$m"; : > "$D/input/$n"
+    }
+    mk event5 69 hidpad ID_INPUT=1 ID_INPUT_JOYSTICK=1
+    mkdir -p "$S/devices/hidpad/input/input69/js0"; : > "$D/input/js0"
+    mk event6 70 hidkbd ID_INPUT=1 ID_INPUT_KEY=1 ID_INPUT_KEYBOARD=1
+    mk event7 71 hidcombo ID_INPUT=1 ID_INPUT_JOYSTICK=1 ID_INPUT_KEYBOARD=1
+    mk event8 72 hidmouse ID_INPUT=1 ID_INPUT_MOUSE=1
+    # A keyboard whose media collection is misdetected as a joystick: same HID
+    # device (and hidraw) as its key reports, so nothing of it may pass.
+    mk event9 73 hidkbd2 ID_INPUT=1 ID_INPUT_JOYSTICK=1
+    mk event10 74 hidkbd2 ID_INPUT=1 ID_INPUT_KEY=1 ID_INPUT_KEYBOARD=1
+    for h in 0:hidpad 1:hidkbd 2:hidcombo 3:fidokey 4:hidkbd2; do
+        mkdir -p "$S/devices/${h#*:}" "$S/class/hidraw/hidraw${h%%:*}"
+        ln -s "../../../devices/${h#*:}" "$S/class/hidraw/hidraw${h%%:*}/device"
+        : > "$D/hidraw${h%%:*}"
+    done
+    _is_chardev() { [ -e "$1" ] && [ ! -L "$1" ]; }
+    collect_gamepad_nodes "$S" "$U" "$D"
+    [[ "${GAMEPAD_NODES[*]}" == "$D/input/event5 $D/input/js0 $D/hidraw0" ]] \
+        || { echo "selected: ${GAMEPAD_NODES[*]}"; exit 1; }
+    # Each pick carries the sysfs identity the guard compares against later.
+    [[ "${#GAMEPAD_IDS[@]}" == 3 && "${GAMEPAD_IDS[0]}" == "$(realpath "$S/devices/hidpad/input/input69/event5")" ]]
+) || fail "gamepad selection must pass only joysticks, their js nodes and their own hidraw"
+assert_eq 0 "$(grep -E 'bind=.*uinput|DeviceAllow=.*uinput' "$TMP/helper.bash" | wc -l)" "uinput is never bound or allowed"
+assert_eq 0 "$(grep -cE 'char-input|char-hidraw' "$TMP/helper.bash" || true)" "no whole-major input/hidraw DeviceAllow"
+full_boot=$(awk '/^boot_full\(\)/,/^}/' "$TMP/helper.bash")
+assert_has "$full_boot" 'props+=(--property=DeviceAllow="$n rw")' "each gamepad node is allowed by exact path"
+assert_has "$full_boot" 'devguard_start "${allow_list[@]}" || ! gamepad_grant' "guard runs before access is granted, failure stops the box"
+guard=$(awk '/^    devguard\)/,/^        ;;$/' "$TMP/helper.bash")
+assert_has "$guard" '[ -z "${SUDO_UID:-}" ]' "the guard cannot be driven through sudo"
+assert_has "$guard" '"UDEV - "*)' "the guard re-checks nodes once it listens"
+assert_has "$(awk '/^devguard_drop\(\)/,/^}/' "$TMP/helper.bash")" 'set-property --runtime "$MACHINE_NAME.service"' \
+    "the guard narrows the running unit's DeviceAllow"
+assert_has "$(awk '/^devguard_start\(\)/,/^}/' "$TMP/helper.bash")" '--property=BindsTo="$MACHINE_NAME.service"' \
+    "the guard lives and dies with its box"
+assert_has "$(awk '/^usb_revoke\(\)/,/^}/' "$TMP/helper.bash")" '/dev/hidraw*' "stop revokes gamepad ACLs"
+assert_has "$(awk '/^power_off\(\)/,/^}/' "$TMP/helper.bash")" 'devguard_clear' "stop removes the guard and its state"
+(
+    # devguard_drop rewrites the recorded list and applies all remaining entries.
+    eval "$(awk '/^devguard_drop\(\)/,/^}/' "$TMP/helper.bash")"
+    DEVGUARD_ALLOW="$TMP/guard-allow" DEVGUARD_PADS="$TMP/guard-pads" MACHINE_NAME=waterbox-2
+    printf '%s\n' 'char-pts rw' '/dev/input/event5 rw' '/dev/input/event55 rw' > "$DEVGUARD_ALLOW"
+    printf '%s\n' '/dev/input/event5 /sys/a' '/dev/input/event55 /sys/b' > "$DEVGUARD_PADS"
+    logger() { :; }
+    # A failed narrowing stops the box and keeps the node recorded (fail closed).
+    systemctl() { printf '%s\n' "$*" >> "$TMP/guard-fail"; [[ "$1" != set-property ]]; }
+    ! devguard_drop /dev/input/event5
+    grep -qx 'stop waterbox-2.service' "$TMP/guard-fail"
+    grep -qx '/dev/input/event5 rw' "$DEVGUARD_ALLOW"
+    systemctl() { printf '%s\n' "$@" > "$TMP/guard-call"; }
+    devguard_drop /dev/input/event5
+    [[ "$(cat "$DEVGUARD_ALLOW")" == $'char-pts rw\n/dev/input/event55 rw' ]]
+    [[ "$(cat "$DEVGUARD_PADS")" == '/dev/input/event55 /sys/b' ]]
+    [[ "$(cat "$TMP/guard-call")" == $'set-property\n--runtime\nwaterbox-2.service\nDeviceAllow=\nDeviceAllow=char-pts rw\nDeviceAllow=/dev/input/event55 rw' ]]
+) || fail "device guard must drop exactly the removed node, and fail closed"
+assert_has "$(awk '/^devguard_start\(\)/,/^}/' "$TMP/helper.bash")" 'changed device during the boot' \
+    "a node that changed device before the guard started fails the boot"
+assert_has "$(awk '/^devguard_start\(\)/,/^}/' "$TMP/helper.bash")" 'StartLimitIntervalSec=0' \
+    "the guard is never rate-limited into staying down"
+ok "gamepads: joysticks only, exact-path access, guarded against minor-number reuse"
 
 printf '# %d checks passed, %d skipped\n' "$pass" "$skip"
 printf '1..%d\n' "$count"

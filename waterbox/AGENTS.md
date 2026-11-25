@@ -13,8 +13,8 @@ local details.
 
 ## What Waterbox is
 
-Waterbox is a self-contained Bash program that creates and operates an Arch Linux
-root filesystem under `~/.waterbox/root` using `systemd-nspawn`. It is intended
+Waterbox is a self-contained Bash program that creates and operates Arch Linux
+root filesystems ("environments") under `~/.waterbox` using `systemd-nspawn`. It is intended
 for running CLI AI agents in their least restrictive/bypass modes while making
 the container—not each agent’s own sandbox—the security boundary.
 
@@ -75,6 +75,59 @@ tradeoffs clear rather than claiming perfect isolation.
 
 These choices were made deliberately. Do not reverse them incidentally while
 fixing an adjacent problem.
+
+### Environments are separate boxes
+
+One host user can own up to 16 environments. Each is a complete, independent box:
+own rootfs, guest home, packages, shares, systemd machine and veth subnet. The use
+case is one main environment for agent work plus occasional special-purpose ones
+(for example a gaming box) whose packages and devices should not mix with it.
+
+Identity:
+
+| | env 0 | env N (1–15) |
+|---|---|---|
+| Config dir | `~/.waterbox` | `~/.waterbox/envs/N` |
+| Rootfs | `~/.waterbox/root` | `~/.waterbox/envs/N/root` |
+| Machine / unit | `waterbox` | `waterbox-N` |
+| Host iface | `ve-waterbox` | `ve-waterbox-N` |
+| Subnet | `10.20.30.0/24` | `10.20.(30+N).0/24` |
+| Restore marker | `/var/lib/waterbox/live-<uid>` | `/var/lib/waterbox/live-<uid>-N` |
+| Autostart unit | `waterbox-autostart.service` | `waterbox-autostart-N.service` |
+
+- Env 0 keeps every path and identifier of the single-box releases, so upgrading
+  moves no data and old autostart units/wake timers keep targeting it.
+- Every identifier follows from the numeric id through `_env_ids_apply`, which
+  the helper receives verbatim (`declare -f`). Never derive one twice.
+- Names are labels in the ordinary-user registry `~/.waterbox/envs.list`
+  (`<id> <name>`). Nothing privileged reads it. Rename edits only that line and is
+  allowed while the environment runs. The first run (or the first run after an
+  upgrade) writes `0 main`.
+- The CLI activates one environment with `_use_env <id>` and then runs the
+  single-box code unchanged. Every helper call goes through `run_priv` /
+  `run_priv_quiet` (or the literal `exec … --env "$WB_ENV" shell`), which pass
+  `--env <id>` as the first two arguments. The helper accepts `--env` only there,
+  so no later argument (a tmux argument, an API key) can be reinterpreted; a
+  missing `--env` means env 0.
+- Per-box commands pick the environment with `_resolve_env`: `--env <name>`, else
+  the only environment, else the only running one, else the environment menu on a
+  terminal, else an error. Never guess between several.
+- The session picker lists sessions of every running environment with the
+  environment name. Enter attaches in that session's environment without asking;
+  `a` asks which environment (booting it if needed). Session names are unique only
+  within one environment; a named `start` that matches several is refused.
+- Delete refuses a running environment, requires the name typed back, removes the
+  environment's wakes and autostart first, refuses a `JAIL_ROOT` that resolves
+  elsewhere, and uses interactive sudo like reset. Shared host folders are never
+  touched. A new environment never adopts a leftover rootfs under a free id.
+- Environments never reach each other over the network: `net_up` keeps one
+  `FORWARD -i ve-waterbox+ -o ve-waterbox+ -j DROP` above every per-environment
+  ACCEPT (re-inserted on top each time); `net_down` removes it once no other
+  environment's veth exists. Without it, MASQUERADE would even present one box's
+  traffic to another as coming from `host`. Each still reaches the host itself.
+- Host-root containment is unchanged: `JAIL_ROOT` stays literal per environment.
+  Shares may never include any part of `~/.waterbox` (it holds every rootfs and
+  the files each helper trusts), in the CLI and the helper alike.
 
 ### Private users are the primary boundary
 
@@ -215,6 +268,64 @@ Rules for this feature:
   nodes plugged in later are not bound at all. Do not add udev hooks or a
   device manager without a new design decision.
 
+### Audio is PipeWire-only and explicit
+
+`--audio` (on `start`/`restart`) binds the host user's
+`/run/user/<uid>/pipewire-0` — fixed path, a socket owned by that user, no
+symlinks — ID-mapped to `/tmp/.waterbox-pipewire`. The box runs its own
+`pipewire-pulse` against it (managed user-unit drop-in; the box's own
+`pipewire`/`wireplumber` units are masked), so Pulse and ALSA programs work.
+
+- Never mount the host Pulse socket: a Pulse client can make the server load
+  modules (a TCP listener, for example). With the box's own pipewire-pulse, those
+  modules load inside the box.
+- No PipeWire on the host: clear error, no fallback.
+- Per boot, never persisted, never used by autostart or wake.
+- Warning: the box is an unrestricted client of the host's PipeWire. Besides the
+  microphone and all audio, PipeWire's node/device factories may let a client
+  name a plugin library to load (the `library.name` path), which would be code
+  running as the host user. Treat `--audio` like `--x11`: only for a box trusted
+  that far. The proper fix is a restricted-access socket with session-manager
+  rules granting only playback/capture; that needs per-host PipeWire config and
+  was deferred, not rejected.
+- `/etc/waterbox/boot-env` is written by the helper from what it accepted; never
+  copy a user-writable file there.
+- Packages (`pipewire pipewire-pulse pipewire-alsa`) are in `PKGS` for new builds.
+  Existing boxes are never upgraded implicitly; the shell prints the install line.
+
+### Gamepads are explicit, exact, and guarded
+
+`--gamepad` (on `start`/`restart`) passes the controllers present at boot:
+
+- `/dev/input/event*` whose udev record has `ID_INPUT_JOYSTICK=1`, their `js*`
+  nodes, and only the `hidraw*` nodes of those same devices — skipping any device
+  where any input node is `ID_INPUT_KEYBOARD=1` (keyboards with a misdetected
+  media/"joystick" collection share their HID interface and hidraw with the key
+  reports). Security keys' hidraw never qualifies.
+- Each node's sysfs identity is recorded at selection; `devguard_start` fails the
+  boot if any node changed device before the guard runs.
+- Each node gets its own `--bind` and exact-path `DeviceAllow`; never the
+  `char-input`/`hidraw` majors (unsafe-mode root could otherwise mknod a keyboard).
+- ACLs like `--usb`, granted after a successful boot, revoked on stop.
+- `/dev/uinput` is never passed: a virtual keyboard could type into the host
+  session. Steam Input virtual pads do not work; native controller support does.
+- The box gets `SDL_JOYSTICK_DISABLE_UDEV=1`; no udev database is synthesized.
+- **Minor-number reuse guard.** Bind and device cgroup both work by major:minor.
+  When a pad is unplugged its minor is freed and the next input/hidraw device (a
+  keyboard, a security key) may receive it. The helper therefore starts
+  `<machine>-devguard.service` (`BindsTo=` the box, `Restart=always`) before
+  granting access. It follows `udevadm monitor` and, when a passed node goes away,
+  rewrites `/run/waterbox/devallow-<uid>-<env>` without it and reapplies the list
+  with `systemctl set-property --runtime`. Once listening (and after every
+  restart) it re-checks each node's sysfs identity, so removals are never missed.
+  Any `add` event re-checks all nodes too (covers a missed remove). The narrowed
+  list is applied before it is recorded; if `set-property` fails the guard stops
+  the box (fail closed). `StartLimitIntervalSec=0` keeps a crashing guard
+  restarting. The guard refuses to run through sudo. A guard that cannot start
+  fails the boot.
+- Per boot, never persisted, never used by autostart or wake. Hotplugged
+  controllers need another `--gamepad` boot.
+
 ### Clipboard behavior is universal
 
 tmux mouse mode stays enabled everywhere so scrolling and pane interaction work.
@@ -242,6 +353,14 @@ Do not:
   gives guest processes another channel to the host clipboard.
 
 ### Resource limits are static and intentionally simple
+
+All environments run in `waterbox.slice`, a runtime unit the helper writes
+(`/run/systemd/system/waterbox.slice`, rewritten only when its body changes). The
+memory, swap, CPU and I/O limits live on that slice, so every running environment
+together stays inside the single-box budget; per-unit memory limits would bypass
+it. `TasksMax` and `OOMPolicy` stay per environment. Consequence: under memory
+pressure the kernel may OOM-kill a process in any running environment, not only
+the one using most. A failure to write the slice fails the boot.
 
 Current defaults:
 
@@ -272,8 +391,9 @@ host capacity, while ordinary host work wins under contention. A dynamic
 host-memory controller was considered and rejected as unnecessary complexity.
 
 `waterbox status` should show the useful live values with color on a terminal and
-plain output when piped: current RAM, maximum, remaining RAM, pressure threshold,
-CPU policy/weight, and current/max tasks. Swap does not need a prominent status
+plain output when piped: current RAM (all environments), maximum, remaining RAM,
+pressure threshold, CPU policy/weight, and current/max tasks. Without `--env` it
+first lists every environment's state. Swap does not need a prominent status
 line.
 
 ### Agent accounts are unified across supported agents
@@ -556,7 +676,8 @@ service-unit device policy. The transient host unit must therefore set:
 
 - `DevicePolicy=closed`;
 - explicit access for PTYs, `/dev/net/tun`, and `/dev/fuse`;
-- DRM access only when `/dev/dri` is intentionally bound.
+- DRM access only when `/dev/dri` is intentionally bound;
+- gamepad nodes only by exact path, under the device guard (see above).
 
 This is critical. Without the closed device policy, a retained capability such as
 `CAP_MKNOD` can become useful for creating a host block-device node and mounting
@@ -602,6 +723,8 @@ Important areas in `waterbox`:
 | Area | Main symbols/section |
 |---|---|
 | Global policy and dependencies | configuration near the top |
+| Environment identity | `_env_ids_apply`, `_use_env`, registry `_env_*` functions |
+| Environment selection | `_resolve_env`, `_env_menu`, `_env_delete`, `env_cmd`, `status_all` |
 | Agent extensibility | `AGENTS`, `_agent_settings_template` |
 | Rootfs write safety | `_in_jail`, `wb_tee` |
 | Arch image trust | `verify_tarball` |
@@ -609,9 +732,10 @@ Important areas in `waterbox`:
 | Rootfs/bootstrap | `bootstrap_sandbox`, `configure_dotfiles` |
 | Profiles | generated `agent-env` functions, migration helpers |
 | GUI forwarding | `build_gui_bind_args`, helper GUI collectors |
-| Sessions/TUI | `attach_session`, chooser/task-manager helpers |
+| Sessions/TUI | `_pick_session`, `_session_rows`, `attach_session`, chooser/task-manager helpers |
 | Update | `_spawn_update_check`, `_update_notice`, `self_update` |
-| Lifecycle | `start_sandbox`, `stop_sandbox`, `restart_sandbox`, `reset_sandbox` |
+| Lifecycle | `start_sandbox`, `_env_up`, `stop_sandbox`, `restart_sandbox`, `reset_sandbox` |
+| Audio / gamepads | helper `collect_audio_mount`, `collect_gamepad_nodes`, `devguard_*`, verb `devguard`; guest `configure_audio_units` |
 | Status/resources | `status_sandbox`, helper `resource_status` |
 | Privileged boundary | `install_helper` and its `HELPER` heredoc |
 | Live shares | host share policy plus helper `mount_into_box` |
@@ -807,7 +931,13 @@ iptables, GUI sockets, or OOM behavior are involved. Important platform coverage
 - native and unsupported share filesystems;
 - cold boot and live add/detach for shares;
 - session restore: a hard host power-off with a busy and an idle chat, a graceful
-  host reboot, a clean `waterbox stop` (must restore nothing), and autostart.
+  host reboot, a clean `waterbox stop` (must restore nothing), and autostart;
+- two environments running at once (both reach the internet and `host`, nonzero
+  uid_map, closed device policy, slice caps their sum, stopping one leaves the
+  other's firewall rules), autostart/wake/restore for env N, and env delete;
+- `--audio` playback and capture; `--gamepad` with Steam and an SDL game, a
+  keyboard and a security key not passed, unplugging a pad drops it from the
+  unit's `DeviceAllow` (`systemctl show waterbox-N -p DeviceAllow`).
 
 Before considering a security change complete, inspect these regressions:
 
@@ -839,6 +969,16 @@ Before considering a security change complete, inspect these regressions:
 - A saturated `TasksMax` may block new in-box sessions; recover from the host.
 - USB sharing covers devices present at boot; hotplugged devices need another
   `--usb` boot for access (raw usbfs) or for the bind itself (serial nodes).
+  The `--usb` serial nodes have no minor-number reuse guard yet (the gamepad
+  guard could cover them).
+- Gamepads cover controllers present at boot. A controller that shares a HID
+  device with a keyboard collection is not passed at all. A host seat change (fast user
+  switching) can reset device ACLs; boot again with `--gamepad`.
+- Ctrl-b s inside a box lists only that box's sessions; the host picker lists all.
+- `--audio` gives the box an unrestricted PipeWire client (see above), not a
+  sandboxed audio channel.
+- All running environments share one memory budget; there is no per-environment
+  budget.
 - Disk usage has no equivalent simple hard quota yet.
 - Session restore brings back panes, directories, agent chats and a running
   `claude rc`, not other programs running in a pane (editors, dev servers) or background processes an

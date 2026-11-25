@@ -4,23 +4,20 @@
 
 set -e
 
-WATERBOX_VERSION="1.22"
+WATERBOX_VERSION="1.23"
 
 # Absolute path to this script, recorded so the shell-completion snippet can fall
 # back to it when 'waterbox' isn't on $PATH (e.g. run by ./waterbox, or moved).
 SELF_PATH="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo "$0")"
 
 # --- Configuration ---
-JAIL_ROOT="$HOME/.waterbox/root"
+# Global host-side state. Everything that belongs to one box (rootfs, shares, GUI
+# spec, machine name, network) is per environment; see _use_env below.
 CONFIG_DIR="$HOME/.waterbox"
-SHARE_LIST="$CONFIG_DIR/shared_paths"
-PENDING_SHARE_LIST="$CONFIG_DIR/shared_paths.pending"
-GUI_ENV_FILE="$CONFIG_DIR/gui_env"       # user-side diagnostic copy; helper derives its own trusted env
-GUI_BINDS_FILE="$CONFIG_DIR/gui_binds"   # --bind spec lines the helper validates at boot
+ENV_REGISTRY="$CONFIG_DIR/envs.list"   # "<id> <name>" lines; ordinary-user data, never read by root
 USER_NAME="water"               # fixed guest user (uid 1000; ID-mapped to host user securely)
 RUN_USER="$(id -un)"            # the host user invoking this script
 HOST_RUNTIME_DIR="/run/user/$(id -u)"
-MACHINE_NAME="waterbox"         # external name: systemd unit, machinectl, ve-* iface
 INSIDE_HOSTNAME="box"           # hostname shown inside the container
 TMUX_SESSION="box"              # tmux session that wraps the interactive shell
 CONTAINER_WORKSPACE="/home/$USER_NAME/workspace"
@@ -34,7 +31,6 @@ PROJECT_URL="https://github.com/morkin1792/mylinux"
 UPDATE_CHECK_FILE="$CONFIG_DIR/latest_version"   # cached upstream version (bg-refreshed)
 UPDATE_CHECK_INTERVAL=86400                       # seconds between background checks (24h)
 UPDATE_CHECK_ERROR="download-error"
-BOOTSTRAP_IN_PROGRESS="$CONFIG_DIR/bootstrap-in-progress"
 
 # Root helper (req: safe privilege model). All privileged RUNTIME ops go through
 # this root-owned, uid-1000-immutable binary so the sudoers rule can be NOPASSWD
@@ -45,13 +41,11 @@ HELPER_PATH="$HELPER_DIR/waterbox-helper"
 HELPER_SUDOERS="/etc/sudoers.d/waterbox-helper"
 
 # --- Network parameters ---
-HOST_IP="10.20.30.1"
-CONTAINER_IP="10.20.30.2"
+# HOST_IP / CONTAINER_IP / VE_IFACE are per environment (_env_ids_apply).
 NET_CIDR="24"
 HOST_ALIAS="host"               # name resolved to $HOST_IP inside the container
-VE_IFACE="ve-$MACHINE_NAME"     # systemd-nspawn names the host side ve-<machine>
 
-# If true, the container (10.20.30.0/24) is allowed to reach ANY port the host
+# If true, the container (its 10.20.x.0/24) is allowed to reach ANY port the host
 # listens on. Combined with the DNAT rule below, this lets the container hit
 # host loopback services (MCP servers, dev servers, etc.) as `host:PORT` even
 # when the host has a restrictive INPUT policy (ufw, firewalld, etc.).
@@ -84,6 +78,7 @@ PKGS=(
     ripgrep tmux bind vim less
     openssh nano openbsd-netcat curl
     python           # JSON for the statusline (powerline pulls it in anyway; explicit here)
+    pipewire pipewire-pulse pipewire-alsa   # --audio: in-box Pulse/ALSA server on the host graph
     openai-codex     # Codex CLI. In [extra], so pacman -Syu keeps it current
 )
 
@@ -176,6 +171,13 @@ WATERBOX_NO_GPU="${WATERBOX_NO_GPU:-0}"
 # (raw usbfs — adb, dfu-util, any libusb tool) plus ttyUSB/ttyACM serial nodes
 # present at boot. Devices stay shared with the host, not moved into the box.
 WATERBOX_USB="${WATERBOX_USB:-0}"
+# Audio: the host's PipeWire socket only (never the Pulse socket, whose clients can
+# load modules into the host server). The box is still an unrestricted PipeWire
+# client: microphone, all audio, and PipeWire's plugin factories.
+WATERBOX_AUDIO="${WATERBOX_AUDIO:-0}"
+# Gamepads present at boot: joystick event/js nodes and their own hidraw, each by
+# exact path, under a guard that revokes a node when it is unplugged. Never uinput.
+WATERBOX_GAMEPAD="${WATERBOX_GAMEPAD:-0}"
 WATERBOX_HERE=0                       # CLI-only: `start --here` shares cwd + opens there
 WATERBOX_X11="${WATERBOX_X11:-0}"     # explicit opt-in to X11/Xwayland on a Wayland host
 # Deliberately NOT configurable through the environment or a saved config file.
@@ -194,8 +196,99 @@ WATERBOX_TASKS_MAX="2048"
 WATERBOX_CPU_WEIGHT="50"
 WATERBOX_IO_WEIGHT="50"
 
+# --- Environments ---------------------------------------------------------------
+# An environment is a complete, independent box: its own rootfs, guest home,
+# packages, shares, systemd machine and veth subnet. Its numeric id (0-15) decides
+# every host-side identifier and never changes; its name is only a label kept in
+# the ordinary-user registry, so a rename touches nothing else and works while the
+# box runs. The root helper never sees names, only a validated id. Env 0 keeps
+# every path and identifier the single-box releases used, so upgrading moves no data.
+_valid_env_id()   { [[ "$1" =~ ^(0|[1-9]|1[0-5])$ ]]; }
+_valid_env_name() {
+    [ "${#1}" -le 64 ] || return 1
+    case "$1" in ''|.|..|-*|*[!A-Za-z0-9._-]*) return 1 ;; *) return 0 ;; esac
+}
+# Shared verbatim with the root helper (declare -f), so both sides always agree.
+_env_ids_apply() {   # $1 = env id; sets MACHINE_NAME VE_IFACE HOST_IP CONTAINER_IP
+    if [ "$1" = 0 ]; then MACHINE_NAME="waterbox"; else MACHINE_NAME="waterbox-$1"; fi
+    VE_IFACE="ve-$MACHINE_NAME"        # nspawn names the host side ve-<machine>; at most 14 chars
+    HOST_IP="10.20.$((30 + $1)).1"
+    CONTAINER_IP="10.20.$((30 + $1)).2"
+}
+_env_dir_for() {     # $1 = home, $2 = env id
+    if [ "$2" = 0 ]; then printf '%s/.waterbox' "$1"; else printf '%s/.waterbox/envs/%s' "$1" "$2"; fi
+}
+# Point every per-environment global at env $1. The rest of the script is written
+# for one box and works unchanged on whichever environment is active.
+_use_env() {
+    WB_ENV="$1"
+    _env_ids_apply "$1"
+    ENV_DIR="$(_env_dir_for "$HOME" "$1")"
+    JAIL_ROOT="$ENV_DIR/root"
+    SHARE_LIST="$ENV_DIR/shared_paths"
+    PENDING_SHARE_LIST="$ENV_DIR/shared_paths.pending"
+    GUI_ENV_FILE="$ENV_DIR/gui_env"       # user-side diagnostic copy; helper derives its own trusted env
+    GUI_BINDS_FILE="$ENV_DIR/gui_binds"   # --bind spec lines the helper validates at boot
+    BOOTSTRAP_IN_PROGRESS="$ENV_DIR/bootstrap-in-progress"
+    if [ "$1" = 0 ]; then AUTOSTART_UNIT="waterbox-autostart.service"
+    else AUTOSTART_UNIT="waterbox-autostart-$1.service"; fi
+}
+_env_rows() {        # "<id> <name>" per valid registry line, sorted by id
+    local id name extra
+    [ -f "$ENV_REGISTRY" ] || return 0
+    while read -r id name extra || [ -n "$id" ]; do
+        _valid_env_id "$id" && _valid_env_name "$name" && [ -z "$extra" ] \
+            && printf '%s %s\n' "$id" "$name"
+    done < "$ENV_REGISTRY" | sort -n -k1,1 -u
+}
+_env_id_of()   { _env_rows | awk -v n="$1" '$2 == n { print $1; f = 1; exit } END { exit !f }'; }
+_env_name_of() { _env_rows | awk -v i="$1" '$1 == i { print $2; f = 1; exit } END { exit !f }'; }
+_env_names()   { _env_rows | awk '{ print $2 }' | paste -sd' '; }
+# First run and upgrades from single-box releases: the box that exists (or will be
+# built) is env 0, named "main".
+_env_registry_init() {
+    [ -f "$ENV_REGISTRY" ] && return 0
+    mkdir -p "$CONFIG_DIR" && printf '0 main\n' > "$ENV_REGISTRY"
+}
+_env_write_rows() {  # stdin = the complete new registry; replaced atomically
+    local tmp
+    tmp=$(mktemp "$CONFIG_DIR/.envs.XXXXXX") || return 1
+    if ! cat > "$tmp" || ! mv -f -- "$tmp" "$ENV_REGISTRY"; then
+        rm -f -- "$tmp"; return 1
+    fi
+}
+_env_create() {      # $1 = name; prints the new id
+    local name="$1" id
+    _valid_env_name "$name" \
+        || { log_warn >&2 "Invalid environment name '$name' (letters, digits, . _ - only, not starting with '-')."; return 1; }
+    _env_id_of "$name" >/dev/null && { log_warn >&2 "An environment named '$name' already exists."; return 1; }
+    for id in $(seq 0 15); do
+        _env_name_of "$id" >/dev/null && continue
+        # Never adopt what a free id left behind: a rootfs is someone's data, and
+        # an old share list would mount their projects into the new box.
+        if [ "$id" = 0 ]; then [ -e "$(_env_dir_for "$HOME" 0)/root" ] && continue
+        else [ -e "$(_env_dir_for "$HOME" "$id")" ] && continue; fi
+        { _env_rows; printf '%s %s\n' "$id" "$name"; } | _env_write_rows || return 1
+        printf '%s\n' "$id"
+        return 0
+    done
+    log_warn >&2 "All 16 environment slots are in use."
+    return 1
+}
+_env_rename() {      # $1 = old name, $2 = new name
+    local old="$1" new="$2" id
+    id=$(_env_id_of "$old") || { log_warn >&2 "No environment named '$old'."; return 1; }
+    [ "$new" = "$old" ] && return 0
+    _valid_env_name "$new" \
+        || { log_warn >&2 "Invalid environment name '$new' (letters, digits, . _ - only, not starting with '-')."; return 1; }
+    _env_id_of "$new" >/dev/null && { log_warn >&2 "An environment named '$new' already exists."; return 1; }
+    _env_rows | awk -v i="$id" -v n="$new" '$1 == i { $2 = n } { print }' | _env_write_rows
+}
+# --- end env identity
+_use_env 0
+
 _ensure_user_config() {
-    mkdir -p "$CONFIG_DIR"
+    mkdir -p "$ENV_DIR"
     touch "$SHARE_LIST"
 }
 
@@ -334,8 +427,15 @@ ${C_HEAD}waterbox v$WATERBOX_VERSION${C_OFF} — isolated Arch sandbox (systemd-
 AI agents in bypass mode without exposing your machine. Ships with Claude Code
 and Codex; inside the box, run ${C_CMD}claude${C_OFF} or ${C_CMD}codex${C_OFF}.
 
-${C_HEAD}Usage:${C_OFF} ${C_CMD}waterbox${C_OFF} [command] [args] [--gui|--no-gui|--x11] [--no-gpu] [--usb]
+${C_HEAD}Usage:${C_OFF} ${C_CMD}waterbox${C_OFF} [command] [args] [--env <name>] [--gui|--no-gui|--x11] [--no-gpu] [--usb]
   Bare '${C_CMD}waterbox${C_OFF}' boots the box and attaches.   ${C_DIM}Ctrl-b d = detach · exit = end session${C_OFF}
+  ${C_DIM}Boot options for gaming: --audio (PipeWire sound) and --gamepad (controllers).${C_OFF}
+
+${C_HEAD}Environments${C_OFF}  ${C_DIM}(independent boxes: own packages, home, shares, network)${C_OFF}
+  ${C_CMD}env${C_OFF}                         Manage them (Enter start · a new · r rename · d delete).
+  ${C_CMD}env${C_OFF} list | create <name> | rename <old> <new> | delete <name>
+  ${C_CMD}--env <name>${C_OFF}                Pick the environment for any box command below. Without
+                              it: the only one, the only running one, or a menu.
 
 ${C_HEAD}Box${C_OFF}
   ${C_CMD}start${C_OFF} [<session>] [--gui]   Boot if needed and attach (the default). A name
@@ -371,9 +471,9 @@ ${C_HEAD}GUI apps${C_OFF}
   Wayland-only GUI is ${C_CMD}ON by default${C_OFF} on Wayland hosts; GUI is ${C_CMD}OFF by default${C_OFF} on
   X11 — for the reason (a real security trade), see ${C_CMD}waterbox start --help${C_OFF}.
 
-${C_HEAD}Locations${C_OFF}
+${C_HEAD}Locations${C_OFF}  ${C_DIM}(first environment; others under $CONFIG_DIR/envs/<n>/)${C_OFF}
   Box files on host:     $JAIL_ROOT
-  Reach host from box:   $HOST_ALIAS or the host's hostname  ($HOST_IP)
+  Reach host from box:   $HOST_ALIAS or the host's hostname  ($HOST_IP; 10.20.(30+n).1 for env n)
   Back up:               $JAIL_ROOT/home/$USER_NAME/.agent-env
                          ${C_DIM}(every agent's logins + shared chat history — copy somewhere safe)${C_OFF}
 EOF
@@ -383,14 +483,17 @@ EOF
 # top-level help stays short and points here.
 help_start() {
     cat <<EOF
-${C_HEAD}Usage:${C_OFF} ${C_CMD}waterbox start${C_OFF} [<session> | --here] [--gui|--no-gui|--x11] [--no-gpu] [--usb]
+${C_HEAD}Usage:${C_OFF} ${C_CMD}waterbox start${C_OFF} [<session> | --here] [--env <name>] [--gui|--no-gui|--x11] [--no-gpu] [--usb] [--audio] [--gamepad]
 
 Boot the box if it isn't already up, then attach to a tmux session inside it. This
 is the default command, so a bare '${C_CMD}waterbox${C_OFF}' does exactly the same thing. Sessions
 outlive your terminal: ${C_CMD}Ctrl-b d${C_OFF} detaches (it keeps running), '${C_CMD}exit${C_OFF}' ends it.
 
-  ${C_DIM}(no args)${C_OFF}          Open the session picker — Enter attach · a new · r rename ·
-                     d kill · q quit. With no live sessions it just asks for a name.
+  ${C_DIM}(no args)${C_OFF}          Open the session picker — every running environment's sessions,
+                     each with its environment name. Enter attach · a new (pick the
+                     environment, booting it if needed) · r rename · d kill · q quit.
+                     With no live sessions it opens the environment menu first.
+  ${C_CMD}--env <name>${C_OFF}       Only that environment: its sessions, or a new one in it.
   ${C_CMD}<session>${C_OFF}          Skip the picker: attach to that session, creating it if it
                      doesn't exist yet. Tab-completes live sessions.
   ${C_CMD}--here${C_OFF}             Share the current directory into the box and open a NEW
@@ -408,6 +511,18 @@ outlive your terminal: ${C_CMD}Ctrl-b d${C_OFF} detaches (it keeps running), '${
                      the box gets raw access to EVERY attached USB device — it
                      could reflash a dongle or talk to a plugged-in security key.
                      Serial ports plugged in later need 'waterbox restart --usb'.
+  ${C_CMD}--audio${C_OFF}            Connect the box to the host's PipeWire (sound out and in).
+                     The box runs its own pipewire-pulse, so Pulse clients never
+                     reach the host's sound server directly. SECURITY: the box is
+                     a full PipeWire client — it can record your microphone, hear
+                     and reroute all host audio, and may be able to make PipeWire
+                     load code that runs as you on the host. Needs PipeWire.
+  ${C_CMD}--gamepad${C_OFF}          Pass in the game controllers connected now (their joystick
+                     and HID nodes only — never keyboards, security keys or
+                     /dev/uinput, so Steam Input's virtual pads do not work).
+                     SECURITY: the box reads every input of those controllers and
+                     can use their rumble/LED/firmware interfaces. A controller
+                     connected later needs 'waterbox restart --gamepad'.
 
 ${C_HEAD}GUI apps: ON by default on Wayland, OFF by default on X11${C_OFF}
 Forwarding the display into the box lets an agent open a browser or any GUI app
@@ -451,7 +566,7 @@ to check the interrupted work, then carries on. After a clean stop nothing is re
 ${C_HEAD}Autostart${C_OFF} ${C_DIM}(off by default)${C_OFF}
 Boots the box together with the host, so the restore happens with nobody there,
 and the resumed agents keep working unattended. It always uses the secure mode and
-never forwards GUI or USB; restart with those flags when you are back. A share that
+never forwards GUI, USB, audio or gamepads; restart with those flags when you are back. A share that
 cannot be mounted at boot keeps the box down, as it would for a manual start.
 The host's boot never waits for it. If your home is not there yet (an encrypted
 volume you unlock later, over SSH for example), it checks once a minute and boots
@@ -500,6 +615,28 @@ If the command is literally named like an option, put ${C_CMD}--${C_OFF} before 
   ${C_CMD}<session> <HH:MM> "<command>" [once|daily]${C_OFF}   Add directly (default: once).
   ${C_CMD}list${C_OFF}                                         List scheduled commands with time-to-trigger.
   ${C_CMD}del <id>${C_OFF}                                     Remove one (id from 'list', e.g. schd-com-1).
+EOF
+}
+help_env() {
+    cat <<EOF
+${C_HEAD}Usage:${C_OFF} ${C_CMD}waterbox env${C_OFF} [list | create <name> | rename <old> <new> | delete <name>]
+
+An environment is a complete, separate box: its own Arch rootfs, packages, guest
+home (agent accounts and chats), shares, schedules and network. Use one for most
+work and others for things that should not mix with it (a gaming box, say).
+Sessions belong to the environment they were created in.
+
+  ${C_DIM}(no args)${C_OFF}               Menu: Enter start · a new · r rename · d delete · q quit.
+  ${C_CMD}list${C_OFF}                    Names and state (running / stopped / not built).
+  ${C_CMD}create <name>${C_OFF}           Add one. It is built the first time it starts.
+  ${C_CMD}rename <old> <new>${C_OFF}      Rename it, even while it runs.
+  ${C_CMD}delete <name>${C_OFF}           Destroy its rootfs, home, share list, wakes and autostart.
+                          It must be stopped, and you type the name to confirm.
+                          Shared host folders are never touched.
+
+Every box command takes ${C_CMD}--env <name>${C_OFF}. Without it Waterbox uses the only
+environment, else the only running one, else asks (or fails when not on a terminal).
+All running environments share one memory budget (the limits 'status' shows).
 EOF
 }
 help_share() {
@@ -881,6 +1018,28 @@ bootstrap_sandbox() {
     log_success "Rootfs ready at $JAIL_ROOT"
 }
 
+# --audio: the box never runs its own PipeWire graph. Its pipewire-pulse (socket-
+# activated for every user) serves Pulse clients inside the box and talks to the
+# host graph through the socket the helper binds at /tmp/.waterbox-pipewire; it
+# stays inactive on boots without --audio. Managed files, rewritten on refresh.
+configure_audio_units() {
+    local u="$JAIL_ROOT/etc/systemd/user" unit
+    _guard_jail_path "$u/pipewire-pulse.service.d"
+    _guard_jail_path "$u/sockets.target.wants"
+    sudo mkdir -p "$u/pipewire-pulse.service.d" "$u/sockets.target.wants"
+    printf '%s\n' \
+        "# Managed by Waterbox: connect to the host's PipeWire (bound only with --audio)." \
+        "[Unit]" "ConditionPathExists=/tmp/.waterbox-pipewire" "" \
+        "[Service]" "Environment=PIPEWIRE_REMOTE=/tmp/.waterbox-pipewire" \
+        | wb_tee "$u/pipewire-pulse.service.d/waterbox.conf"
+    for unit in pipewire.service pipewire.socket wireplumber.service; do
+        _guard_jail_path "$u/$unit"
+        sudo ln -sfn /dev/null "$u/$unit"
+    done
+    _guard_jail_path "$u/sockets.target.wants/pipewire-pulse.socket"
+    sudo ln -sfn /usr/lib/systemd/user/pipewire-pulse.socket "$u/sockets.target.wants/pipewire-pulse.socket"
+}
+
 # Dotfiles, claude defaults, git identity — all per-user, written once.
 configure_dotfiles() {
     # Disk-backed, age-cleaned temp dir for Claude Code (the zshrc below points
@@ -894,6 +1053,7 @@ configure_dotfiles() {
         "# Managed by Waterbox; rewritten on config refresh." \
         "d /var/tmp/claude 0700 $USER_NAME $USER_NAME 7d" \
         | wb_tee "$JAIL_ROOT/etc/tmpfiles.d/waterbox-claude-tmp.conf"
+    configure_audio_units
     wb_tee "$JAIL_ROOT/home/$USER_NAME/.zshrc" <<'EOF'
 HISTFILE=~/.histfile
 HISTSIZE=20000
@@ -943,6 +1103,13 @@ autoload -Uz compinit && compinit -u
 # DISPLAY / WAYLAND_DISPLAY available in every session, independent of how the
 # session was spawned — so X/Wayland apps launched from the box just work.
 [ -f /etc/waterbox/gui-env ] && source /etc/waterbox/gui-env
+# Per-boot device env (--audio / --gamepad), written by the host helper at boot.
+[ -f /etc/waterbox/boot-env ] && source /etc/waterbox/boot-env
+# Boxes built before --audio existed lack the in-box PipeWire; packages are never
+# upgraded behind your back, so say once per shell what to install.
+if [[ -o interactive && -n "$PIPEWIRE_REMOTE" ]] && (( ! $+commands[pipewire-pulse] )); then
+    print "waterbox: audio needs PipeWire in this box once: sudo pacman -Syu pipewire pipewire-pulse pipewire-alsa"
+fi
 
 # Small orientation banner, printed once per tmux session.
 waterbox_welcome() {
@@ -1844,7 +2011,7 @@ migrate_agent_env() {
 # that (fresh bootstrap) fall back to a plain read — the box isn't up yet anyway.
 is_running() {
     if _helper_current; then
-        [ "$(sudo -n "$HELPER_PATH" state 2>/dev/null)" = running ]
+        [ "$(run_priv_quiet state 2>/dev/null)" = running ]
     else
         machinectl show "$MACHINE_NAME" --property=State 2>/dev/null | grep -q "State=running"
     fi
@@ -1900,7 +2067,7 @@ build_gui_bind_args() {
         [ -f "$xsrc" ] || xsrc=$(xauth info 2>/dev/null | sed -n 's/.*Authority file:[[:space:]]*//p' | head -n1)
         [ -f "$xsrc" ] || xsrc="$HOME/.Xauthority"
         if command -v xauth >/dev/null 2>&1 && [ -f "$xsrc" ]; then
-            local wx="$CONFIG_DIR/xauth"
+            local wx="$ENV_DIR/xauth"
             rm -f "$wx"; (umask 077; : > "$wx")
             xauth -f "$xsrc" nlist "$DISPLAY" 2>/dev/null \
                 | sed -e 's/^..../ffff/' \
@@ -1944,7 +2111,7 @@ build_gui_bind_args() {
 # host can query/list/kill sessions. Goes through the root helper (leader-PID +
 # nsenter, dropped to uid 1000) so output is a clean pipe and no broad sudo is used.
 container_tmux() {
-    sudo "$HELPER_PATH" tmux "$@"
+    run_priv tmux "$@"
 }
 
 _sanitize_session_names() {
@@ -1960,8 +2127,15 @@ _sanitize_session_names() {
 # Best-effort session listing for shell completion: `sudo -n` on the NOPASSWD helper
 # never prompts. Prints nothing when the box is down — completion just offers none.
 list_sessions_quiet() {
-    sudo -n "$HELPER_PATH" tmux list-sessions -F '#{session_name}' 2>/dev/null \
-        | head -c 65536 | _sanitize_session_names || return 0
+    local rows=() row
+    mapfile -t rows < <(_env_rows)
+    for row in "${rows[@]}"; do
+        [ -z "${CLI_ENV_NAME:-}" ] || [ "${row#* }" = "$CLI_ENV_NAME" ] || continue
+        _use_env "${row%% *}"
+        run_priv_quiet tmux list-sessions -F '#{session_name}' 2>/dev/null \
+            | head -c 65536 | _sanitize_session_names
+    done | sort -u
+    return 0
 }
 
 # Swallow any buffered keystrokes on /dev/tty (e.g. auto-repeat from a held arrow
@@ -2609,10 +2783,11 @@ self_update() {
 
 attach_session() {
     # GUI env reaches the shell via the in-box /etc/waterbox/gui-env (sourced by
-    # .zshrc), so nothing to forward here beyond an optional API key.
-    local want="${1:-}" target sessions=() s dn default_name base_name keep_name="" ki
+    # .zshrc), so nothing to forward here beyond an optional API key. The active
+    # environment is already up (_env_up).
+    local want="${1:-}" target
     # `start --here`: skip the picker — open a brand-new session named after the launch
-    # dir (dir, dir-2, …), landing inside its shared copy when start_sandbox mounted one
+    # dir (dir, dir-2, …), landing inside its shared copy when _env_up mounted one
     # (WB_START_SUBDIR); empty subdir → the default workspace (couldn't/needn't share).
     if [ "${WB_HERE:-0}" = 1 ]; then
         target="$(_free_session_name "$(_default_session_base)")"
@@ -2621,24 +2796,86 @@ attach_session() {
         else
             log_info "Creating new session '$target'."
         fi
-        exec sudo "$HELPER_PATH" shell "$target" "${ANTHROPIC_API_KEY:-}" "${WB_START_SUBDIR:-}"
+        exec sudo "$HELPER_PATH" --env "$WB_ENV" shell "$target" "${ANTHROPIC_API_KEY:-}" "${WB_START_SUBDIR:-}"
     fi
-    if [ -n "$want" ]; then
-        # No leading '-': such a name would be indistinguishable from a flag here and
-        # would reach grep/tmux/systemd as one (an unrecognised `waterbox start --foo`
-        # should be rejected, not turned into a session).
-        _valid_session_name "$want" \
-            || log_error "Invalid session name '$want' (letters, digits, . _ - only, not starting with '-'). See 'waterbox start --help'."
-        # `--`: belt-and-braces so the name is never parsed as a grep option.
-        if _live_sessions | grep -qxF -- "$want"; then log_info "Attaching to '$want'."
-        else log_info "Creating new session '$want'."; fi
-        exec sudo "$HELPER_PATH" shell "$want" "${ANTHROPIC_API_KEY:-}"
-    fi
-    # Reaching the picker: refresh the upstream-version cache in the background and, if
-    # last run's probe found a newer release, drop one WARN above the menu (it stays put
-    # — the menu only ever redraws its own rows). Never blocks; silent when up to date.
+    # No leading '-': such a name would be indistinguishable from a flag here and
+    # would reach grep/tmux/systemd as one (an unrecognised `waterbox start --foo`
+    # should be rejected, not turned into a session).
+    _valid_session_name "$want" \
+        || log_error "Invalid session name '$want' (letters, digits, . _ - only, not starting with '-'). See 'waterbox start --help'."
+    # `--`: belt-and-braces so the name is never parsed as a grep option.
+    if _live_sessions | grep -qxF -- "$want"; then log_info "Attaching to '$want'."
+    else log_info "Creating new session '$want' in environment '$(_env_label)'."; fi
+    _attach "$want"
+}
+
+# The helper 'shell' verb runs `machinectl shell … tmux new-session -A` (attach if it
+# exists, else create in the workspace) in the active environment. The optional API
+# key is forwarded as an -E env value inside the helper.
+_attach() {
+    exec sudo "$HELPER_PATH" --env "$WB_ENV" shell "$1" "${ANTHROPIC_API_KEY:-}"
+}
+
+# Sessions of every running environment (only --env's when given), in parallel
+# arrays: SR_ENV (env id), SR_NAME (tmux session), SR_LABEL (picker row).
+SR_ENV=(); SR_NAME=(); SR_LABEL=()
+_session_rows() {
+    local rows=() row id name s
+    SR_ENV=(); SR_NAME=(); SR_LABEL=()
+    mapfile -t rows < <(_env_rows)
+    for row in "${rows[@]}"; do
+        id="${row%% *}"; name="${row#* }"
+        [ -z "${CLI_ENV_NAME:-}" ] || [ "$name" = "$CLI_ENV_NAME" ] || continue
+        _use_env "$id"
+        is_running || continue
+        while IFS= read -r s; do
+            [ -n "$s" ] || continue
+            SR_ENV+=("$id"); SR_NAME+=("$s")
+            SR_LABEL+=("$(printf '%-24s [%s]' "$s" "$name")")
+        done < <(_live_sessions)
+    done
+}
+
+# Print the id of every running environment that has session $1.
+_session_matches() {
+    local rows=() row id
+    mapfile -t rows < <(_env_rows)
+    for row in "${rows[@]}"; do
+        id="${row%% *}"
+        _use_env "$id"
+        is_running && container_tmux has-session -t "=$1" 2>/dev/null && printf '%s\n' "$id"
+    done
+    return 0
+}
+
+# Name a new session in the active (already up) environment, offer to share the
+# launch directory, then attach. Returns 1 when the name prompt is abandoned.
+_new_session_here() {
+    local live base_name default_name dn=2
+    live="$(_live_sessions)"
+    # Suggested name: the launch directory's basename (box at $HOME), auto-suffixed
+    # on a collision (proj, proj-2, …).
+    base_name="$(_default_session_base)"; default_name="$base_name"
+    while printf '%s\n' "$live" | grep -Fxq -- "$default_name"; do
+        default_name="$base_name-$dn"; dn=$((dn + 1))
+    done
+    _prompt_new_session "$default_name" || return 1
+    log_info "Creating new session '$NEW_SESSION' in environment '$(_env_label)'."
+    _maybe_offer_share
+    _attach "$NEW_SESSION"
+}
+
+# The session picker spans every running environment. Enter attaches to a session
+# in its own environment (no environment prompt: a session already belongs to one);
+# 'a' picks the environment for a new session, booting it if needed. With no live
+# session anywhere it goes straight to the environment menu — on a first run that
+# menu holds just the environment created for you, so Enter is all it takes.
+_pick_session() {
+    local keep="" ki c victim ans neighbor was_running restored_once=0 _newver
+    # Refresh the upstream-version cache in the background and, if last run's probe
+    # found a newer release, drop one WARN above the menu (it stays put — the menu
+    # only ever redraws its own rows). Never blocks; silent when up to date.
     _spawn_update_check
-    local _newver
     if _newver="$(_update_notice)"; then
         if [ "$_newver" = "$UPDATE_CHECK_ERROR" ]; then
             log_warn "Couldn't check for updates. The script URL may have changed; open $PROJECT_URL to investigate." > /dev/tty
@@ -2647,93 +2884,92 @@ attach_session() {
         fi
     fi
     while true; do
-        sessions=()
-        while IFS= read -r s; do
-            [ -n "$s" ] && sessions+=("$s")
-        done < <(_live_sessions)
+        _session_rows
 
-        # Next free auto name suggested for a brand-new session: the launch
-        # directory's basename (box at $HOME), auto-suffixed on a collision
-        # (proj, proj-2, …).
-        base_name="$(_default_session_base)"
-        default_name="$base_name"; dn=2
-        while printf '%s\n' "${sessions[@]}" | grep -Fxq "$default_name"; do
-            default_name="$base_name-$dn"; dn=$((dn + 1))
-        done
-
-        # No live sessions: nothing to pick — create the first one directly.
-        if [ "${#sessions[@]}" -eq 0 ]; then
-            _prompt_new_session "$default_name" || return 0
-            target="$NEW_SESSION"; log_info "Creating new session '$target'."
-            _maybe_offer_share
-            break
+        if [ "${#SR_NAME[@]}" -eq 0 ]; then
+            if [ -n "${CLI_ENV_NAME:-}" ]; then
+                _resolve_env
+            else
+                _env_menu select || return 0
+                _use_env "$ENV_PICK"
+            fi
+            was_running=0; is_running && was_running=1
+            _env_up
+            # A cold boot after an unexpected shutdown brings its sessions back:
+            # show them instead of asking for a new name.
+            if [ "$was_running" = 0 ] && [ "$restored_once" = 0 ] && [ -n "$(_live_sessions)" ]; then
+                restored_once=1
+                continue
+            fi
+            _new_session_here || return 0
+            return 0
         fi
 
         # Re-open on the row we were just acting on (after a rename/kill), not row 0.
         MENU_SELECT=0
-        if [ -n "$keep_name" ]; then
-            for ki in "${!sessions[@]}"; do
-                [ "${sessions[$ki]}" = "$keep_name" ] && { MENU_SELECT=$ki; break; }
+        if [ -n "$keep" ]; then
+            for ki in "${!SR_NAME[@]}"; do
+                [ "${SR_ENV[$ki]}:${SR_NAME[$ki]}" = "$keep" ] && { MENU_SELECT=$ki; break; }
             done
-            keep_name=""
+            keep=""
         fi
 
         MENU_DELETE=1; MENU_ADD=1; MENU_QUIT=1; MENU_RENAME=1
         choose_menu "Select a session (↑/↓ move · Enter attach · a new · r rename · d kill · q quit):" \
-            "${sessions[@]}"
+            "${SR_LABEL[@]}"
 
-        [ "$MENU_CANCELLED" = 1 ] && return 0        # 'q'/Ctrl-C → leave the box running
+        [ "$MENU_CANCELLED" = 1 ] && return 0        # 'q'/Ctrl-C → leave the boxes running
 
-        # 'a' → name + create a new session.
+        # 'a' → pick the environment (highlighting the first listed one), bring it
+        # up, then name + create the session there.
         if [ "$MENU_ACTION" = add ]; then
-            _prompt_new_session "$default_name" || continue
-            target="$NEW_SESSION"; log_info "Creating new session '$target'."
-            _maybe_offer_share
-            break
+            _env_menu select "${SR_ENV[0]}" || continue
+            _use_env "$ENV_PICK"
+            _env_up
+            _new_session_here || continue
+            return 0
         fi
+
+        c="$MENU_CHOICE"
+        _use_env "${SR_ENV[$c]}"
 
         # 'r' on a session → rename it (and repoint its scheduled commands), re-loop
         # with the highlight kept on that session (new name on success, old on no-op).
         if [ "$MENU_ACTION" = rename ]; then
-            _rename_session "${sessions[$MENU_CHOICE]}"
-            keep_name="$KEEP_SESSION"
+            _rename_session "${SR_NAME[$c]}"
+            keep="$WB_ENV:$KEEP_SESSION"
             continue
         fi
 
         # 'd' on a session → confirm, kill it + its schedules, re-loop. Keep the
         # highlight on a neighbour when it dies, or on the session itself if kept.
         if [ "$MENU_ACTION" = delete ]; then
-            local victim="${sessions[$MENU_CHOICE]}" ans neighbor="" ci=$MENU_CHOICE
-            if [ $((ci + 1)) -lt "${#sessions[@]}" ]; then neighbor="${sessions[$((ci + 1))]}"
-            elif [ $((ci - 1)) -ge 0 ]; then neighbor="${sessions[$((ci - 1))]}"; fi
-            printf "Kill session '%s' and its scheduled commands? [y/N] " "$victim" > /dev/tty
-            IFS= read -r ans < /dev/tty || true
+            victim="${SR_NAME[$c]}"; neighbor=""
+            if [ $((c + 1)) -lt "${#SR_NAME[@]}" ]; then neighbor="${SR_ENV[$((c + 1))]}:${SR_NAME[$((c + 1))]}"
+            elif [ $((c - 1)) -ge 0 ]; then neighbor="${SR_ENV[$((c - 1))]}:${SR_NAME[$((c - 1))]}"; fi
+            printf "Kill session '%s' (%s) and its scheduled commands? [y/N] " "$victim" "$(_env_label)" > /dev/tty
+            ans=""; IFS= read -r ans < /dev/tty || true
             if [[ "$ans" == [Yy]* ]]; then
                 if container_tmux kill-session -t "=$victim" 2>/dev/null; then
                     _remove_session_schedules "$victim" \
                         || log_warn "Session '$victim' ended, but one or more of its scheduled commands could not be removed."
                     log_info "Killed session '$victim'."
-                    keep_name="$neighbor"
+                    keep="$neighbor"
                 else
                     log_warn "Could not kill session '$victim'; it is still running."
-                    keep_name="$victim"
+                    keep="$WB_ENV:$victim"
                 fi
             else
-                keep_name="$victim"
+                keep="$WB_ENV:$victim"
             fi
             continue
         fi
 
-        # Enter on an existing session → attach.
-        target="${sessions[$MENU_CHOICE]}"
-        log_info "Attaching to '$target'."
-        break
+        # Enter on an existing session → attach in its own environment.
+        _env_up
+        log_info "Attaching to '${SR_NAME[$c]}'."
+        _attach "${SR_NAME[$c]}"
     done
-
-    # The helper 'shell' verb runs `machinectl shell … tmux new-session -A` (attach
-    # if it exists, else create in the workspace). The optional API key is forwarded
-    # as an -E env value inside the helper.
-    exec sudo "$HELPER_PATH" shell "$target" "${ANTHROPIC_API_KEY:-}"
 }
 
 # --- Network setup on host ---
@@ -2744,7 +2980,7 @@ attach_session() {
 # sudo is needed. The 'boot' verb runs net_up after the container is up; 'down'
 # runs net_down. These wrappers just reach the helper for the stop/reset paths.
 teardown_host_network() {
-    _helper_current && sudo -n "$HELPER_PATH" net-down 2>/dev/null || true
+    _helper_current && run_priv_quiet net-down 2>/dev/null || true
 }
 
 # Are all required host tools present? Fills MISSING_DEPS with any that aren't.
@@ -2812,6 +3048,239 @@ require_host_deps() {
     log_error "Still missing: ${MISSING_DEPS[*]}. Install manually, then retry."
 }
 
+# --- Environments: selection, menu, delete ------------------------------------
+_env_label() { _env_name_of "$WB_ENV" 2>/dev/null || printf 'env %s' "$WB_ENV"; }
+
+# running | stopped | not built, for env $1. Leaves the active environment as it was.
+_env_state() {
+    local keep="$WB_ENV" st
+    _use_env "$1"
+    if is_running; then st=running
+    elif [ -f "$JAIL_ROOT/.waterbox-ready" ]; then st=stopped
+    else st="not built"; fi
+    _use_env "$keep"
+    printf '%s' "$st"
+}
+
+# There is always at least one environment to pick: on a first run (or after every
+# environment was deleted) create "main". It is built the first time it starts.
+_env_ensure_one() {
+    _env_registry_init || log_error "Could not create $ENV_REGISTRY."
+    [ -n "$(_env_rows)" ] && return 0
+    _env_create main >/dev/null || log_error "Could not create the first environment in $ENV_REGISTRY."
+    log_info "Created environment 'main'."
+}
+
+# Choose the environment for a per-box command and make it active:
+#   --env <name>; else the only environment; else the only running one; else the
+#   environment menu on a terminal; else an error asking for --env.
+# Idempotent within one invocation, so nested callers never ask twice.
+WB_ENV_RESOLVED=0
+WB_RESOLVED_ID=""
+_env_resolved() { _use_env "$1"; WB_ENV_RESOLVED=1; WB_RESOLVED_ID="$1"; }
+_resolve_env() {
+    local rows=() row id running=()
+    # Loops over environments switch the active one; re-activate the choice.
+    if [ "$WB_ENV_RESOLVED" = 1 ]; then _use_env "$WB_RESOLVED_ID"; return 0; fi
+    _env_registry_init
+    if [ -n "${CLI_ENV_NAME:-}" ]; then
+        id=$(_env_id_of "$CLI_ENV_NAME") \
+            || log_error "No environment named '$CLI_ENV_NAME'. Existing: $(_env_names). See 'waterbox env'."
+        _env_resolved "$id"
+        return 0
+    fi
+    mapfile -t rows < <(_env_rows)
+    [ "${#rows[@]}" -gt 0 ] || log_error "No environments yet. Run 'waterbox' to create one."
+    if [ "${#rows[@]}" -eq 1 ]; then
+        _env_resolved "${rows[0]%% *}"
+        return 0
+    fi
+    for row in "${rows[@]}"; do
+        _use_env "${row%% *}"
+        is_running && running+=("${row%% *}")
+    done
+    if [ "${#running[@]}" -eq 1 ]; then
+        _env_resolved "${running[0]}"
+        log_info "Using environment '$(_env_label)' (the only one running)."
+        return 0
+    fi
+    if [ -t 0 ] && [ -t 1 ]; then
+        _env_menu select || exit 0
+        _env_resolved "$ENV_PICK"
+        return 0
+    fi
+    log_error "Several environments exist ($(_env_names)); choose one with --env <name>."
+}
+
+# Environment menu. $1 = what Enter does (shown in the hint), $2 = id to highlight.
+# a/r/d create, rename and delete in place. Sets ENV_PICK; returns 1 on cancel.
+ENV_PICK=""
+_env_menu() {
+    local verb="$1" keep="${2:-}" rows=() row ids=() names=() labels=() i n new name
+    while true; do
+        _env_ensure_one
+        mapfile -t rows < <(_env_rows)
+        ids=(); names=(); labels=()
+        for row in "${rows[@]}"; do
+            ids+=("${row%% *}"); names+=("${row#* }")
+            labels+=("$(printf '%-20s [%s]' "${row#* }" "$(_env_state "${row%% *}")")")
+        done
+        MENU_SELECT=0
+        for i in "${!ids[@]}"; do [ "${ids[$i]}" = "$keep" ] && MENU_SELECT=$i; done
+        MENU_ADD=1; MENU_RENAME=1; MENU_DELETE=1; MENU_QUIT=1
+        choose_menu "Select an environment (↑/↓ move · Enter $verb · a new · r rename · d delete · q quit):" \
+            "${labels[@]}"
+        [ "$MENU_CANCELLED" = 1 ] && return 1
+        case "$MENU_ACTION" in
+            add)
+                new=""
+                IFS= read -rep "New environment name: " new < /dev/tty 2>/dev/tty || continue
+                [ -n "$new" ] || continue
+                if n=$(_env_create "$new"); then
+                    keep="$n"
+                    log_info "Created environment '$new'. It is built the first time it starts."
+                fi
+                continue ;;
+            rename)
+                name="${names[$MENU_CHOICE]}"; keep="${ids[$MENU_CHOICE]}"; new=""
+                IFS= read -rep "New name for '$name': " -i "$name" new < /dev/tty 2>/dev/tty || continue
+                if [ -n "$new" ] && [ "$new" != "$name" ] && _env_rename "$name" "$new"; then
+                    log_info "Renamed environment '$name' → '$new'."
+                fi
+                continue ;;
+            delete)
+                keep="${ids[$MENU_CHOICE]}"
+                ( _env_delete "${names[$MENU_CHOICE]}" ) || true
+                continue ;;
+        esac
+        ENV_PICK="${ids[$MENU_CHOICE]}"
+        return 0
+    done
+}
+
+# The environment a host wake timer boots: the "--env N" in its ExecStart, or env 0
+# for units written before environments existed. Host-owned unit files, not rootfs.
+_hostwake_env() {
+    local line
+    line=$(grep -m1 '^ExecStart=' "${HOSTWAKE_GLOB}$1.service" 2>/dev/null) || { echo 0; return 0; }
+    if [[ "$line" =~ \ --env\ ([0-9]+)\  ]]; then echo "${BASH_REMATCH[1]}"; else echo 0; fi
+}
+# Remove every host wake timer of the active environment.
+_remove_env_hostwakes() {
+    local f n failed=0
+    for f in "$HOSTWAKE_GLOB"*.timer; do
+        [ -e "$f" ] || continue
+        n=$(basename "$f" .timer); n="${n##*-}"
+        case "$n" in ''|*[!0-9]*) continue ;; esac
+        [ "$(_hostwake_env "$n")" = "$WB_ENV" ] || continue
+        run_priv remove-host-wake "$n" >/dev/null 2>&1 || failed=1
+    done
+    return "$failed"
+}
+
+# Delete an environment: its rootfs (guest home included) and per-environment
+# configuration. Refuses while it runs and requires the name typed back. Shares are
+# references to host folders; their files are never touched.
+_env_delete() {
+    local name="$1" id typed=""
+    id=$(_env_id_of "$name") || { log_warn "No environment named '$name'."; return 1; }
+    _use_env "$id"
+    ensure_helper
+    if is_running; then
+        log_warn "Environment '$name' is running. Stop it first: waterbox stop --env $name"
+        return 1
+    fi
+    {
+        echo "Deleting environment '$name' destroys:"
+        echo "  - its rootfs $JAIL_ROOT, including the guest home"
+        echo "    (agent logins, chat history, workspace files that are not shares)"
+        echo "  - its share list, wake-claude schedules and autostart setting"
+        echo "Shared host folders are not touched."
+    } > /dev/tty
+    # A failed reset parks the user's home here as its recovery copy; never delete
+    # that as a side effect.
+    if compgen -G "$ENV_DIR/reset-home.*" >/dev/null; then
+        log_warn "Environment '$name' holds a preserved home from a failed reset ($(compgen -G "$ENV_DIR/reset-home.*" | paste -sd' ')). Move it somewhere safe first; nothing was deleted."
+        return 1
+    fi
+    IFS= read -rep "Type the environment name to delete it: " typed < /dev/tty 2>/dev/tty || return 1
+    [ "$typed" = "$name" ] || { log_info "Kept environment '$name'."; return 0; }
+    run_priv autostart-disable >/dev/null 2>&1 || true
+    _remove_env_hostwakes \
+        || { log_warn "Could not remove the wake-claude schedules of '$name'; nothing was deleted."; return 1; }
+    # Also clears the restore marker. A wake may have booted the box meanwhile: a
+    # failed stop, or a box still up, aborts before anything is deleted.
+    if ! run_priv down >/dev/null 2>&1 || is_running; then
+        log_warn "Environment '$name' is running or did not stop cleanly; nothing was deleted."
+        return 1
+    fi
+    if [ -e "$JAIL_ROOT" ]; then
+        # JAIL_ROOT is literal: a symlinked component would aim root's rm elsewhere.
+        [ "$(realpath -e -- "$JAIL_ROOT" 2>/dev/null)" = "$JAIL_ROOT" ] \
+            || { log_warn "Refusing to delete: $JAIL_ROOT resolves somewhere else."; return 1; }
+        sudo rm -rf -- "$JAIL_ROOT" \
+            || { log_warn "Could not delete $JAIL_ROOT; environment '$name' was kept."; return 1; }
+    fi
+    if [ "$id" = 0 ]; then
+        # Env 0's files sit beside the global ones in ~/.waterbox; remove only its own.
+        rm -f -- "$SHARE_LIST" "$PENDING_SHARE_LIST" "$GUI_ENV_FILE" "$GUI_BINDS_FILE" \
+            "$ENV_DIR/xauth" "$BOOTSTRAP_IN_PROGRESS"
+    elif [ -L "$ENV_DIR" ] || ! sudo rm -rf -- "$ENV_DIR"; then
+        log_warn "Deleted the rootfs, but could not remove $ENV_DIR; remove it by hand."
+    fi
+    _env_rows | awk -v i="$id" '$1 != i' | _env_write_rows \
+        || { log_warn "Deleted the files, but $ENV_REGISTRY could not be updated."; return 1; }
+    log_success "Deleted environment '$name'."
+}
+
+# `waterbox env [list | create <name> | rename <old> <new> | delete <name>]`
+env_cmd() {
+    local rows=() row id
+    _env_registry_init
+    case "${1:-}" in
+        "")
+            _env_menu start || return 0
+            CLI_ENV_NAME="$(_env_name_of "$ENV_PICK")"
+            start_sandbox ;;
+        list)
+            mapfile -t rows < <(_env_rows)
+            [ "${#rows[@]}" -gt 0 ] || { echo "  (none — 'waterbox' creates one)"; return 0; }
+            for row in "${rows[@]}"; do
+                printf '  %-20s %s\n' "${row#* }" "$(_env_state "${row%% *}")"
+            done ;;
+        create)
+            id=$(_env_create "$2") || exit 1
+            log_success "Created environment '$2'. It is built the first time it starts: waterbox start --env $2" ;;
+        rename)
+            _env_rename "$2" "$3" || exit 1
+            log_success "Renamed environment '$2' → '$3'." ;;
+        delete)
+            _env_delete "$2" || exit 1 ;;
+    esac
+}
+
+# `waterbox status` without --env: every environment's state, then the details of
+# each running one.
+status_all() {
+    local rows=() row
+    _env_registry_init
+    mapfile -t rows < <(_env_rows)
+    if [ "${#rows[@]}" -le 1 ]; then
+        _resolve_env; status_sandbox; return
+    fi
+    log_info "Environments:"
+    for row in "${rows[@]}"; do
+        printf '  %-20s %s\n' "${row#* }" "$(_env_state "${row%% *}")"
+    done
+    for row in "${rows[@]}"; do
+        _use_env "${row%% *}"
+        is_running || continue
+        echo
+        printf '── %s ──\n' "${row#* }"
+        status_sandbox
+    done
+}
+
 # --- Start: boot if needed, attach a shell ---
 warn_unsafe_host_root() {
     echo -e "\e[1;31m[UNSAFE] Private-user isolation is OFF: container root is real host root.\e[0m"
@@ -2874,7 +3343,7 @@ _require_running_mode_match() {
 }
 
 start_sandbox() {
-    local want="${1:-}"        # optional target session (`waterbox start <name>`)
+    local want="${1:-}" ids=() id   # optional target session (`waterbox start <name>`)
     # Reject a bad name (notably a mistyped flag: the global parser only consumes the
     # ones it knows, so `waterbox start --foo` arrives here as a session name) BEFORE
     # bootstrapping or booting — attach_session re-checks, but only at the very end.
@@ -2882,12 +3351,49 @@ start_sandbox() {
         log_error "Invalid session name '$want' (letters, digits, . _ - only, not starting with '-'). See 'waterbox start --help'."
     fi
     require_host_deps
-    bootstrap_sandbox
+    _env_ensure_one      # first run (or every environment deleted): create 'main'
     ensure_host_privs    # immutable helper (narrow sudoers) + completion; no manual 'setup'
+
+    # `--here` always opens a new session, so it needs an environment up front.
+    if [ "${WATERBOX_HERE:-0}" = 1 ]; then
+        _resolve_env
+        _env_up
+        attach_session
+        return 0
+    fi
+    # A named session: attach where it already lives; a new name is created in the
+    # environment the usual rules pick (--env, the only one, the only running one,
+    # or the environment menu).
+    if [ -n "$want" ]; then
+        if [ -n "${CLI_ENV_NAME:-}" ]; then
+            _resolve_env
+        else
+            mapfile -t ids < <(_session_matches "$want")
+            if [ "${#ids[@]}" -eq 1 ]; then
+                _env_resolved "${ids[0]}"
+            elif [ "${#ids[@]}" -gt 1 ]; then
+                log_error "Session '$want' exists in several environments ($(for id in "${ids[@]}"; do _env_name_of "$id"; done | paste -sd' ')); add --env <name>."
+            else
+                _resolve_env
+            fi
+        fi
+        _env_up
+        attach_session "$want"
+        return 0
+    fi
+    _pick_session
+}
+
+# Bring the active environment to a usable state: build it on first use, refresh
+# its managed config while it is down, boot it (or re-assert networking and DNS
+# when it already runs) and apply a `--here` share. Attaching is the caller's job.
+_env_up() {
+    _ensure_user_config
+    bootstrap_sandbox
     if is_running; then
         _require_running_mode_match
         if [ "${CLI_BOOT_FLAG_USED:-0}" = 1 ]; then
-            log_warn "Display/GPU flags are boot-time settings; this running box keeps its current settings. Use 'waterbox restart' with the desired flags to change them."
+            log_warn "Display/GPU/USB/audio/gamepad flags are boot-time settings; this running box keeps its current settings. Use 'waterbox restart' with the desired flags to change them."
         fi
     fi
     [ "$WATERBOX_UNSAFE_HOST_ROOT" = 1 ] && warn_unsafe_host_root
@@ -2943,7 +3449,7 @@ start_sandbox() {
                 fi
             done < "$SHARE_LIST"
             if [ "$existing" != collision ]; then
-                mkdir -p "$CONFIG_DIR"
+                mkdir -p "$ENV_DIR"
                 printf '%s\n' "$here_rp" >> "$SHARE_LIST" \
                     || log_error "Could not save the --here share."
                 WB_START_SUBDIR="$(basename "$here_rp")"; here_added=1
@@ -2962,6 +3468,15 @@ start_sandbox() {
            && ! systemctl show "$MACHINE_NAME.service" -p DeviceAllow 2>/dev/null | grep -q 'usb_device'; then
             log_warn "USB binds are set at boot — 'waterbox restart --usb' to enable them."
         fi
+        if [ "$WATERBOX_GAMEPAD" = "1" ] \
+           && ! systemctl show "$MACHINE_NAME.service" -p DeviceAllow 2>/dev/null | grep -qE '/dev/(input|hidraw)'; then
+            log_warn "Gamepads are set at boot — 'waterbox restart --gamepad' to enable them."
+        fi
+        # A hint only: boot-env lives in the box-controlled rootfs.
+        if [ "$WATERBOX_AUDIO" = "1" ] \
+           && ! _read_jail_regular "$JAIL_ROOT/etc/waterbox/boot-env" 4096 2>/dev/null | grep -q PIPEWIRE_REMOTE; then
+            log_warn "Audio is set at boot — 'waterbox restart --audio' to enable it."
+        fi
         # Re-assert the fixed veth/firewall setup as well as DNS on every attach.
         # Firewall managers can reload while the box stays up; reporting a usable
         # session while its forwarding rules are gone is a misleading success.
@@ -2973,7 +3488,7 @@ start_sandbox() {
             log_error "The box is running, but Waterbox could not repair its host networking."
         fi
     else
-        log_info "Booting sandbox as transient systemd unit '$MACHINE_NAME.service'..."
+        log_info "Booting environment '$(_env_label)' as transient systemd unit '$MACHINE_NAME.service'..."
 
         # Detect the display server + write the GUI bind/env spec files as YOU
         # (needs your DISPLAY/XAUTHORITY). Clears them when --gui is absent.
@@ -2998,6 +3513,16 @@ start_sandbox() {
                 || log_error "--usb needs setfacl (package 'acl') to grant the box access to device nodes."
             log_warn "--usb: the box gets raw access to EVERY attached USB device — it could reflash a dongle or talk to a plugged-in security key."
             boot_args+=(--usb)
+        fi
+        if [ "$WATERBOX_AUDIO" = "1" ]; then
+            log_warn "--audio: the box becomes a full client of your PipeWire server. It can record your microphone, hear and reroute all host audio, and may be able to make PipeWire load code that runs as you on the host. Use it only for a box you trust that far."
+            boot_args+=(--audio)
+        fi
+        if [ "$WATERBOX_GAMEPAD" = "1" ]; then
+            command -v setfacl >/dev/null 2>&1 \
+                || log_error "--gamepad needs setfacl (package 'acl') to grant the box access to controllers."
+            log_warn "--gamepad: the box reads every input of the controllers connected now and can use their rumble, LED and firmware interfaces. Controllers connected later need a restart."
+            boot_args+=(--gamepad)
         fi
         [ "$WATERBOX_UNSAFE_HOST_ROOT" = "1" ] && boot_args+=(--unsafe-host-root)
         local boot_output="" boot_rc=0 failed_b64="" failed_share=""
@@ -3033,7 +3558,7 @@ start_sandbox() {
             if [ -n "$failed_share" ] && _pending_share_has "$failed_share" \
                && ! is_running && [ "$share_retries" -lt 32 ]; then
                 _remove_share_record "$SHARE_LIST" "$failed_share" \
-                    || log_error "The new share failed and Waterbox could not roll it back. Fix permissions/free space in $CONFIG_DIR, then detach '$failed_share'."
+                    || log_error "The new share failed and Waterbox could not roll it back. Fix permissions/free space in $ENV_DIR, then detach '$failed_share'."
                 _remove_share_record "$PENDING_SHARE_LIST" "$failed_share"
                 share_retries=$((share_retries + 1))
                 log_warn "The newly added share '$failed_share' could not be mounted securely; it was rolled back. Retrying without it."
@@ -3045,7 +3570,7 @@ start_sandbox() {
             if [ "$here_added" = 1 ] && [ "$failed_share" = "$here_rp" ] \
                && ! is_running && [ "$share_retries" -lt 32 ]; then
                 _remove_share_record "$SHARE_LIST" "$here_rp" \
-                    || log_error "The --here share failed and Waterbox could not roll it back. Fix permissions/free space in $CONFIG_DIR, then detach '$here_rp'."
+                    || log_error "The --here share failed and Waterbox could not roll it back. Fix permissions/free space in $ENV_DIR, then detach '$here_rp'."
                 here_added=0
                 WB_START_SUBDIR=""
                 share_retries=$((share_retries + 1))
@@ -3061,7 +3586,7 @@ start_sandbox() {
             fi
             log_error "Sandbox failed to boot. Check: journalctl -u $MACHINE_NAME -e"
         done
-        log_success "Sandbox up. Host reachable inside as '$HOST_ALIAS' ($HOST_IP)."
+        log_success "Environment '$(_env_label)' up. Host reachable inside as '$HOST_ALIAS' ($HOST_IP)."
     fi
 
     # Repair schedule messages created by the old root:0600 bug. This runs inside
@@ -3087,13 +3612,11 @@ start_sandbox() {
     if [ "$WB_HERE" = 1 ] && [ "$here_added" = 1 ] && [ "$box_was_running" = 1 ]; then
         if ! run_priv bind-share "$here_rp"; then
             _remove_share_record "$SHARE_LIST" "$here_rp" \
-                || log_error "The --here mount failed and its saved entry could not be removed. Fix permissions/free space in $CONFIG_DIR, then detach '$here_rp'."
+                || log_error "The --here mount failed and its saved entry could not be removed. Fix permissions/free space in $ENV_DIR, then detach '$here_rp'."
             log_warn "Couldn't mount '$WB_START_SUBDIR' securely; the share was not added."
             WB_START_SUBDIR=""
         fi
     fi
-
-    attach_session "$want"
 }
 
 restart_sandbox() {
@@ -3106,6 +3629,8 @@ restart_sandbox() {
     fi
     stop_sandbox
     [ "$WB_CANCELLED" = 1 ] && { log_info "Restart cancelled."; return 0; }
+    # The start half must come back in the same environment the stop took down.
+    CLI_ENV_NAME="$(_env_label)"
     start_sandbox
 }
 
@@ -3119,7 +3644,7 @@ stop_sandbox() {
         if ! _confirm_kill_sessions "stop"; then
             log_info "Stop cancelled."; WB_CANCELLED=1; return 0
         fi
-        log_info "Powering off sandbox..."
+        log_info "Powering off environment '$(_env_label)'..."
         run_priv down \
             || log_error "Sandbox did not stop cleanly. It is still running; inspect: journalctl -u $MACHINE_NAME -e"
         # Do this after the verified stop. Besides avoiding writes against a live
@@ -3128,22 +3653,22 @@ stop_sandbox() {
         _remove_all_schedules \
             || log_warn "The box stopped, but one or more stale scheduled commands could not be removed."
     else
-        log_info "Sandbox not running."
+        log_info "Environment '$(_env_label)' is not running."
         teardown_host_network            # clear any stray rules
     fi
-    log_success "Sandbox stopped."
+    log_success "Environment '$(_env_label)' stopped."
 }
 
 # --- Status ---
 status_sandbox() {
     if is_running; then
-        log_success "Sandbox is running."
+        log_success "Environment '$(_env_label)' is running."
         local status_args=()
         [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && status_args+=(--color)
         run_priv status "${status_args[@]}" \
             || log_warn "The sandbox is running, but its detailed status could not be read."
     else
-        log_info "Sandbox is stopped."
+        log_info "Environment '$(_env_label)' is stopped."
     fi
 }
 
@@ -3151,28 +3676,27 @@ status_sandbox() {
 # Session restore itself needs no setup: any cold boot after an unexpected shutdown
 # restores. Autostart only removes the need to type 'waterbox' after the host comes
 # back, through one fixed host unit the helper generates.
-AUTOSTART_UNIT="waterbox-autostart.service"
 manage_autostart() {   # on | off | status (default)
     case "${1:-status}" in
         on)
             [ -f "$JAIL_ROOT/.waterbox-ready" ] \
-                || log_error "No built box to autostart. Run 'waterbox start' once first."
+                || log_error "Environment '$(_env_label)' is not built yet. Run 'waterbox start --env $(_env_label)' once first."
             require_host_deps
             ensure_helper
-            log_warn "Autostart: the box will boot with the host, and chats that were mid-task when the host went down continue on their own, with nobody watching them."
+            log_warn "Autostart: environment '$(_env_label)' will boot with the host, and chats that were mid-task when the host went down continue on their own, with nobody watching them."
             run_priv autostart-enable || log_error "Could not enable autostart."
-            log_success "Autostart on: the box boots with the host (secure mode, no GUI/USB) and restores its sessions after an unexpected shutdown."
+            log_success "Autostart on for '$(_env_label)': it boots with the host (secure mode, no GUI/USB/audio/gamepad) and restores its sessions after an unexpected shutdown."
             ;;
         off)
             ensure_helper
             run_priv autostart-disable || log_error "Could not disable autostart."
-            log_success "Autostart off. After an unexpected shutdown, the next 'waterbox' start still restores the sessions."
+            log_success "Autostart off for '$(_env_label)'. After an unexpected shutdown, the next 'waterbox' start still restores the sessions."
             ;;
         status)
             if systemctl is-enabled --quiet "$AUTOSTART_UNIT" 2>/dev/null; then
-                log_info "Autostart is on: the box boots with the host and restores its sessions."
+                log_info "Autostart is on for '$(_env_label)': it boots with the host and restores its sessions."
             else
-                log_info "Autostart is off. Turn it on with 'waterbox autostart on'."
+                log_info "Autostart is off for '$(_env_label)'. Turn it on with 'waterbox autostart on --env $(_env_label)'."
             fi
             ;;
     esac
@@ -3196,7 +3720,7 @@ reset_sandbox() {
         # backing-filesystem probe immediately after extraction.
         _require_secure_nspawn
     fi
-    log_info "About to wipe the waterbox environment."
+    log_info "About to wipe environment '$(_env_label)'."
     if is_running && _print_session_impact > /dev/tty 2>&1; then
         log_warn "The live session(s) above will be ended."
     fi
@@ -3245,7 +3769,7 @@ reset_sandbox() {
     fi
     teardown_host_network
 
-    # Stash the WHOLE user home if keeping it. Move it to a sibling under CONFIG_DIR
+    # Stash the WHOLE user home if keeping it. Move it to a sibling under ENV_DIR
     # instead of duplicating it into /tmp: this is atomic on the same filesystem,
     # needs no second copy's worth of free disk, and leaves a recoverable backup if
     # bootstrap fails. Never proceed to the wipe when preservation itself fails.
@@ -3253,7 +3777,7 @@ reset_sandbox() {
     if [ "$keep_home" = 1 ]; then
         _guard_jail_path "$JAIL_ROOT/home/$USER_NAME"
         if [ -d "$JAIL_ROOT/home/$USER_NAME" ]; then
-            kept=$(mktemp -d "$CONFIG_DIR/reset-home.XXXXXX")
+            kept=$(mktemp -d "$ENV_DIR/reset-home.XXXXXX")
             if ! sudo mv "$JAIL_ROOT/home/$USER_NAME" "$kept/home"; then
                 sudo rmdir "$kept" 2>/dev/null || true
                 log_error "Reset aborted: could not preserve the home directory; the original rootfs was not deleted."
@@ -3295,7 +3819,7 @@ reset_sandbox() {
     ensure_host_privs        # helper is needed for reliable host-wake cleanup below
 
     if [ "$keep_wake" != 1 ]; then
-        if _remove_all_hostwakes; then
+        if _remove_env_hostwakes; then
             log_info "Removed wake-claude schedules."
         else
             log_warn "One or more wake-claude schedules could not be removed; check 'waterbox wake-claude list'."
@@ -3315,36 +3839,24 @@ reset_sandbox() {
     log_success "Rebuilt. Run 'waterbox' to boot and attach."
 }
 
-# Remove every host wake timer (req 15: when not keeping wake-claude schedules).
-_remove_all_hostwakes() {
-    local f n failed=0
-    for f in "$HOSTWAKE_GLOB"*.timer; do
-        [ -e "$f" ] || continue
-        n=$(basename "$f" .timer); n="${n##*-}"
-        case "$n" in ''|*[!0-9]*) continue ;; esac
-        run_priv remove-host-wake "$n" >/dev/null 2>&1 || failed=1
-    done
-    return "$failed"
-}
-
 # --- In-box config version -----------------------------------------------------
 # Marker (rootfs, world-readable) tying the baked in-box config (dotfiles, tmux bar,
 # agent-env switcher, waterbox-fire) to the exact waterbox script that wrote it — a
 # checksum of this script. Lets 'start' notice a box built by an OLDER waterbox and
 # auto-refresh it, so you never have to remember 'refresh-config' after an upgrade.
-CONFIG_VERSION_FILE="$JAIL_ROOT/etc/waterbox/config-version"
+_config_version_file() { printf '%s' "$JAIL_ROOT/etc/waterbox/config-version"; }
 _config_marker()  { cksum < "$SELF_PATH" 2>/dev/null | cut -d' ' -f1; }
 _config_current() {
     local installed
     [ -f "$JAIL_ROOT/.waterbox-ready" ] || return 1
-    installed=$(_read_jail_regular "$CONFIG_VERSION_FILE" 64 2>/dev/null) || return 1
+    installed=$(_read_jail_regular "$(_config_version_file)" 64 2>/dev/null) || return 1
     [ "$installed" = "$(_config_marker)" ]
 }
 _write_config_version() {
-    _in_jail "$CONFIG_VERSION_FILE" \
+    _in_jail "$(_config_version_file)" \
         || log_error "Refusing to create the config marker: it resolves outside $JAIL_ROOT. Run 'waterbox reset'."
     sudo mkdir -p "$JAIL_ROOT/etc/waterbox"
-    _config_marker | wb_tee "$CONFIG_VERSION_FILE"
+    _config_marker | wb_tee "$(_config_version_file)"
 }
 
 # --- Refresh in-box config (no wipe) ------------------------------------------
@@ -3431,12 +3943,8 @@ install_helper() {
 # verbs) so sudo can be NOPASSWD for this file only.
 set -e
 WB_HELPER_VERSION="$hmark"
-MACHINE_NAME="$MACHINE_NAME"
 USER_NAME="$USER_NAME"
-HOST_IP="$HOST_IP"
-CONTAINER_IP="$CONTAINER_IP"
 NET_CIDR="$NET_CIDR"
-VE_IFACE="$VE_IFACE"
 ALLOW_CONTAINER_TO_HOST_PORTS="$ALLOW_CONTAINER_TO_HOST_PORTS"
 CONTAINER_WORKSPACE="$CONTAINER_WORKSPACE"
 WATERBOX_MEMORY_HIGH="$WATERBOX_MEMORY_HIGH"
@@ -3446,6 +3954,9 @@ WATERBOX_TASKS_MAX="$WATERBOX_TASKS_MAX"
 WATERBOX_CPU_WEIGHT="$WATERBOX_CPU_WEIGHT"
 WATERBOX_IO_WEIGHT="$WATERBOX_IO_WEIGHT"
 EOF
+        # The environment identity, verbatim from this script, so the helper derives
+        # exactly the machine name, veth, subnet and paths the CLI expects.
+        declare -f _valid_env_id _env_ids_apply _env_dir_for
         cat <<'HELPER'
 HW_ETC="/etc/systemd/system"
 TASK_ETC="/etc/systemd/system"      # inside the rootfs ($JAIL_ROOT$TASK_ETC)
@@ -3464,6 +3975,16 @@ unattended_lock() {
     exec 9>/run/waterbox-unattended.lock && flock -w 900 9 \
         || { echo "helper: another unattended Waterbox boot did not finish within 15 minutes" >&2; exit 3; }
 }
+
+# Environment: accepted only as the first two arguments, so no later argument (a
+# tmux argument, an API key) can ever be reinterpreted as one. Missing means env 0,
+# which keeps host units written by releases before environments working unchanged.
+wb_env=0
+if [ "${1:-}" = --env ]; then wb_env="${2:-}"; shift 2 || exit 2; fi
+_valid_env_id "$wb_env" || { echo "helper: bad environment id"; exit 2; }
+_env_ids_apply "$wb_env"
+if [ "$wb_env" = 0 ]; then AUTOSTART_UNIT="waterbox-autostart.service"
+else AUTOSTART_UNIT="waterbox-autostart-$wb_env.service"; fi
 
 # Pull a trailing "--user <uid>" out of the args (a host root timer has no
 # SUDO_UID, so it passes the target uid explicitly). Everything else is positional.
@@ -3491,7 +4012,7 @@ case "$wb_uid" in ''|*[!0-9]*) echo "helper: no valid target user"; exit 2 ;; es
 if [ "$verb" = autostart ]; then
     wb_waited=0
     until wb_home="$(getent passwd "$wb_uid" | cut -d: -f6)" \
-            && [ -n "$wb_home" ] && [ -f "$wb_home/.waterbox/root/.waterbox-ready" ]; do
+            && [ -n "$wb_home" ] && [ -f "$(_env_dir_for "$wb_home" "$wb_env")/root/.waterbox-ready" ]; do
         [ "$wb_waited" = 1 ] || echo "helper: no built box under the home of uid $wb_uid yet (not mounted?); checking every minute"
         wb_waited=1
         sleep 60
@@ -3499,8 +4020,11 @@ if [ "$verb" = autostart ]; then
 fi
 wb_home="$(getent passwd "$wb_uid" | cut -d: -f6)"
 [ -n "$wb_home" ] && [ -d "$wb_home" ] || { echo "helper: no home for uid $wb_uid"; exit 2; }
-JAIL_ROOT="$wb_home/.waterbox/root"
-WB_CFG="$wb_home/.waterbox"
+# Literal paths built from the home and the validated id; never a resolved symlink.
+WB_CFG="$(_env_dir_for "$wb_home" "$wb_env")"
+JAIL_ROOT="$WB_CFG/root"
+RESUME_MARK="$RESUME_MARK_DIR/live-$wb_uid"
+[ "$wb_env" = 0 ] || RESUME_MARK="$RESUME_MARK-$wb_env"
 
 # Charset-limited AND never "." / ".." (so a name can't traverse out of its dir).
 _valid_profile() { [ "${#1}" -le 128 ] || return 1; case "$1" in ''|.|..|-*|*[!A-Za-z0-9._-]*) return 1 ;; *) return 0 ;; esac; }
@@ -3585,6 +4109,29 @@ human_bytes() {
 unit_property() {
     systemctl show "$MACHINE_NAME.service" --property="$1" --value 2>/dev/null || true
 }
+slice_property() {
+    systemctl show waterbox.slice --property="$1" --value 2>/dev/null || true
+}
+
+# Every environment runs in this slice, so the limits below cap all running
+# environments together: two boxes cannot each take 70% of RAM. A runtime unit file
+# (rewritten only when its body changes) also loads on systemd 249.
+ensure_slice() {
+    local unit=/run/systemd/system/waterbox.slice body
+    body=$(printf '%s\n' \
+        "# Managed by Waterbox: every environment shares these limits." \
+        "[Unit]" "Description=Waterbox environments" "" \
+        "[Slice]" \
+        "MemoryHigh=$WATERBOX_MEMORY_HIGH" \
+        "MemoryMax=$WATERBOX_MEMORY_MAX" \
+        "MemorySwapMax=$(swap_limit_bytes)" \
+        "CPUWeight=$WATERBOX_CPU_WEIGHT" \
+        "IOWeight=$WATERBOX_IO_WEIGHT")
+    [ "$(cat "$unit" 2>/dev/null)" = "$body" ] && return 0
+    mkdir -p /run/systemd/system \
+        && printf '%s\n' "$body" > "$unit" \
+        && systemctl daemon-reload
+}
 
 resource_status() {
     local use_color="${1:-0}" current high maximum remaining tasks tasks_max
@@ -3599,13 +4146,15 @@ resource_status() {
         c_dim=$'\e[2m'
         c_off=$'\e[0m'
     fi
-    current=$(unit_property MemoryCurrent)
-    high=$(unit_property MemoryHigh)
-    maximum=$(unit_property MemoryMax)
+    # Memory and CPU limits belong to the slice every environment shares; tasks
+    # are counted per environment.
+    current=$(slice_property MemoryCurrent)
+    high=$(slice_property MemoryHigh)
+    maximum=$(slice_property MemoryMax)
     tasks=$(unit_property TasksCurrent)
     tasks_max=$(unit_property TasksMax)
-    weight=$(unit_property CPUWeight)
-    quota=$(unit_property CPUQuotaPerSecUSec)
+    weight=$(slice_property CPUWeight)
+    quota=$(slice_property CPUQuotaPerSecUSec)
 
     printf '%sResource limits:%s\n' "$c_head" "$c_off"
     if _valid_id "$current" && _valid_id "$high" && _valid_id "$maximum"; then
@@ -3618,7 +4167,7 @@ resource_status() {
         else
             ram_color="$c_good"
         fi
-        printf '  %sRAM:%s %s%s%s / %s max %s(%s remaining; pressure at %s)%s\n' \
+        printf '  %sRAM (all environments):%s %s%s%s / %s max %s(%s remaining; pressure at %s)%s\n' \
             "$c_label" "$c_off" "$ram_color" "$(human_bytes "$current")" "$c_off" \
             "$(human_bytes "$maximum")" "$c_dim" "$(human_bytes "$remaining")" \
             "$(human_bytes "$high")" "$c_off"
@@ -3691,6 +4240,7 @@ if ".." in target.split("/"):
 allowed_gui = {
     "/tmp/.waterbox-wayland",
     "/tmp/.waterbox-xauth",
+    "/tmp/.waterbox-pipewire",
 }
 if not (target.startswith(workspace + "/")
         or target in allowed_gui
@@ -3961,7 +4511,24 @@ net_up() {
             || iptables -I INPUT 1 -i "$VE_IFACE" -s "$HOST_IP/$NET_CIDR" -j ACCEPT \
             || return 1
     fi
+    # Environments are separate boxes: never forward between their veths (the
+    # ACCEPT above has no output interface, and MASQUERADE would even present the
+    # other box's traffic as coming from 'host'). Re-inserted on top every time,
+    # because the ACCEPT rules above are inserted at position 1 too.
+    _drop_interenv_rule
+    iptables -I FORWARD 1 -i ve-waterbox+ -o ve-waterbox+ -j DROP || return 1
     return 0
+}
+_drop_interenv_rule() {   # every copy, bounded
+    local i
+    for i in 1 2 3 4 5 6 7 8; do
+        iptables -D FORWARD -i ve-waterbox+ -o ve-waterbox+ -j DROP 2>/dev/null || return 0
+    done
+}
+# True while another environment's veth exists (it still needs the shared DROP).
+_other_waterbox_veths() {
+    ip -o link show 2>/dev/null | awk -F': ' '{ sub(/@.*/, "", $2); print $2 }' \
+        | grep -E '^ve-waterbox(-[0-9]+)?$' | grep -qvxF -- "$VE_IFACE"
 }
 net_down() {
     iptables -t nat -D PREROUTING -i "$VE_IFACE" -d "$HOST_IP" -j DNAT --to-destination 127.0.0.1 2>/dev/null || true
@@ -3969,6 +4536,9 @@ net_down() {
     iptables -D FORWARD -i "$VE_IFACE" -j ACCEPT 2>/dev/null || true
     iptables -D FORWARD -o "$VE_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
     iptables -D INPUT -i "$VE_IFACE" -s "$HOST_IP/$NET_CIDR" -j ACCEPT 2>/dev/null || true
+    if ! _other_waterbox_veths; then
+        _drop_interenv_rule
+    fi
 }
 
 # Minimal boot for an unattended wake: NO shares, NO GUI — just the base container
@@ -3982,20 +4552,17 @@ boot_min() {
         return 0
     fi
     [ -f "$JAIL_ROOT/.waterbox-ready" ] || { echo "helper: rootfs not built at $JAIL_ROOT"; exit 3; }
-    local raf=() swap_max
-    swap_max=$(swap_limit_bytes)
+    local raf=()
+    ensure_slice \
+        || { echo "helper: could not set up the shared waterbox.slice resource limits" >&2; return 3; }
     _nspawn_supports_raf && raf=(--restrict-address-families="AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET")
     # Same device-cgroup lockdown as boot_full: private users are the primary
     # boundary, while the closed device policy remains defense in depth.
     systemd-run --unit="$MACHINE_NAME" --collect --service-type=notify \
         --description="Waterbox container ($MACHINE_NAME)" \
         --property=KillMode=mixed --property=TimeoutStopSec=30 --property=SuccessExitStatus=133 \
-        --property=MemoryHigh="$WATERBOX_MEMORY_HIGH" \
-        --property=MemoryMax="$WATERBOX_MEMORY_MAX" \
-        --property=MemorySwapMax="$swap_max" \
+        --slice=waterbox.slice \
         --property=TasksMax="$WATERBOX_TASKS_MAX" \
-        --property=CPUWeight="$WATERBOX_CPU_WEIGHT" \
-        --property=IOWeight="$WATERBOX_IO_WEIGHT" \
         --property=OOMPolicy=continue \
         --property=DevicePolicy=closed \
         --property=DeviceAllow="/dev/net/tun rwm" \
@@ -4058,11 +4625,177 @@ usb_revoke() {
     # that user's own device ACLs alone.
     [ "$uid" != 1000 ] || return 0
     command -v setfacl >/dev/null 2>&1 || return 0
-    for n in /dev/bus/usb/*/* /dev/ttyUSB* /dev/ttyACM*; do
+    for n in /dev/bus/usb/*/* /dev/ttyUSB* /dev/ttyACM* \
+             /dev/input/event* /dev/input/js* /dev/hidraw*; do
         [ -c "$n" ] || continue
         setfacl -x "u:$uid" "$n" 2>/dev/null || true
     done
 }
+
+# --- Gamepads (--gamepad) ------------------------------------------------------
+# A char device's identity independent of its node name and number: its sysfs
+# device path. Used to notice that a node name now belongs to a different device.
+_char_devpath() {
+    local mm
+    mm=$(stat -Lc '%t %T' -- "$1" 2>/dev/null) || return 1
+    set -- $mm
+    realpath -e "/sys/dev/char/$((16#$1)):$((16#$2))" 2>/dev/null
+}
+_is_chardev() { [ -c "$1" ] && [ ! -L "$1" ]; }
+# Joystick event nodes, their js nodes, and the hidraw nodes of the same device —
+# but nothing from a device that also presents a keyboard: keyboards whose media
+# or "joystick" collection is misdetected share one HID interface (and hidraw)
+# with the key reports. A keyboard's or security key's hidraw thus stays out.
+# Each pick records its sysfs identity (GAMEPAD_IDS) so the guard can tell when a
+# node name later belongs to another device. Roots are parameters so the selection
+# can be tested against a fake tree. /dev/uinput is never a candidate: it would let
+# the box create a virtual keyboard and type into the host session.
+_gamepad_udev_has() {   # $1 = sysfs class dir of a node, $2 = udev property line
+    local mm
+    mm=$(cat "$1/dev" 2>/dev/null) || return 1
+    [[ "$mm" =~ ^[0-9]+:[0-9]+$ ]] || return 1
+    grep -qx -- "$2" "$GP_UDEV/c$mm" 2>/dev/null
+}
+collect_gamepad_nodes() {
+    local sys="${1:-/sys}" dev="${3:-/dev}" ev n parent sib hr js
+    local -A pad_parent=()
+    GP_UDEV="${2:-/run/udev/data}"
+    GAMEPAD_NODES=(); GAMEPAD_IDS=()
+    for ev in "$sys"/class/input/event*; do
+        n=${ev##*/}
+        _is_chardev "$dev/input/$n" || continue
+        _gamepad_udev_has "$ev" 'E:ID_INPUT_JOYSTICK=1' || continue
+        parent=$(realpath -e "$ev/device/device" 2>/dev/null) || continue
+        for sib in "$parent"/input/input*/event*; do
+            _gamepad_udev_has "$sib" 'E:ID_INPUT_KEYBOARD=1' && continue 2
+        done
+        GAMEPAD_NODES+=("$dev/input/$n"); GAMEPAD_IDS+=("$(realpath -e "$ev")")
+        for js in "$ev"/device/js*; do
+            [ -e "$js" ] && _is_chardev "$dev/input/${js##*/}" || continue
+            GAMEPAD_NODES+=("$dev/input/${js##*/}"); GAMEPAD_IDS+=("$(realpath -e "$js")")
+        done
+        pad_parent[$parent]=1
+    done
+    for hr in "$sys"/class/hidraw/hidraw*; do
+        parent=$(realpath -e "$hr/device" 2>/dev/null) || continue
+        [ -n "${pad_parent[$parent]:-}" ] && _is_chardev "$dev/${hr##*/}" || continue
+        GAMEPAD_NODES+=("$dev/${hr##*/}"); GAMEPAD_IDS+=("$(realpath -e "$hr")")
+    done
+    return 0
+}
+# --- end gamepad collect
+gamepad_grant() {
+    local uid n
+    command -v setfacl >/dev/null 2>&1 \
+        || { echo "helper: setfacl not found — install the 'acl' package for --gamepad" >&2; return 1; }
+    uid=$(_usb_mapped_uid) || return 1
+    for n in "${GAMEPAD_NODES[@]}"; do
+        setfacl -m "u:$uid:rw" "$n" || { [ -c "$n" ] || continue; return 1; }
+    done
+}
+# Root-only state for the device guard (see the devguard verb).
+DEVGUARD_DIR="/run/waterbox"
+devguard_paths() {
+    DEVGUARD_ALLOW="$DEVGUARD_DIR/devallow-$wb_uid-$wb_env"
+    DEVGUARD_PADS="$DEVGUARD_DIR/pads-$wb_uid-$wb_env"
+}
+# Record the unit's complete DeviceAllow list and the passed nodes with the
+# identity they had when they were selected, then start the guard that narrows
+# that list on removal. A node that changed device since selection (unplugged
+# during the boot, its number reused) fails the boot.
+devguard_start() {   # args = the DeviceAllow values the unit was started with
+    local i
+    devguard_paths
+    install -d -m 0700 -o root -g root "$DEVGUARD_DIR" || return 1
+    printf '%s\n' "$@" > "$DEVGUARD_ALLOW" || return 1
+    : > "$DEVGUARD_PADS" || return 1
+    for i in "${!GAMEPAD_NODES[@]}"; do
+        [ "$(_char_devpath "${GAMEPAD_NODES[$i]}")" = "${GAMEPAD_IDS[$i]}" ] \
+            || { echo "helper: ${GAMEPAD_NODES[$i]} changed device during the boot" >&2; return 1; }
+        printf '%s %s\n' "${GAMEPAD_NODES[$i]}" "${GAMEPAD_IDS[$i]}" >> "$DEVGUARD_PADS"
+    done
+    systemctl stop "$MACHINE_NAME-devguard.service" >/dev/null 2>&1 || true
+    systemd-run --unit="$MACHINE_NAME-devguard" --collect --quiet \
+        --description="Waterbox device guard ($MACHINE_NAME)" \
+        --property=BindsTo="$MACHINE_NAME.service" --property=After="$MACHINE_NAME.service" \
+        --property=Restart=always --property=RestartSec=1 --property=StartLimitIntervalSec=0 \
+        "$0" --env "$wb_env" devguard --user "$wb_uid"
+}
+# Drop one passed node from the box's device cgroup for good. The narrowed list is
+# applied first (an empty DeviceAllow= resets, then every remaining entry) and
+# recorded only after that worked, so a failure is retried rather than forgotten.
+# If the cgroup cannot be narrowed, the box is stopped: fail closed.
+devguard_drop() {
+    local node="$1" args=(DeviceAllow=) line
+    grep -vxF -- "$node rw" "$DEVGUARD_ALLOW" > "$DEVGUARD_ALLOW.new" || true
+    while IFS= read -r line; do args+=("DeviceAllow=$line"); done < "$DEVGUARD_ALLOW.new"
+    if ! systemctl set-property --runtime "$MACHINE_NAME.service" "${args[@]}"; then
+        logger -t waterbox "devguard: could not revoke $node; stopping $MACHINE_NAME" 2>/dev/null || true
+        rm -f "$DEVGUARD_ALLOW.new"
+        systemctl stop "$MACHINE_NAME.service" >/dev/null 2>&1 || true
+        return 1
+    fi
+    mv -f "$DEVGUARD_ALLOW.new" "$DEVGUARD_ALLOW"
+    awk -v n="$node" '$1 != n' "$DEVGUARD_PADS" > "$DEVGUARD_PADS.new" || true
+    mv -f "$DEVGUARD_PADS.new" "$DEVGUARD_PADS"
+    logger -t waterbox "devguard: $node went away; removed it from $MACHINE_NAME's device access" 2>/dev/null || true
+}
+# Drop every recorded node that is gone or now belongs to a different device.
+devguard_recheck() {
+    local pads=() entry node
+    mapfile -t pads < "$DEVGUARD_PADS"
+    for entry in "${pads[@]}"; do
+        node="${entry%% *}"
+        [ "$(_char_devpath "$node" 2>/dev/null)" = "${entry#* }" ] || devguard_drop "$node" || return 1
+    done
+}
+devguard_clear() {
+    devguard_paths
+    systemctl stop "$MACHINE_NAME-devguard.service" >/dev/null 2>&1 || true
+    rm -f "$DEVGUARD_ALLOW" "$DEVGUARD_PADS"
+}
+
+# --- Audio (--audio) -----------------------------------------------------------
+# PipeWire only. The box runs its own pipewire-pulse against this socket, so a
+# Pulse client's load-module lands inside the box; the host's Pulse socket (where
+# load-module would act on the host server) is never exposed. The path is fixed
+# and must be the host user's own socket, not a symlink.
+collect_audio_mount() {
+    local dir="/run/user/$wb_uid" sock="/run/user/$wb_uid/pipewire-0"
+    AUDIO_SOURCE=""
+    if [ -d "$dir" ] && [ ! -L "$dir" ] && [ "$(stat -c %u "$dir" 2>/dev/null)" = "$wb_uid" ] \
+       && [ -S "$sock" ] && [ ! -L "$sock" ] && [ "$(stat -c %u "$sock" 2>/dev/null)" = "$wb_uid" ]; then
+        AUDIO_SOURCE="$sock"
+        return 0
+    fi
+    echo "helper: --audio needs PipeWire on the host (no $sock owned by uid $wb_uid)" >&2
+    return 1
+}
+mount_collected_audio() {
+    local map_uid="$wb_uid"
+    run_in_approved_box /bin/sh -c '[ -e "$1" ] || : > "$1"; chown -h 1000:1000 "$1"' \
+        sh /tmp/.waterbox-pipewire \
+        || { echo "helper: could not prepare the audio target" >&2; return 1; }
+    unsafe_unit && map_uid="-"
+    mount_into_box "$AUDIO_SOURCE" /tmp/.waterbox-pipewire "$map_uid"
+}
+# The guest environment for this boot's devices, derived only from what the helper
+# itself accepted (never from a user-writable file). Removed when neither is on.
+write_boot_env() {   # $1 = audio, $2 = gamepad
+    local target="$JAIL_ROOT/etc/waterbox/boot-env" tmp rc=0
+    _in_jail "$target" \
+        || { echo "helper: refusing to write boot-env — it resolves outside the rootfs" >&2; return 1; }
+    if [ "$1" != 1 ] && [ "$2" != 1 ]; then rm -f "$target"; return 0; fi
+    mkdir -p "$JAIL_ROOT/etc/waterbox"
+    tmp=$(mktemp)
+    [ "$1" = 1 ] && echo 'export PIPEWIRE_REMOTE="/tmp/.waterbox-pipewire"' >> "$tmp"
+    # No udev database in the box: SDL (and Steam) then scan /dev/input directly.
+    [ "$2" = 1 ] && echo 'export SDL_JOYSTICK_DISABLE_UDEV="1"' >> "$tmp"
+    install -m 0644 "$tmp" "$target" || rc=1
+    rm -f "$tmp"
+    return "$rc"
+}
+
 power_off() {
     usb_revoke || true
     running && machinectl poweroff "$MACHINE_NAME" >/dev/null 2>&1 || true
@@ -4072,6 +4805,7 @@ power_off() {
         return 1
     fi
     net_down
+    devguard_clear || true
 }
 
 # --- Full interactive boot (shares + GUI + GPU), all validated helper-side ------
@@ -4081,9 +4815,11 @@ power_off() {
 # dirs), or owned dirs on removable/user mounts; reject everything else. This
 # re-checks what `share add` enforces, in case $SHARE_LIST was hand-edited.
 _share_allowed() {
+    # All of ~/.waterbox stays out, not only this environment's directory: it holds
+    # every environment's rootfs and the files their helpers trust.
     local rp="$1"
     case "$rp" in
-        "$wb_home"|"$wb_home/.ssh"|"$wb_home/.ssh/"*|"$wb_home/.gnupg"|"$wb_home/.gnupg/"*|"$wb_home/.config"|"$wb_home/.config/"*|"$WB_CFG"|"$WB_CFG/"*) return 1 ;;
+        "$wb_home"|"$wb_home/.ssh"|"$wb_home/.ssh/"*|"$wb_home/.gnupg"|"$wb_home/.gnupg/"*|"$wb_home/.config"|"$wb_home/.config/"*|"$wb_home/.waterbox"|"$wb_home/.waterbox/"*) return 1 ;;
         "$wb_home/"*)
             [ "$(stat -c %u "$rp" 2>/dev/null)" = "$wb_uid" ] && return 0 || return 1 ;;
     esac
@@ -4265,7 +5001,7 @@ clear_gui_env() {
     rm -f "$target"
 }
 boot_full() {
-    local gui="$1" nogpu="$2" unsafe="$3" usb="$4"
+    local gui="$1" nogpu="$2" unsafe="$3" usb="$4" audio="${5:-0}" gamepad="${6:-0}"
     if running; then
         if [ "$unsafe" = 1 ]; then
             unsafe_unit \
@@ -4287,6 +5023,16 @@ boot_full() {
     else
         clear_gui_env || return 3
     fi
+    if [ "$audio" = 1 ]; then collect_audio_mount || return 3; fi
+    GAMEPAD_NODES=()
+    if [ "$gamepad" = 1 ]; then
+        collect_gamepad_nodes
+        if [ "${#GAMEPAD_NODES[@]}" -eq 0 ]; then
+            echo "helper: --gamepad: no game controller is connected; booting without gamepads" >&2
+            gamepad=0
+        fi
+    fi
+    write_boot_env "$audio" "$gamepad" || return 3
     # SECURITY: normally private users make container root an unprivileged host uid.
     # The explicit compatibility flag omits that primary boundary; every remaining
     # restriction below stays enabled as defense in depth in both modes.
@@ -4298,13 +5044,14 @@ boot_full() {
     # NOTE: not empirically verified here — this shell is itself inside a waterbox, so
     # the device controller isn't delegated to it; validated against systemd's unit.
     local gpu=() raf=() userns=(--private-users=pick --private-users-ownership=map)
-    local unit_mode=() mode_label="" swap_max
+    local unit_mode=() mode_label=""
     if [ "$unsafe" = 1 ]; then
         userns=(--private-users=no)
         unit_mode=(--property=Environment=WATERBOX_UNSAFE_HOST_ROOT=1)
         mode_label=" [UNSAFE host-root]"
     fi
-    swap_max=$(swap_limit_bytes)
+    ensure_slice \
+        || { echo "helper: could not set up the shared waterbox.slice resource limits" >&2; return 3; }
     local props=(--property=DevicePolicy=closed
                  --property=DeviceAllow="/dev/net/tun rwm"  # we --bind it below
                  --property=DeviceAllow="char-pts rw"       # ESSENTIAL: in-box ttys/tmux
@@ -4334,18 +5081,24 @@ boot_full() {
             usb=0
         fi
     fi
+    # Gamepads: each node is bound and allowed by its exact path, never the whole
+    # input or hidraw major, so even container root cannot mknod a keyboard node.
+    local pad_dev=() allow_list=() p
+    for n in "${GAMEPAD_NODES[@]}"; do
+        pad_dev+=(--bind="$n")
+        props+=(--property=DeviceAllow="$n rw")
+    done
+    for p in "${props[@]}"; do
+        case "$p" in --property=DeviceAllow=*) allow_list+=("${p#--property=DeviceAllow=}") ;; esac
+    done
     _nspawn_supports_raf && raf=(--restrict-address-families="AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET")
     # KillMode=mixed: on stop, SIGTERM reaches nspawn (clean container poweroff),
     # not the container PID 1 (where SIGTERM means reexec, hanging the host).
     systemd-run --unit="$MACHINE_NAME" --collect --service-type=notify \
         --description="Waterbox container ($MACHINE_NAME)$mode_label" \
         --property=KillMode=mixed --property=TimeoutStopSec=30 --property=SuccessExitStatus=133 \
-        --property=MemoryHigh="$WATERBOX_MEMORY_HIGH" \
-        --property=MemoryMax="$WATERBOX_MEMORY_MAX" \
-        --property=MemorySwapMax="$swap_max" \
+        --slice=waterbox.slice \
         --property=TasksMax="$WATERBOX_TASKS_MAX" \
-        --property=CPUWeight="$WATERBOX_CPU_WEIGHT" \
-        --property=IOWeight="$WATERBOX_IO_WEIGHT" \
         --property=OOMPolicy=continue \
         "${unit_mode[@]}" \
         "${props[@]}" \
@@ -4355,7 +5108,8 @@ boot_full() {
             --resolv-conf=off --capability=CAP_NET_ADMIN,CAP_NET_RAW --bind=/dev/net/tun \
             "${raf[@]}" \
             "${gpu[@]}" \
-            "${usb_dev[@]}"
+            "${usb_dev[@]}" \
+            "${pad_dev[@]}"
     running || { echo "helper: boot failed"; exit 3; }
     if ! mount_collected_shares; then
         echo "helper: a configured share could not be mounted securely; stopping the box" >&2
@@ -4364,6 +5118,11 @@ boot_full() {
     fi
     if [ "$gui" = 1 ] && ! mount_collected_gui; then
         echo "helper: GUI sockets could not be mounted securely; stopping the box" >&2
+        power_off || true
+        return 3
+    fi
+    if [ "$audio" = 1 ] && ! mount_collected_audio; then
+        echo "helper: the PipeWire socket could not be mounted securely; stopping the box" >&2
         power_off || true
         return 3
     fi
@@ -4377,6 +5136,15 @@ boot_full() {
         power_off || true
         return 3
     fi
+    if [ "$gamepad" = 1 ]; then
+        # The guard must run before the box can use a node: a pad unplugged now
+        # would free its number for the next keyboard or security key.
+        if ! devguard_start "${allow_list[@]}" || ! gamepad_grant; then
+            echo "helper: could not set up guarded gamepad access; stopping the box" >&2
+            power_off || true
+            return 3
+        fi
+    fi
     BOOT_COLD=1
 }
 
@@ -4387,7 +5155,7 @@ boot_full() {
 # Deliberately not called by boot_min, so an unattended wake-claude boot neither
 # consumes a pending restore nor clears the marker.
 resume_after_boot() {
-    local mark="$RESUME_MARK_DIR/live-$wb_uid" mode=discard
+    local mark="$RESUME_MARK" mode=discard
     [ -e "$mark" ] && mode=restore
     install -d -m 0755 -o root -g root "$RESUME_MARK_DIR" && : > "$mark" \
         || echo "helper: could not mark the box as running; an unexpected shutdown will not restore its sessions" >&2
@@ -4790,7 +5558,7 @@ _write_host_wake() {
     printf '%s\n' \
         "[Unit]" "Description=Waterbox quota wake ($label)" "" \
         "[Service]" "Type=oneshot" \
-        "ExecStart=$0 wake $prof --user $wb_uid" \
+        "ExecStart=$0 --env $wb_env wake $prof --user $wb_uid" \
         > "$HW_ETC/$base.service"
     printf '%s\n' \
         "[Unit]" "Description=Waterbox quota wake ($label)" \
@@ -4835,7 +5603,7 @@ case "$verb" in
     down)
         power_off
         # Only a verified stop is a clean shutdown; the next boot starts fresh.
-        rm -f "$RESUME_MARK_DIR/live-$wb_uid"
+        rm -f "$RESUME_MARK"
         ;;
     state) running && echo running || echo stopped ;;
     security-state)
@@ -4850,25 +5618,27 @@ case "$verb" in
         ;;
     net-down) net_down ;;
     boot)
-        gui=0; nogpu=0; unsafe=0; usb=0
+        gui=0; nogpu=0; unsafe=0; usb=0; audio=0; gamepad=0
         for a in "$@"; do
             case "$a" in
                 --gui) gui=1 ;;
                 --no-gpu) nogpu=1 ;;
                 --usb) usb=1 ;;
+                --audio) audio=1 ;;
+                --gamepad) gamepad=1 ;;
                 --unsafe-host-root) unsafe=1 ;;
                 *) echo "helper: unknown boot option '$a'" >&2; exit 2 ;;
             esac
         done
-        boot_full "$gui" "$nogpu" "$unsafe" "$usb"
+        boot_full "$gui" "$nogpu" "$unsafe" "$usb" "$audio" "$gamepad"
         if [ "$BOOT_COLD" = 1 ]; then resume_after_boot; fi
         ;;
     autostart)
         # Run by the opt-in host unit at host boot. Always the secure mode and never
-        # GUI/USB: an unattended boot must not enter --unsafe-host-root, and nobody is
-        # at a desktop yet. A box that only boots unsafely simply fails here.
+        # GUI/USB/audio/gamepads: an unattended boot must not enter --unsafe-host-root,
+        # and nobody is at a desktop yet. A box that only boots unsafely fails here.
         unattended_lock
-        boot_full 0 0 0 0
+        boot_full 0 0 0 0 0 0
         if [ "$BOOT_COLD" = 1 ]; then resume_after_boot; fi
         ;;
     autostart-enable)
@@ -4878,31 +5648,31 @@ case "$verb" in
         # boot stalled behind network-online plus the box's whole boot and restore.
         # The shutdown ordering the defaults gave is restated; a host shutdown stops
         # a wait for the home (see the top of this helper) within seconds.
-        unit="$HW_ETC/waterbox-autostart.service"
+        unit="$HW_ETC/$AUTOSTART_UNIT"
         body=$(printf '%s\n' \
             "# Managed by Waterbox ('waterbox autostart on|off'); rewritten on start." \
-            "[Unit]" "Description=Waterbox: boot the box with the host and restore its sessions" \
+            "[Unit]" "Description=Waterbox: boot environment $wb_env with the host and restore its sessions" \
             "DefaultDependencies=no" \
             "Wants=network-online.target" "After=basic.target network-online.target" \
             "Conflicts=shutdown.target" "Before=shutdown.target" "" \
-            "[Service]" "Type=simple" "ExecStart=$0 autostart --user $wb_uid" "TimeoutStopSec=20s" "" \
+            "[Service]" "Type=simple" "ExecStart=$0 --env $wb_env autostart --user $wb_uid" "TimeoutStopSec=20s" "" \
             "[Install]" "WantedBy=multi-user.target")
         if [ "$(cat "$unit" 2>/dev/null)" = "$body" ] \
-                && systemctl is-enabled --quiet waterbox-autostart.service 2>/dev/null; then
+                && systemctl is-enabled --quiet "$AUTOSTART_UNIT" 2>/dev/null; then
             exit 0
         fi
         printf '%s\n' "$body" > "$unit"
         systemctl daemon-reload
-        if ! systemctl enable waterbox-autostart.service >/dev/null 2>&1; then
+        if ! systemctl enable "$AUTOSTART_UNIT" >/dev/null 2>&1; then
             rm -f "$unit"
             systemctl daemon-reload >/dev/null 2>&1 || true
-            echo "helper: could not enable waterbox-autostart.service" >&2
+            echo "helper: could not enable $AUTOSTART_UNIT" >&2
             exit 1
         fi
         ;;
     autostart-disable)
-        systemctl disable waterbox-autostart.service >/dev/null 2>&1 || true
-        rm -f "$HW_ETC/waterbox-autostart.service"
+        systemctl disable "$AUTOSTART_UNIT" >/dev/null 2>&1 || true
+        rm -f "$HW_ETC/$AUTOSTART_UNIT"
         systemctl daemon-reload
         ;;
     status)
@@ -5184,6 +5954,39 @@ case "$verb" in
             done
         ' sh "$target" 2>/dev/null || true
         ;;
+    devguard)
+        # Runs as the box's companion unit (devguard_start), never through sudo.
+        # Unplugging a pad frees its minor number, and the kernel hands it to the
+        # next input or hidraw device — possibly a keyboard or a security key. The
+        # box's bind and DeviceAllow name that number, so drop the node from the
+        # box's device cgroup as soon as it goes away, before anything new gets it.
+        [ -z "${SUDO_UID:-}" ] || { echo "helper: devguard runs only as the box's guard unit" >&2; exit 2; }
+        devguard_paths
+        [ -f "$DEVGUARD_ALLOW" ] && [ -f "$DEVGUARD_PADS" ] || exit 0
+        action=""
+        udevadm monitor --udev --property --subsystem-match=input --subsystem-match=hidraw \
+        | while IFS= read -r line; do
+            case "$line" in
+                "UDEV - "*)
+                    # udevadm prints this once it listens. Only now re-check every
+                    # node (gone, or a different device behind the same name), so a
+                    # removal before the monitor started — or while a crashed guard
+                    # was restarting — is never missed.
+                    devguard_recheck || exit 1 ;;
+                ACTION=*) action="${line#ACTION=}" ;;
+                DEVNAME=*)
+                    node="${line#DEVNAME=}"
+                    if [ "$action" = remove ] \
+                       && awk -v n="$node" '$1 == n { f = 1 } END { exit !f }' "$DEVGUARD_PADS"; then
+                        devguard_drop "$node" || exit 1
+                    elif [ "$action" = add ]; then
+                        # Covers a missed remove: any new device re-checks them all.
+                        devguard_recheck || exit 1
+                    fi ;;
+            esac
+        done
+        exit 1      # the monitor ended: Restart=always brings the guard back
+        ;;
     *) echo "helper: unknown verb '$verb'"; exit 2 ;;
 esac
 HELPER
@@ -5210,17 +6013,28 @@ _helper_current() {
     [ -x "$HELPER_PATH" ] && grep -q "^WB_HELPER_VERSION=\"$(_config_marker)\"\$" "$HELPER_PATH" 2>/dev/null
 }
 ensure_helper() { _helper_current || install_helper; }
-run_priv() { sudo "$HELPER_PATH" "$@"; }
+# Every helper call names the active environment; the helper takes it only as its
+# first two arguments.
+run_priv()       { sudo "$HELPER_PATH" --env "$WB_ENV" "$@"; }
+run_priv_quiet() { sudo -n "$HELPER_PATH" --env "$WB_ENV" "$@"; }   # never prompts
 
 # Idempotently ensure the host-side privileges start/reset rely on: the immutable
 # helper (+ its narrow sudoers) and shell completion. No broad sudo cache anymore.
 ensure_host_privs() {
+    _env_registry_init || true
     ensure_helper
     enable_completion
-    # Rewrites an enabled autostart unit from an older release (no-op when current).
-    if systemctl is-enabled --quiet "$AUTOSTART_UNIT" 2>/dev/null; then
-        run_priv autostart-enable || log_warn "Could not update the autostart unit; run 'waterbox autostart on' again."
-    fi
+    # Rewrites every enabled autostart unit from an older release (no-op when
+    # current). The active environment is restored afterwards.
+    local keep="$WB_ENV" rows=() row
+    mapfile -t rows < <(_env_rows)
+    for row in "${rows[@]}"; do
+        _use_env "${row%% *}"
+        if systemctl is-enabled --quiet "$AUTOSTART_UNIT" 2>/dev/null; then
+            run_priv autostart-enable || log_warn "Could not update the autostart unit of '${row#* }'; run 'waterbox autostart on --env ${row#* }' again."
+        fi
+    done
+    _use_env "$keep"
 }
 
 # --- Shares (req 7 safety: refuse paths a sandboxed root could use to escape) --
@@ -5246,7 +6060,7 @@ _host_share_allowed() {
 _remove_share_record() {
     local file="$1" value="$2" tmp
     [ -f "$file" ] || return 0
-    tmp=$(mktemp "$CONFIG_DIR/.share-list.XXXXXX") || return 1
+    tmp=$(mktemp "$(dirname -- "$file")/.share-list.XXXXXX") || return 1
     grep -vFx -- "$value" "$file" > "$tmp" || true
     if ! mv -f -- "$tmp" "$file"; then
         rm -f -- "$tmp"
@@ -5312,7 +6126,7 @@ manage_share() {
                     # A filesystem may not support ID-mapped mounts. Do not leave a
                     # broken persistent entry that would make the next boot fail too.
                     _remove_share_record "$SHARE_LIST" "$absolute_path" \
-                        || log_error "The live mount failed and its saved entry could not be removed. Fix permissions/free space in $CONFIG_DIR, then detach '$absolute_path'."
+                        || log_error "The live mount failed and its saved entry could not be removed. Fix permissions/free space in $ENV_DIR, then detach '$absolute_path'."
                     log_error "Could not mount '$absolute_path' securely. The share was not added (the source filesystem may not support ID-mapped mounts)."
                 fi
                 log_success "Added '$absolute_path' and mounted it live at $mount_target."
@@ -6529,10 +7343,11 @@ _timer_next() {
 # next-elapse epoch + "time left" come from _timer_next (cached, second-granular).
 HW_IDS=(); HW_ROWS=()
 _hostwake_collect() {
-    local now f n info expr
+    local now f n info expr env_tag="" multi=0
     local -a t_ids=() t_rows=() t_keys=()
     now=$(date +%s)
     HW_IDS=(); HW_ROWS=()
+    [ "$(_env_rows | wc -l)" -gt 1 ] && multi=1
     for f in "$HOSTWAKE_GLOB"*.timer; do
         [ -e "$f" ] || continue
         n=$(basename "$f" .timer); n="${n##*-}"
@@ -6545,7 +7360,10 @@ _hostwake_collect() {
             continue
         fi
         t_ids+=("wake-$n")
-        t_rows+=("${info}${_TIMER_LEFT:+   [$_TIMER_LEFT]}")
+        # Several environments: say which one each wake boots.
+        env_tag=""
+        [ "$multi" = 1 ] && env_tag="$(_env_name_of "$(_hostwake_env "$n")" 2>/dev/null || echo "env $(_hostwake_env "$n")"): "
+        t_rows+=("${env_tag}${info}${_TIMER_LEFT:+   [$_TIMER_LEFT]}")
         # key = <profile>\t<epoch>\t<index-into-t_ids>; profile is the 1st token of
         # "<profile> @ <time> <mode>". Missing epoch sorts last within the profile.
         # Index is plain %d (no zero-pad — a padded "0008" would be read as octal).
@@ -6567,6 +7385,7 @@ manage_wake_claude() {
             [ -n "$profile" ] && [ -n "$time" ] \
                 || log_error "Usage: waterbox wake-claude <profile> <HH:MM> [once|daily]"
             _valid_profile_name "$profile" || log_error "Invalid profile name: '$profile'."
+            _resolve_env          # the account lives in one environment's home
             [[ "$time" =~ ^([01]?[0-9]|2[0-3]):[0-5][0-9]$ ]] \
                 || log_error "Time must be HH:MM (24-hour), got '$time'."
             time=$(printf '%02d:%s' "$((10#${time%%:*}))" "${time#*:}")   # 9:30 -> 09:30
@@ -6577,7 +7396,7 @@ manage_wake_claude() {
             ensure_helper
             local n; n=$(_hostwake_next_id)
             run_priv install-host-wake "$n" "$profile" "$time" "$mode"
-            log_success "wake-claude 'wake-$n' set: $mode at $time for '$profile' — fires unattended even while the box is powered off."
+            log_success "wake-claude 'wake-$n' set: $mode at $time for '$profile' in '$(_env_label)' — fires unattended even while the box is powered off."
             ;;
         del|rm)
             local id="$1" n
@@ -6712,6 +7531,7 @@ wake_load() {
 }
 wake_add() {
     local profile="${1:-}" profiles=() p AW_TIME AW_MODE
+    _resolve_env          # the wake boots this environment and primes one of its accounts
     if [ -n "$profile" ]; then
         # Pre-seeded from the CLI (`waterbox wake-claude <profile>`): skip the picker
         # and jump straight to asking time + when.
@@ -6830,12 +7650,22 @@ _waterbox_time() {
     local now1; now1=$(date -d '+1 minute' +%H:%M 2>/dev/null)
     compadd -X "time · 24-hour HH:MM (e.g. 07:00) · Tab = now+1min" -- "${now1:-07:00}"
 }
+_waterbox_envs() {
+    local id name extra
+    [[ -r "$HOME/.waterbox/envs.list" ]] || return 0
+    while read -r id name extra; do [[ -n "$name" ]] && print -r -- "$name"; done < "$HOME/.waterbox/envs.list"
+}
 _waterbox() {
     local root="$HOME/.waterbox/root"
     local -a cmds items
-    cmds=(start stop restart status reset autostart update share
+    cmds=(start stop restart status reset autostart update share env
           wake-claude schedule-command version help)
 
+    # --env <name> anywhere: complete environment names.
+    if [[ "${words[CURRENT-1]}" == --env ]]; then
+        items=(${(f)"$(_waterbox_envs)"}); compadd -a items
+        return
+    fi
     if (( CURRENT == 2 )); then
         _describe -t commands 'waterbox command' cmds
         return
@@ -6845,11 +7675,16 @@ _waterbox() {
         start)
             # `waterbox start <session>` boots (if needed) and attaches that session
             # directly — complete existing live session names, plus the flags.
-            items=(--here --gui --no-gui --x11 --no-gpu --usb ${(f)"$(command waterbox _sessions 2>/dev/null)"})
+            items=(--env --here --gui --no-gui --x11 --no-gpu --usb --audio --gamepad ${(f)"$(command waterbox _sessions 2>/dev/null)"})
             compadd -a items ;;
         restart)
-            items=(--gui --no-gui --x11 --no-gpu --usb)
+            items=(--env --gui --no-gui --x11 --no-gpu --usb --audio --gamepad)
             compadd -a items ;;
+        env)
+            if (( CURRENT == 3 )); then items=(list create rename delete); compadd -a items
+            elif [[ "${words[3]}" == (rename|delete) ]] && (( CURRENT == 4 )); then
+                items=(${(f)"$(_waterbox_envs)"}); compadd -a items
+            fi ;;
         autostart)
             (( CURRENT == 3 )) && { items=(on off status); compadd -a items; } ;;
         share)
@@ -6858,9 +7693,12 @@ _waterbox() {
         wake-claude)
             if (( CURRENT == 3 )); then
                 # Multi-agent layout, or the pre-1.9 flat one on an unmigrated box.
-                local croot="$root/home/water/.agent-env/claude"
-                [[ -d $croot ]] || croot="$root/home/water/.claude-env"
-                items=(list del ${croot}/*(N/:t)); compadd -a items
+                local r
+                items=(list del)
+                for r in "$root" "$HOME"/.waterbox/envs/*/root(N/); do
+                    items+=("$r"/home/water/.agent-env/claude/*(N/:t) "$r"/home/water/.claude-env/*(N/:t))
+                done
+                compadd -a items
             elif [[ "${words[3]}" == (del|rm) ]]; then
                 items=(/etc/systemd/system/waterbox-hostwake-*.timer(N:t:r))
                 items=(wake-${items#waterbox-hostwake-}); compadd -a items
@@ -6874,7 +7712,8 @@ _waterbox() {
                 items=(list del ${(f)"$(command waterbox _sessions 2>/dev/null)"})
                 compadd -a items
             elif [[ "${words[3]}" == (del|rm) ]]; then
-                items=("$root"/etc/systemd/system/waterbox-schd-com-*.timer(N:t:r))
+                items=("$root"/etc/systemd/system/waterbox-schd-com-*.timer(N:t:r)
+                       "$HOME"/.waterbox/envs/*/root/etc/systemd/system/waterbox-schd-com-*.timer(N:t:r))
                 items=(${items#waterbox-}); compadd -a items
             elif (( CURRENT == 4 )); then
                 _waterbox_time                          # <session> <HH:MM>
@@ -6903,6 +7742,8 @@ CLI_FLAGS_SEEN=()
 CLI_BOOT_FLAG_USED=0
 CLI_HERE_FLAG_USED=0
 CLI_UNSAFE_FLAG_USED=0
+CLI_ENV_NAME=""
+CLI_ENV_SEEN=0
 _parse_flags=1
 while [ $# -gt 0 ]; do
     if [ "$_parse_flags" = 0 ]; then
@@ -6916,7 +7757,16 @@ while [ $# -gt 0 ]; do
         --x11)    WATERBOX_GUI=1; WATERBOX_X11=1; CLI_BOOT_FLAG_USED=1; CLI_FLAGS_SEEN+=("$1"); shift ;;
         --no-gpu) WATERBOX_NO_GPU=1; CLI_BOOT_FLAG_USED=1; CLI_FLAGS_SEEN+=("$1"); shift ;;
         --usb)    WATERBOX_USB=1; CLI_BOOT_FLAG_USED=1; CLI_FLAGS_SEEN+=("$1"); shift ;;
+        --audio)  WATERBOX_AUDIO=1; CLI_BOOT_FLAG_USED=1; CLI_FLAGS_SEEN+=("$1"); shift ;;
+        --gamepad) WATERBOX_GAMEPAD=1; CLI_BOOT_FLAG_USED=1; CLI_FLAGS_SEEN+=("$1"); shift ;;
         --here)   WATERBOX_HERE=1; CLI_HERE_FLAG_USED=1; CLI_FLAGS_SEEN+=("$1"); shift ;;
+        --env)
+            [ $# -ge 2 ] && [ -n "$2" ] || log_error "--env needs an environment name. See 'waterbox env list'."
+            CLI_ENV_NAME="$2"; CLI_ENV_SEEN=1; shift 2 ;;
+        --env=*)
+            CLI_ENV_NAME="${1#--env=}"; CLI_ENV_SEEN=1
+            [ -n "$CLI_ENV_NAME" ] || log_error "--env needs an environment name. See 'waterbox env list'."
+            shift ;;
         --unsafe-host-root)
             WATERBOX_UNSAFE_HOST_ROOT=1
             CLI_UNSAFE_FLAG_USED=1
@@ -6939,6 +7789,7 @@ case "${2:-}" in
             wake-claude)      help_wake ;;
             schedule-command) help_schedule ;;
             autostart)        help_autostart ;;
+            env)              help_env ;;
             *)                show_help ;;   # stop/restart/status/reset/update/…
         esac
         exit 0 ;;
@@ -6952,21 +7803,29 @@ esac
 # `waterbox reset typo` still reset, and `start --here named` silently discarded
 # the requested name.
 _cmd="${1:-start}"
+# --env selects the box a per-box command acts on; elsewhere it would be ignored.
+case "$_cmd" in
+    update|version|--version|-v|help|--help|-h|completion|env|setup)
+        [ "$CLI_ENV_SEEN" = 0 ] || log_error "--env is not valid with '$_cmd'." ;;
+esac
+if [ "$CLI_ENV_SEEN" = 1 ] && ! _valid_env_name "$CLI_ENV_NAME"; then
+    log_error "Invalid environment name '$CLI_ENV_NAME'. See 'waterbox env list'."
+fi
 case "$_cmd" in
     start|"")
         [ "$#" -le 2 ] \
-            || log_error "Usage: waterbox start [<session> | --here] [--gui|--no-gui|--x11] [--no-gpu] [--usb]"
+            || log_error "Usage: waterbox start [<session> | --here] [--env <name>] [--gui|--no-gui|--x11] [--no-gpu] [--usb] [--audio] [--gamepad]"
         [ "$CLI_HERE_FLAG_USED" != 1 ] || [ "$#" -lt 2 ] \
             || log_error "--here and an explicit session name are mutually exclusive."
         ;;
     restart)
-        [ "$#" -eq 1 ] || log_error "Usage: waterbox restart [--gui|--no-gui|--x11] [--no-gpu] [--usb]"
+        [ "$#" -eq 1 ] || log_error "Usage: waterbox restart [--env <name>] [--gui|--no-gui|--x11] [--no-gpu] [--usb] [--audio] [--gamepad]"
         [ "$CLI_HERE_FLAG_USED" != 1 ] || log_error "--here is valid with start, not restart."
         ;;
     reset)
         [ "$#" -eq 1 ] || log_error "Usage: waterbox reset"
         [ "$CLI_BOOT_FLAG_USED" != 1 ] && [ "$CLI_HERE_FLAG_USED" != 1 ] \
-            || log_error "Display, GPU, USB, and --here options are not valid with reset."
+            || log_error "Display, GPU, USB, audio, gamepad and --here options are not valid with reset."
         ;;
     stop|status|setup|refresh-config|update|version|--version|-v|help|--help|-h|_sessions)
         [ "$#" -eq 1 ] || log_error "Unexpected argument '${2:-}' after '$_cmd'. See 'waterbox --help'."
@@ -7041,13 +7900,25 @@ case "$_cmd" in
             log_error "Usage: waterbox schedule-command <session> <HH:MM> \"<command>\" [once|daily]"
         fi
         ;;
+    env)
+        [ "${#CLI_FLAGS_SEEN[@]}" -eq 0 ] \
+            || log_error "Option '${CLI_FLAGS_SEEN[0]}' is not valid with env."
+        case "$#:${2:-}" in
+            1:|2:list) ;;
+            3:create|3:delete) ;;
+            4:rename) ;;
+            *) log_error "Usage: waterbox env [list | create <name> | rename <old> <new> | delete <name>]" ;;
+        esac
+        ;;
     *) ;; # The final dispatcher prints the unknown-command error.
 esac
 
 # Help/version/completion and invalid commands must not create ~/.waterbox merely
 # by being inspected. Initialize only commands that actually need host-side state.
+# Per-environment state is created once the environment is chosen (_env_up, or the
+# dispatcher below for share/reset/restart/refresh-config).
 case "$_cmd" in
-    start|""|restart|reset|setup|refresh-config|update|share) _ensure_user_config ;;
+    start|""|restart|reset|setup|refresh-config|update|share|env) mkdir -p "$CONFIG_DIR" ;;
 esac
 
 # Resolve GUI=auto now that flags are parsed: on only when a Wayland socket is live.
@@ -7065,13 +7936,30 @@ if [ "$WATERBOX_GUI" = auto ]; then
     fi
 fi
 
+# Every per-box command first picks its environment (see _resolve_env). Helper
+# calls name the environment, which a helper from an older release cannot parse,
+# so then bring the helper up to date (a one-time sudo prompt after an update).
+case "${1:-start}" in
+    stop|restart|reset|share|autostart|schedule-command|refresh-config|_helper)
+        _resolve_env
+        _helper_current || ensure_helper ;;
+    status)
+        # Read-only: refresh an outdated helper only when someone can answer sudo.
+        [ -t 0 ] && ! _helper_current && ensure_helper ;;
+esac
+case "${1:-start}" in
+    restart|reset|share|refresh-config) _ensure_user_config ;;
+esac
+
 case "${1:-start}" in
     start|"") start_sandbox "$2" ;;
     stop)     stop_sandbox ;;
     restart)  restart_sandbox ;;
-    status)   status_sandbox ;;
+    status)
+        if [ "$CLI_ENV_SEEN" = 1 ]; then _resolve_env; status_sandbox; else status_all; fi ;;
     reset)    reset_sandbox ;;
     autostart) manage_autostart "$2" ;;
+    env)      env_cmd "${@:2}" ;;
     setup)    ensure_host_privs ;;         # normally automatic on start/reset
     refresh-config) refresh_config ;;      # internal; not shown in help
     completion)     emit_completion "$2" ;; # internal; installed automatically
