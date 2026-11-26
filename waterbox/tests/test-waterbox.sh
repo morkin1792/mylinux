@@ -167,7 +167,7 @@ run_parser() {
         help_share() { echo CALL:help-share; }
         help_wake() { echo CALL:help-wake; }
         help_schedule() { echo CALL:help-schedule; }
-        start_sandbox() { printf "CALL:start:<%s>:gui=%s:here=%s\n" "${1:-}" "$WATERBOX_GUI" "$WATERBOX_HERE"; }
+        start_sandbox() { printf "CALL:start:<%s>:gui=%s:here=%s:audio=%s:gamepad=%s:x11=%s:usb=%s\n" "${1:-}" "$WATERBOX_GUI" "$WATERBOX_HERE" "${WATERBOX_AUDIO:-0}" "${WATERBOX_GAMEPAD:-0}" "$WATERBOX_X11" "${WATERBOX_USB:-0}"; }
         stop_sandbox() { echo CALL:stop; }
         restart_sandbox() { echo CALL:restart; }
         status_sandbox() { echo CALL:status; }
@@ -249,6 +249,9 @@ assert_has "$(run_parser status --env gaming)" "RESOLVE:gaming" "status --env sh
 assert_has "$(run_parser start --env gaming alpha)" "CALL:start:<alpha>" "start keeps the session with --env"
 assert_has "$(run_parser schedule-command --env g sess 12:00 pwd)" "RESOLVE:g" "schedule-command takes --env"
 parser_fails env create
+assert_has "$(run_parser env create play --game)" "CALL:env <create> <play>" "env create --game"
+parser_fails env rename a b --game
+parser_fails env create play --audio
 parser_fails env rename a
 parser_fails env delete a b
 parser_fails env bogus
@@ -428,6 +431,22 @@ kill "$socket_pid" 2>/dev/null || true
 wait "$socket_pid" 2>/dev/null || true
 ok "plain Wayland GUI forwarding does not expose X11"
 
+# --x11 is an explicit request: when it cannot be honoured, say why.
+(
+    # shellcheck disable=SC1090
+    source "$TMP/gui-function.bash"
+    GUI_ENV_FILE="$TMP/x11-env" GUI_BINDS_FILE="$TMP/x11-binds" ENV_DIR="$TMP/x11-cfg"
+    HOST_RUNTIME_DIR="$TMP/x11-runtime" XDG_RUNTIME_DIR="$TMP/x11-runtime"
+    WATERBOX_GUI=1 WATERBOX_X11=1 WAYLAND_DISPLAY= RUN_USER=test HOME="$TMP/x11-home"
+    mkdir -p "$ENV_DIR" "$HOME"
+    log_warn() { printf 'WARN:%s\n' "$1"; }
+    DISPLAY=
+    [[ "$(build_gui_bind_args)" == *"WARN:--x11: DISPLAY is not set"* ]]
+    DISPLAY=:97
+    [[ "$(build_gui_bind_args)" == *"WARN:--x11: /tmp/.X11-unix/X97 does not exist"* ]]
+) || fail "--x11 without a usable X display must explain itself"
+ok "--x11 explains a missing DISPLAY or X socket"
+
 # An explicit GUI request with no usable display must fail before boot instead of
 # reporting success and leaving applications with dead display variables.
 (
@@ -477,6 +496,12 @@ assert_has "$(grep -A35 '^collect_gui_mounts()' "$TMP/helper.bash")" \
     '"/run/user/$wb_uid/$src_base"' "canonical Wayland runtime restriction"
 assert_has "$(grep -A35 '^collect_gui_mounts()' "$TMP/helper.bash")" \
     '[ ! -L "$src" ]' "GUI source symlink rejection"
+# A user-owned X socket (per-session Xwayland, mode 0755) must be owner-mapped or
+# the box cannot connect; a root-owned one must never be mapped (uid 1000 -> root).
+x_case=$(awk '/^collect_gui_mounts\(\)/,/^}/' "$TMP/helper.bash" | grep -A3 '/tmp/.X11-unix/\*)$')
+assert_has "$x_case" 'if [ "$(stat -c %u "$src" 2>/dev/null)" = "$wb_uid" ]; then map_uid="$wb_uid"' \
+    "user-owned X socket is owner-mapped"
+assert_has "$x_case" 'else map_uid="-"; fi' "other X sockets stay unmapped"
 ok "privileged GUI forwarding derives trusted exports and rejects arbitrary sockets/files"
 
 # DNS generation keeps glibc's three-server ceiling useful: at most one host
@@ -967,6 +992,11 @@ ok "bootstrap retry and post-package host-root writes fail closed"
     _use_env 0
     [[ "$JAIL_ROOT" == "$HOME/.waterbox/root" && "$SHARE_LIST" == "$HOME/.waterbox/shared_paths" ]]
     [[ "$AUTOSTART_UNIT" == waterbox-autostart.service ]]
+    # First run (no box yet): the registry starts empty, so the first environment
+    # can be created interactively. An upgrade from a single box adopts it as main.
+    HOME="$TMP/envfresh" CONFIG_DIR="$TMP/envfresh/.waterbox" ENV_REGISTRY="$TMP/envfresh/.waterbox/envs.list" \
+        bash -c 'source "$1"; _env_registry_init; [[ -f "$ENV_REGISTRY" && -z "$(_env_rows)" ]]' _ "$TMP/env.bash"
+    mkdir -p "$HOME/.waterbox/root"
     _env_registry_init; [[ "$(_env_rows)" == "0 main" ]]
     id=$(_env_create gaming); [[ "$id" == 1 ]]
     ! _env_create gaming >/dev/null 2>&1
@@ -980,6 +1010,10 @@ ok "bootstrap retry and post-package host-root writes fail closed"
     ! _env_rename agents gaming >/dev/null 2>&1
     printf 'junk\n99 x\n2 ok extra\n' >> "$ENV_REGISTRY"
     [[ "$(_env_rows | wc -l)" == 3 && "$(_env_names)" == "agents gaming third" ]]
+    # Gaming kind: kept through rename/delete rewrites, invisible to _env_rows.
+    play=$(_env_create play game); _env_is_game "$play"; ! _env_is_game 0
+    _env_rename play arcade; _env_is_game "$(_env_id_of arcade)"
+    [[ "$(_env_rows | awk -v i="$play" '$1 == i')" == "$play arcade" ]]
     out=$(_env_create 'b d' 2>/dev/null) || true; [[ -z "$out" ]]   # warnings never land in the id
 ) || fail "environment identity/registry"
 ok "environment identity, registry migration, create and rename"
@@ -1042,30 +1076,61 @@ assert_has "$del_body" 'realpath -e -- "$JAIL_ROOT"' "delete refuses a redirecte
    "$(grep -n 'sudo rm -rf -- "$JAIL_ROOT"' <<< "$del_body" | cut -d: -f1)" ]] \
     || fail "delete must drop the environment's wakes before its rootfs"
 assert_has "$(awk '/^reset_sandbox\(\)/,/^}/' "$WB")" '_remove_env_hostwakes' "reset removes only its environment's wakes"
+# The first environment: a question on a terminal, a plain one otherwise.
+ensure_body=$(awk '/^_env_ensure_one\(\)/,/^}/' "$WB")
+assert_has "$ensure_body" 'if [ -t 0 ] && [ -t 1 ] && _ask_gaming_env; then kind=game; fi' \
+    "an interactive first run asks whether the first environment is for games"
+(
+    log_info() { :; }; log_warn() { :; }; log_error() { echo "ERR:$1"; exit 64; }
+    source "$TMP/env.bash"; source "$TMP/env-select.bash"
+    HOME="$TMP/ensure-home"; CONFIG_DIR="$HOME/.waterbox"; ENV_REGISTRY="$CONFIG_DIR/envs.list"
+    _ask_gaming_env() { echo ASKED; return 0; }
+    out=$(_env_ensure_one </dev/null)
+    [[ "$out" != *ASKED* && "$(_env_rows_full)" == "0 main" ]]          # no terminal: no question
+) || fail "a non-interactive first run must create a plain environment without asking"
 ok "environment resolution, cross-environment picker and delete safeguards"
 
-# --audio: PipeWire only, fixed host path, the host Pulse socket never exposed;
-# the guest runs its own pipewire-pulse against it.
+# --audio: the box gets only a sandboxed, module-loading-free Pulse bridge on the
+# host. Never the host's PipeWire socket (clients there can make the daemon load
+# plugins with their own properties) and never the host's Pulse socket.
 assert_has "$(run_parser start --audio)" "CALL:start" "start accepts --audio"
 assert_has "$(run_parser restart --gamepad)" "CALL:restart" "restart accepts --gamepad"
+assert_has "$(run_parser start --game)" "gui=1:here=0:audio=1:gamepad=1:x11=0:usb=0" \
+    "--game is display + audio + gamepads, never --x11 or --usb"
 parser_fails status --audio
 parser_fails reset --gamepad
 parser_fails share list --audio
-audio_fn=$(awk '/^collect_audio_mount\(\)/,/^}/' "$TMP/helper.bash")
-assert_has "$audio_fn" 'sock="/run/user/$wb_uid/pipewire-0"' "audio accepts only the host user's PipeWire socket"
-assert_has "$audio_fn" '[ ! -L "$sock" ]' "audio rejects a symlinked socket"
-assert_has "$audio_fn" '[ ! -L "$dir" ]' "audio rejects a symlinked runtime dir"
+parser_fails stop --game
+check_fn=$(awk '/^check_audio_host\(\)/,/^}/' "$TMP/helper.bash")
+assert_has "$check_fn" 'sock="/run/user/$wb_uid/pipewire-0"' "audio checks only the host user's PipeWire socket"
+assert_has "$check_fn" '[ ! -L "$sock" ]' "audio rejects a symlinked socket"
+assert_has "$check_fn" '[ ! -L "$dir" ]' "audio rejects a symlinked runtime dir"
 assert_eq 0 "$(grep -c 'pulse/native' "$WB" || true)" "the host Pulse socket is never mounted"
-assert_has "$(grep -F -A4 'allowed_gui = {' "$TMP/helper.bash")" '/tmp/.waterbox-pipewire' "mount shim allows only the fixed audio target"
-assert_has "$(cat "$TMP/zshrc")" '[ -f /etc/waterbox/boot-env ] && source /etc/waterbox/boot-env' "shell sources the boot env"
-units=$(awk '/^configure_audio_units\(\)/,/^}/' "$WB")
-assert_has "$units" 'Environment=PIPEWIRE_REMOTE=/tmp/.waterbox-pipewire' "in-box pipewire-pulse targets the host graph"
-for unit in pipewire.service pipewire.socket wireplumber.service; do
-    assert_has "$units" "$unit" "in-box $unit is masked"
+assert_eq 0 "$(grep -c 'waterbox-pipewire' "$WB" || true)" "the host PipeWire socket is never mounted"
+assert_has "$(grep -F -A4 'allowed_gui = {' "$TMP/helper.bash")" '/tmp/.waterbox-pulse' "mount shim allows only the fixed audio target"
+assert_has "$(awk '/^mount_audio_bridge\(\)/,/^}/' "$TMP/helper.bash")" \
+    'mount_into_box "$AUDIO_SOCK" /tmp/.waterbox-pulse' "only the bridge's socket enters the box"
+(
+    eval "$(awk '/^audio_paths\(\)/,/^}/; /^audio_bridge_conf\(\)/,/^}/' "$TMP/helper.bash")"
+    AUDIO_ROOT=/run/waterbox-pulse wb_uid=1000 wb_env=2
+    audio_paths; conf=$(audio_bridge_conf)
+    grep -qx '    pulse.allow-module-loading = false' <<< "$conf"
+    grep -qx '    server.address = \[ "unix:/run/waterbox-pulse/1000-2/native" \]' <<< "$conf"
+    grep -qx '    server.dbus-name = ""' <<< "$conf"
+    ! grep -q 'tcp:' <<< "$conf"
+) || fail "the audio bridge must refuse module loading and listen only on its own socket"
+bridge=$(awk '/^start_audio_bridge\(\)/,/^}/' "$TMP/helper.bash")
+for prop in 'NoExecPaths=/' 'ExecPaths="/usr -/lib -/lib64"' 'MemoryDenyWriteExecute=yes' \
+        'RestrictAddressFamilies=AF_UNIX' 'ProtectSystem=strict' 'ProtectHome=tmpfs' \
+        'ReadWritePaths="$AUDIO_DIR"' 'InaccessiblePaths="-/mnt -/media -/run/media"' \
+        'BindsTo="$MACHINE_NAME.service"' '--uid="$wb_uid"'; do
+    assert_has "$bridge" "$prop" "audio bridge sandbox: $prop"
 done
-# Functional: Arch's preset links and our masks have absolute targets that exist
-# on the host; refresh must replace them in place (repeatedly) without following
-# them, and still refuse a redirected directory.
+assert_has "$(awk '/^power_off\(\)/,/^}/' "$TMP/helper.bash")" 'stop_audio_bridge' "stop removes the audio bridge"
+assert_has "$(cat "$TMP/zshrc")" '[ -f /etc/waterbox/boot-env ] && source /etc/waterbox/boot-env' "shell sources the boot env"
+# Functional: refresh masks the box's own PipeWire/Pulse units (absolute-target
+# symlinks replaced in place, never followed), removes 1.23 development drop-ins,
+# points libpulse at the bridge, and still refuses a redirected directory.
 (
     log_error() { echo "ERR:$1"; exit 64; }
     eval "$(awk '/^_in_jail\(\)/,/^}/' "$WB")"
@@ -1074,20 +1139,60 @@ done
     eval "$(awk '/^configure_audio_units\(\)/,/^}/' "$WB")"
     sudo() { "$@"; }
     JAIL_ROOT="$TMP/audio-root"; u="$JAIL_ROOT/etc/systemd/user"
-    mkdir -p "$u/sockets.target.wants"
-    ln -s /usr/lib/systemd/user/pipewire-pulse.socket "$u/sockets.target.wants/pipewire-pulse.socket"
+    mkdir -p "$u/sockets.target.wants" "$u/pipewire-pulse.service.d"
+    ln -s /usr/lib/systemd/user/pipewire-pulse.socket "$u/pipewire-pulse.socket"
+    echo old > "$u/pipewire-pulse.service.d/waterbox.conf"
     configure_audio_units; configure_audio_units
-    [[ "$(readlink "$u/pipewire.service")" == /dev/null && "$(readlink "$u/wireplumber.service")" == /dev/null ]]
-    [[ "$(readlink "$u/sockets.target.wants/pipewire-pulse.socket")" == /usr/lib/systemd/user/pipewire-pulse.socket ]]
-    grep -qx 'Environment=PIPEWIRE_REMOTE=/tmp/.waterbox-pipewire' "$u/pipewire-pulse.service.d/waterbox.conf"
+    for unit in pipewire.service pipewire.socket wireplumber.service pipewire-pulse.service pipewire-pulse.socket; do
+        [[ "$(readlink "$u/$unit")" == /dev/null ]] || { echo "not masked: $unit"; exit 1; }
+    done
+    [[ ! -e "$u/pipewire-pulse.service.d" ]]
+    grep -qx 'default-server = unix:/tmp/.waterbox-pulse' "$JAIL_ROOT/etc/pulse/client.conf.d/50-waterbox.conf"
     rm -rf "$JAIL_ROOT/etc/systemd/user"; mkdir -p "$TMP/audio-outside"
     ln -s "$TMP/audio-outside" "$JAIL_ROOT/etc/systemd/user"
     [[ "$( (configure_audio_units) 2>&1)" == ERR:Refusing* ]]
     [[ -z "$(ls -A "$TMP/audio-outside")" ]]
-) || fail "in-box audio unit links must survive refresh and refuse a redirected directory"
+) || fail "in-box audio config must survive refresh and refuse a redirected directory"
 boot_env=$(awk '/^write_boot_env\(\)/,/^}/' "$TMP/helper.bash")
-assert_has "$boot_env" '_in_jail "$target"' "boot-env write is contained"
-ok "audio is PipeWire-only, fixed-path, and served by the box's own pipewire-pulse"
+assert_has "$boot_env" '_in_jail "$target" && _in_jail "$old_marker"' "boot-env writes are contained"
+(
+    eval "$boot_env"
+    _in_jail() { case "$(realpath -m "$1")" in "$JAIL_ROOT"/*) return 0 ;; *) return 1 ;; esac; }
+    JAIL_ROOT="$TMP/bootenv-root"; mkdir -p "$JAIL_ROOT/etc/waterbox"
+    : > "$JAIL_ROOT/etc/waterbox/audio-on"
+    write_boot_env 1 0
+    [[ ! -e "$JAIL_ROOT/etc/waterbox/audio-on" ]]
+    grep -qx 'export PULSE_SERVER="unix:/tmp/.waterbox-pulse"' "$JAIL_ROOT/etc/waterbox/boot-env"
+    write_boot_env 0 1
+    ! grep -q PULSE_SERVER "$JAIL_ROOT/etc/waterbox/boot-env"
+    grep -q SDL_JOYSTICK_DISABLE_UDEV "$JAIL_ROOT/etc/waterbox/boot-env"
+    write_boot_env 0 0
+    [[ ! -e "$JAIL_ROOT/etc/waterbox/boot-env" ]]
+) || fail "the boot env must follow exactly this boot's flags"
+ok "audio reaches the host only through a sandboxed Pulse bridge without module loading"
+
+# Wayland-only GUI boots give X11 programs an X server of the box's own.
+x_units=$(awk '/^configure_box_x11\(\)/,/^}/' "$WB")
+assert_has "$x_units" 'ExecStart=/usr/bin/xwayland-satellite :$BOX_X11_DISPLAY' "box X server unit"
+assert_has "$x_units" 'User=$USER_NAME' "box X server runs as the guest user"
+(
+    eval "$(awk '/^write_gui_env\(\)/,/^}/' "$TMP/helper.bash")"
+    _in_jail() { return 0; }
+    JAIL_ROOT="$TMP/boxx-root" BOX_X11_DISPLAY=42 BOX_X11=0
+    mkdir -p "$JAIL_ROOT/etc/waterbox" "$JAIL_ROOT/usr/bin"
+    GUI_TARGETS=(/tmp/.waterbox-wayland)
+    write_gui_env; ! grep -q DISPLAY= "$JAIL_ROOT/etc/waterbox/gui-env"     # no satellite installed
+    [[ "$BOX_X11" == 0 ]]
+    : > "$JAIL_ROOT/usr/bin/xwayland-satellite"
+    write_gui_env; grep -qx 'export DISPLAY=":42"' "$JAIL_ROOT/etc/waterbox/gui-env"
+    [[ "$BOX_X11" == 1 ]]
+    BOX_X11=0; GUI_TARGETS=(/tmp/.waterbox-wayland /tmp/.X11-unix/X1)
+    write_gui_env; grep -qx 'export DISPLAY=":1"' "$JAIL_ROOT/etc/waterbox/gui-env"
+    [[ "$BOX_X11" == 0 ]]                                                     # --x11 uses the host's X
+) || fail "only Wayland-only boots with xwayland-satellite installed get the box's own X server"
+assert_has "$(awk '/^boot_full\(\)/,/^}/' "$TMP/helper.bash")" 'systemctl -M "$MACHINE_NAME" start --no-block waterbox-xwayland.service' \
+    "the helper starts the box's X server inside the box after mounting the Wayland socket"
+ok "X11 programs on Wayland get an X server private to the box"
 
 # --gamepad: joysticks and their own hidraw only, exact-path DeviceAllow, and a
 # guard that revokes a node once it is unplugged (its number may go to a keyboard).
@@ -1164,6 +1269,204 @@ assert_has "$(awk '/^devguard_start\(\)/,/^}/' "$TMP/helper.bash")" 'changed dev
 assert_has "$(awk '/^devguard_start\(\)/,/^}/' "$TMP/helper.bash")" 'StartLimitIntervalSec=0' \
     "the guard is never rate-limited into staying down"
 ok "gamepads: joysticks only, exact-path access, guarded against minor-number reuse"
+
+# Tab completion covers every command, subcommand and option, including options
+# placed before the command, --env values, and the gaming/device flags.
+if command -v zsh >/dev/null 2>&1; then
+    mkdir -p "$TMP/comp-bin" "$TMP/comp-home/.waterbox"
+    printf '%s\n' '#!/bin/sh' 'case "$*" in "_sessions --env gaming") echo game-sess ;; _sessions) echo agent-sess; echo game-sess ;; esac' \
+        > "$TMP/comp-bin/waterbox"
+    chmod +x "$TMP/comp-bin/waterbox"
+    printf '0 main\n3 gaming\n' > "$TMP/comp-home/.waterbox/envs.list"
+    cat > "$TMP/comp-test.zsh" <<'ZT'
+compdef() { :; }; zstyle() { :; }
+source "$1"
+typeset -ga OUT
+compadd() {
+    local arr=0
+    while (( $# )); do
+        case "$1" in
+            -a) arr=1; shift ;;
+            --) shift; OUT+=("$@"); return ;;
+            -*) shift; [[ "$1" != -* ]] && (( ! arr )) && shift ;;
+            *) if (( arr )); then OUT+=("${(@P)1}"); else OUT+=("$1"); fi; shift ;;
+        esac
+    done
+}
+_describe() { OUT+=("${(@P)4}"); }
+_files() { OUT+=("<files>"); }
+_message() { OUT+=("<message>"); }
+_waterbox_time() { OUT+=("<time>"); }
+check() {   # check "<expected word>" [absent=1] -- words…   (last word is the one being completed)
+    local want="$1" absent="$2"; shift 3
+    words=("$@"); CURRENT=$#; PREFIX="${words[CURRENT]}"; OUT=()
+    _waterbox
+    if (( absent )); then (( ${OUT[(Ie)$want]} == 0 )) || { print -r -- "unexpected '$want' for: $*"; exit 1; }
+    else (( ${OUT[(Ie)$want]} )) || { print -r -- "missing '$want' for: $* -> ${OUT[*]}"; exit 1; }; fi
+}
+check env 0 -- waterbox ''
+check --env 0 -- waterbox -
+check --game 0 -- waterbox start -
+check --audio 0 -- waterbox start -
+check --gamepad 0 -- waterbox restart -
+check --game 0 -- waterbox --env gaming restart -
+check --env 0 -- waterbox stop -
+check --env 0 -- waterbox status -
+check --env 0 -- waterbox reset -
+check --env 0 -- waterbox share -
+check --env 0 -- waterbox schedule-command -
+check --env 0 -- waterbox wake-claude -
+check --game 1 -- waterbox stop -
+check --game 1 -- waterbox env -
+check gaming 0 -- waterbox --env ''
+check gaming 0 -- waterbox stop --env ''
+check gaming 0 -- waterbox env rename ''
+check gaming 0 -- waterbox env delete ''
+check create 0 -- waterbox env ''
+check start 0 -- waterbox --env gaming ''
+check game-sess 0 -- waterbox --env gaming start ''
+check agent-sess 1 -- waterbox --env gaming start ''
+check agent-sess 0 -- waterbox start ''
+check add 0 -- waterbox --env gaming share ''
+check '<files>' 0 -- waterbox share --env gaming add ''
+check on 0 -- waterbox autostart --env gaming ''
+check '<time>' 0 -- waterbox --env gaming schedule-command game-sess ''
+check once 0 -- waterbox schedule-command --env gaming game-sess 12:00 cmd ''
+check --game 0 -- waterbox env create play -
+check --game 1 -- waterbox env rename -
+ZT
+    HOME="$TMP/comp-home" PATH="$TMP/comp-bin:$PATH" zsh -f "$TMP/comp-test.zsh" "$TMP/completion.zsh" \
+        || fail "zsh completion misses a command, subcommand or option"
+    ok "zsh completion covers commands, options anywhere, --env values and gaming flags"
+else
+    skip_test "zsh completion behaviour (zsh unavailable)"
+fi
+
+# The host-kernel placeholder: provides only NTSYNC-MODULE, ships nothing, never
+# conflicts with or replaces a real kernel, and a failure cannot break bootstrap.
+(
+    eval "$(awk '/^HOST_KERNEL_PKGBUILD=\(/,/^\)/' "$WB")"
+    printf '%s\n' "${HOST_KERNEL_PKGBUILD[@]}" > "$TMP/PKGBUILD"
+    bash -n "$TMP/PKGBUILD"
+    source "$TMP/PKGBUILD"
+    [[ "$pkgname" == waterbox-uses-host-kernel && "${arch[*]}" == any ]]
+    [[ "${provides[*]}" == NTSYNC-MODULE ]]
+    [[ -z "${depends[*]:-}${conflicts[*]:-}${replaces[*]:-}${install:-}${source[*]:-}" ]]
+    [[ "$(declare -f package | tr -d ' \n')" == 'package(){:}' ]]
+) || fail "host-kernel placeholder must provide only NTSYNC-MODULE and ship nothing"
+boot_body=$(awk '/^bootstrap_sandbox\(\)/,/^}/' "$WB")
+assert_has "$boot_body" 'bash "${HOST_KERNEL_PKGBUILD[@]}" \' "bootstrap installs the host-kernel placeholder"
+assert_has "$boot_body" "|| log_warn \"Could not install the host-kernel placeholder" "placeholder failure is not fatal"
+assert_has "$boot_body" 'makepkg -si --noconfirm' "placeholder is installed explicitly (survives orphan cleanup)"
+ok "host-kernel placeholder lets wine install without a kernel package, harmlessly"
+
+# New boxes enable exactly [multilib] (never [multilib-testing]); an image without
+# the stanza gets one appended; running it twice changes nothing.
+(
+    eval "$(awk '/^_enable_multilib\(\)/,/^}/' "$WB")"
+    _guard_jail_path() { :; }
+    sudo() { "$@"; }
+    conf="$TMP/pacman.conf"
+    printf '%s\n' '[core]' 'Include = /etc/pacman.d/mirrorlist' '' \
+        '#[multilib-testing]' '#Include = /etc/pacman.d/mirrorlist' '' \
+        '#[multilib]' '#Include = /etc/pacman.d/mirrorlist' > "$conf"
+    _enable_multilib "$conf"; _enable_multilib "$conf"
+    grep -qx '\[multilib\]' "$conf"
+    [[ "$(grep -A1 -x '\[multilib\]' "$conf" | tail -n1)" == 'Include = /etc/pacman.d/mirrorlist' ]]
+    grep -qx '#\[multilib-testing\]' "$conf"
+    [[ "$(grep -c '^Include' "$conf")" == 2 ]]
+    printf '%s\n' '[core]' 'Include = /etc/pacman.d/mirrorlist' > "$conf"
+    _enable_multilib "$conf"; _enable_multilib "$conf"
+    [[ "$(grep -cx '\[multilib\]' "$conf")" == 1 ]]
+) || fail "bootstrap must enable exactly the [multilib] repository"
+assert_has "$(awk '/^bootstrap_sandbox\(\)/,/^}/' "$WB")" '_enable_multilib "$JAIL_ROOT/etc/pacman.conf"' \
+    "bootstrap enables multilib before the first package sync"
+ok "new boxes come with the official multilib repository enabled"
+
+# GPU-matched Vulkan drivers: the host's Mesa vendors are detected (NVIDIA left to
+# the user), and the box-local "lib32-vulkan-driver" package makes pacman pick the
+# right 32-bit driver instead of the alphabetically first (NVIDIA) provider.
+(
+    eval "$(awk '/^_host_mesa_vulkan\(\)/,/^}/' "$WB")"
+    S="$TMP/gpu-sys"
+    for c in card0:0x8086 card1:0x10de card0-eDP-1:0x8086 card2:0x1002; do
+        mkdir -p "$S/class/drm/${c%%:*}/device"; echo "${c#*:}" > "$S/class/drm/${c%%:*}/device/vendor"
+    done
+    [[ "$(_host_mesa_vulkan "$S" | paste -sd' ')" == "vulkan-intel vulkan-radeon" ]]
+    rm -rf "$S/class/drm/card0" "$S/class/drm/card0-eDP-1" "$S/class/drm/card2"
+    [[ -z "$(_host_mesa_vulkan "$S")" ]]                     # NVIDIA only: nothing chosen
+) || fail "host GPU detection must pick Mesa Vulkan drivers only"
+boot_body=$(awk '/^bootstrap_sandbox\(\)/,/^}/' "$WB")
+assert_has "$boot_body" '"${PKGS[@]}" "${gpu_pkgs[@]}"' "bootstrap installs the host GPU's Vulkan driver"
+assert_has "$boot_body" 'bash -c "$LIB32_VULKAN_REPO_SCRIPT" bash "${gpu_pkgs[@]/#/lib32-}"' \
+    "bootstrap registers the matching 32-bit driver as pacman's choice"
+assert_has "$boot_body" '|| log_warn "Could not set the default 32-bit Vulkan driver' "that step is not fatal"
+if command -v makepkg >/dev/null && command -v repo-add >/dev/null && command -v fakeroot >/dev/null \
+   && command -v pacman >/dev/null; then
+    (
+        T="$TMP/prov"; mkdir -p "$T/fake" "$T/root" "$T/db" "$T/cache" "$T/shim"; cd "$T"
+        mk() {
+            mkdir -p "b/$1"
+            printf '%s\n' "pkgname=$1" pkgver=1 pkgrel=1 'arch=(any)' 'license=(0BSD)' "$2" 'package() { :; }' > "b/$1/PKGBUILD"
+            (cd "b/$1" && makepkg --nodeps --noconfirm >/dev/null 2>&1) && mv "b/$1"/*.pkg.tar.* fake/
+        }
+        mk aaa-nvidia 'provides=(lib32-vulkan-driver)'
+        mk lib32-vulkan-intel 'provides=(lib32-vulkan-driver)'
+        mk steamlike 'depends=(lib32-vulkan-driver)'
+        repo-add -q fake/fake.db.tar.gz fake/*.pkg.tar.* 2>/dev/null
+        printf '[options]\nArchitecture = auto\nSigLevel = Never\n[fake]\nServer = file://%s/fake\n' "$T" > pacman.conf
+        P() { fakeroot pacman --root "$T/root" --dbpath "$T/db" --config "$T/pacman.conf" --cachedir "$T/cache" "$@"; }
+        P -Sy >/dev/null 2>&1
+        [[ "$(P -Sp --print-format %n --noconfirm steamlike 2>/dev/null | head -n1)" == aaa-nvidia ]]   # the problem
+        printf '#!/bin/sh\nexec "$@"\n' > shim/sudo
+        printf '#!/bin/sh\n[ "$1" = -Sy ] || exec %s "$@"\n' "$(command -v pacman)" > shim/pacman
+        chmod +x shim/*
+        eval "$(awk "/^LIB32_VULKAN_REPO_SCRIPT='/,/^'\$/" "$WB")"
+        script=${LIB32_VULKAN_REPO_SCRIPT//\/var\/lib\/waterbox\/repo/$T\/wbrepo}
+        script=${script//\/etc\/pacman.conf/$T\/pacman.conf}
+        PATH="$T/shim:$PATH" bash -c "$script" bash lib32-vulkan-intel >/dev/null 2>&1
+        P -Sy >/dev/null 2>&1
+        picked=$(P -Sp --print-format %n --noconfirm steamlike 2>/dev/null | paste -sd' ')
+        [[ " $picked " == *" lib32-vulkan-intel "* && " $picked " != *" aaa-nvidia "* ]] \
+            || { echo "picked: $picked"; exit 1; }
+        [[ "$(grep -c '^\[waterbox\]' pacman.conf)" == 1 ]]
+    ) || fail "pacman must pick the host GPU's 32-bit Vulkan driver through the box-local repo"
+    ok "new boxes get the host GPU's Vulkan driver, and pacman picks its 32-bit driver on demand"
+else
+    skip_test "pacman provider choice (makepkg/repo-add/fakeroot unavailable)"
+fi
+
+# Gaming environments: Wine with a ready prefix at build time (virtual desktop,
+# DXVK, no Mono/Gecko prompts), --game on every cold boot, harmless when it fails.
+boot_body=$(awk '/^bootstrap_sandbox\(\)/,/^}/' "$WB")
+assert_has "$boot_body" 'if _env_is_game "$WB_ENV"; then' "only gaming environments get Wine at build time"
+assert_has "$(grep -m1 '^WINE_GAMING_PKGS=' "$WB")" '(wine-staging winetricks)' "gaming environments use wine-staging"
+assert_has "$boot_body" 'bash -c "$WINE_PREFIX_SCRIPT" bash "$WINE_DESKTOP_SIZE"' "the gaming prefix is prepared as the guest user"
+[[ "$(grep -n 'Installing the host-kernel placeholder' <<< "$boot_body" | cut -d: -f1)" -lt \
+   "$(grep -n 'installing Wine and preparing its prefix' <<< "$boot_body" | cut -d: -f1)" ]] \
+    || fail "the NTSYNC placeholder must be installed before Wine"
+wine_script=$(awk "/^WINE_PREFIX_SCRIPT='/,/^'\$/" "$WB")
+for needle in 'WINEDLLOVERRIDES="mscoree=;mshtml="' 'HKCU\\Software\\Wine\\Explorer" /v Desktop /d Default' \
+        'Explorer\\Desktops" /v Default /d "$1"' 'winetricks -q dxvk'; do
+    assert_has "$wine_script" "$needle" "gaming prefix: $needle"
+done
+(
+    eval "$(awk "/^WINE_PREFIX_SCRIPT='/,/^'\$/" "$WB")"
+    mkdir -p "$TMP/wine-bin"; : > "$TMP/wine.calls"
+    for t in wine wineboot winetricks wineserver; do
+        printf '#!/bin/sh\nprintf "%%s|" "%s" "$@" >> %s; echo >> %s\n' "$t" "$TMP/wine.calls" "$TMP/wine.calls" > "$TMP/wine-bin/$t"
+        chmod +x "$TMP/wine-bin/$t"
+    done
+    HOME="$TMP/wine-home" PATH="$TMP/wine-bin:$PATH" bash -c "$WINE_PREFIX_SCRIPT" bash 1600x900
+    grep -qxF 'wine|reg|add|HKCU\Software\Wine\Explorer|/v|Desktop|/d|Default|/f|' "$TMP/wine.calls"
+    grep -qxF 'wine|reg|add|HKCU\Software\Wine\Explorer\Desktops|/v|Default|/d|1600x900|/f|' "$TMP/wine.calls"
+    grep -qxF 'winetricks|-q|dxvk|' "$TMP/wine.calls"
+) || fail "the gaming prefix must turn on Wine's virtual desktop and DXVK"
+up_body=$(awk '/^_env_up\(\)/,/^}/' "$WB")
+assert_has "$up_body" 'WATERBOX_AUDIO=1; WATERBOX_GAMEPAD=1' "gaming environments boot with audio and controllers"
+assert_has "$up_body" '[ "${CLI_NO_GUI:-0}" = 1 ] || WATERBOX_GUI=1' "an explicit --no-gui still wins"
+assert_has "$up_body" 'its programs can see your other X11 windows' "an X11-only host gets the X11 warning"
+ok "gaming environments come with Wine ready and boot with --game"
 
 printf '# %d checks passed, %d skipped\n' "$pass" "$skip"
 printf '1..%d\n' "$count"

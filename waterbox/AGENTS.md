@@ -101,8 +101,10 @@ Identity:
   the helper receives verbatim (`declare -f`). Never derive one twice.
 - Names are labels in the ordinary-user registry `~/.waterbox/envs.list`
   (`<id> <name>`). Nothing privileged reads it. Rename edits only that line and is
-  allowed while the environment runs. The first run (or the first run after an
-  upgrade) writes `0 main`.
+  allowed while the environment runs. An upgrade from a single-box release
+  writes `0 main` for the existing box. A first run starts with an empty
+  registry; `_env_ensure_one` then creates `main`, asking on a terminal whether
+  it is a gaming environment (scripts and pipes get an ordinary one).
 - The CLI activates one environment with `_use_env <id>` and then runs the
   single-box code unchanged. Every helper call goes through `run_priv` /
   `run_priv_quiet` (or the literal `exec … --env "$WB_ENV" shell`), which pass
@@ -235,6 +237,12 @@ an escape route.
   other X clients.
 - `--x11` is the explicit opt-in on a Wayland host.
 - `--gui` on a native X11 host is also an explicit acceptance of the X11 risk.
+- A user-owned X socket (a desktop's per-session Xwayland, often mode 0755) is
+  owner-mapped like the Wayland socket, or the box cannot connect; a root-owned
+  one stays unmapped, since mapping it would map container uid 1000 to host root.
+  The box's processes never match the X server's `localuser` rule, so access
+  depends on the copied cookie; `--x11` warns when it cannot forward a display or
+  copy the cookie.
 - GPU `/dev/dri` forwarding is on by default and can be disabled with `--no-gpu`.
 
 Avoid desktop-specific policy such as “Cinnamon does X, KDE does Y.” Detect the
@@ -268,30 +276,91 @@ Rules for this feature:
   nodes plugged in later are not bound at all. Do not add udev hooks or a
   device manager without a new design decision.
 
-### Audio is PipeWire-only and explicit
+### Audio goes through a sandboxed Pulse bridge
 
-`--audio` (on `start`/`restart`) binds the host user's
-`/run/user/<uid>/pipewire-0` — fixed path, a socket owned by that user, no
-symlinks — ID-mapped to `/tmp/.waterbox-pipewire`. The box runs its own
-`pipewire-pulse` against it (managed user-unit drop-in; the box's own
-`pipewire`/`wireplumber` units are masked), so Pulse and ALSA programs work.
+`--audio` (on `start`/`restart`) never gives the box the host's PipeWire or Pulse
+socket. Reasons, verified in the PipeWire source (1.6):
 
-- Never mount the host Pulse socket: a Pulse client can make the server load
-  modules (a TCP listener, for example). With the box's own pipewire-pulse, those
-  modules load inside the box.
-- No PipeWire on the host: clear error, no fallback.
-- Per boot, never persisted, never used by autostart or wake.
-- Warning: the box is an unrestricted client of the host's PipeWire. Besides the
-  microphone and all audio, PipeWire's node/device factories may let a client
-  name a plugin library to load (the `library.name` path), which would be code
-  running as the host user. Treat `--audio` like `--x11`: only for a box trusted
-  that far. The proper fix is a restricted-access socket with session-manager
-  rules granting only playback/capture; that needs per-host PipeWire config and
-  was deferred, not rejected.
+- A PipeWire client can create nodes in the daemon (`adapter`,
+  `spa-node-factory`) with its own properties. `library.name` cannot escape the
+  SPA plugin directory (`../` is stripped), but audioconvert honours
+  `audioconvert.filter-graph.N` (a LADSPA plugin is `dlopen`ed by absolute path)
+  and `debug.wav-path` (writes a file). Either is code execution or an arbitrary
+  file write as the host user.
+- A Pulse client's stream proplist becomes the `pw_stream` properties, and the
+  stream's audioconvert runs inside the Pulse server process, so the same
+  properties work through the host's Pulse server; `load-module` adds more.
+
+Design:
+
+- The helper starts `<machine>-pulse.service`: the host's `pipewire-pulse`, as the
+  user, with a generated config (`/run/waterbox-pulse/<uid>-<env>.conf`) that
+  listens only on `/run/waterbox-pulse/<uid>-<env>/native`, has
+  `pulse.allow-module-loading = false`, no D-Bus name and no TCP. It is a normal
+  client of the user's PipeWire (`PIPEWIRE_REMOTE`).
+- The bridge is sandboxed so stream properties cannot turn into code or writes:
+  `NoExecPaths=/` + `ExecPaths=/usr -/lib -/lib64`, `MemoryDenyWriteExecute`,
+  `ProtectSystem=strict` with only its own directory writable, `ProtectHome=tmpfs`
+  (+ `BindPaths` of the PipeWire socket), removable-media paths inaccessible,
+  `RestrictAddressFamilies=AF_UNIX`, `NoNewPrivileges`. `BindsTo=` the box unit;
+  `power_off` also stops it and removes its files.
+- Only the bridge socket enters the box, ID-mapped, at `/tmp/.waterbox-pulse`;
+  `boot-env` exports `PULSE_SERVER` and a managed `client.conf.d` names it too.
+- The box's own `pipewire`, `wireplumber` and `pipewire-pulse` user units are
+  masked. PipeWire-native programs (SDL tries PipeWire first) then fall back to
+  Pulse instead of an empty local graph, and no box socket can refuse
+  connections: libpulse clients such as Steam recurse until their stack
+  overflows on a Pulse socket that refuses, while an absent server is handled
+  cleanly. Do not unmask `pipewire.service` alone: `pipewire-pulse.service`
+  requires it (a masked dependency left its socket failed and refusing).
+- Remaining exposure, stated in the warning: microphone, all host audio, and
+  changing/rerouting sound devices; plus memory-safety bugs in the bridge's
+  Pulse protocol code (sandboxed, but still a client of the user's PipeWire).
+- No PipeWire or no `pipewire-pulse` on the host: clear error, no fallback.
+- Per boot, never persisted (except that a gaming environment boots with `--game`
+  every time), never used by autostart or wake.
 - `/etc/waterbox/boot-env` is written by the helper from what it accepted; never
   copy a user-writable file there.
-- Packages (`pipewire pipewire-pulse pipewire-alsa`) are in `PKGS` for new builds.
-  Existing boxes are never upgraded implicitly; the shell prints the install line.
+- Packages (`libpulse pulseaudio-alsa`) are in `PKGS` for new builds. Existing
+  boxes are never upgraded implicitly.
+
+### X11 programs on Wayland use an X server of the box's own
+
+On Wayland-only GUI boots, when the box has `xwayland-satellite` (in `PKGS`), the
+helper exports `DISPLAY=:42` in `gui-env` and starts the box's
+`waterbox-xwayland.service` (a system unit running as the guest user) after the
+Wayland socket is mounted. X11-only programs (Steam, Wine, Proton games) then
+open as normal Wayland windows and see only the box's other X11 clients, never
+the host's. `--x11` still shares the host's X server, and then the satellite is
+not started. Boxes without the package keep `DISPLAY` unset, so toolkits never
+pick a dead X11 display.
+
+### `--game` is a fixed bundle
+
+`--game` = `--gui` + `--audio` + `--gamepad` (GPU is already the default). It
+never includes `--x11` or `--usb`, which stay separate explicit decisions, and
+the audio/gamepad warnings still print. Like the flags it bundles, it applies
+to one boot only — except in a gaming environment (below).
+
+### Gaming environments
+
+`waterbox env create <name> --game` (or answering yes in the menu's `a`) records
+the kind in the registry (`<id> <name> game`). Such an environment:
+
+- installs `wine-staging` (it provides `wine`) and `winetricks` at build time and
+  prepares `~/.wine` as the
+  guest user (`WINE_PREFIX_SCRIPT`): Mono/Gecko prompts skipped, DXVK, and Wine's
+  virtual desktop on by default through `HKCU\Software\Wine\Explorer`
+  `Desktop`/`Desktops` (checked against Wine 11's explorer), so a plain
+  `wine program.exe` opens in one window and launchers that embed another
+  process's window draw on the box's own X server. Failure only warns;
+- boots with `--game` on every cold boot. This is the one place device flags are
+  remembered, because the user chose it explicitly when creating the
+  environment. An explicit `--no-gui` still wins for the display, and on a host
+  without Wayland a warning states that the box then uses the host's X11;
+- never preinstalls Steam (`pacman -S steam` already asks nothing).
+
+Ordinary environments are unchanged and stay light.
 
 ### Gamepads are explicit, exact, and guarded
 
@@ -323,7 +392,8 @@ symlinks — ID-mapped to `/tmp/.waterbox-pipewire`. The box runs its own
   the box (fail closed). `StartLimitIntervalSec=0` keeps a crashing guard
   restarting. The guard refuses to run through sudo. A guard that cannot start
   fails the boot.
-- Per boot, never persisted, never used by autostart or wake. Hotplugged
+- Per boot, never persisted (except that a gaming environment boots with `--game`
+  every time), never used by autostart or wake. Hotplugged
   controllers need another `--gamepad` boot.
 
 ### Clipboard behavior is universal
@@ -865,6 +935,10 @@ session and warn clearly; never claim that schedules were repointed.
   work. Extra arguments are errors; destructive commands must never ignore them.
 - Global options may appear around the command. `--` preserves an option-like
   share path or scheduled command; session names still cannot begin with `-`.
+- Every command, subcommand and option belongs in the zsh completion
+  (`emit_completion`, the only completion Waterbox ships), which must also work
+  when options come before the command. The harness drives it with stubbed
+  `compadd`; extend that check with each new option.
 - Color is used only on terminals and respects `NO_COLOR`; piped output remains
   clean.
 - Prefer one universal Linux behavior over a growing compatibility matrix.
@@ -880,6 +954,29 @@ session and warn clearly; never claim that schedules were repointed.
   provides a safe compatible path.
 - Do not assume the host has Arch tools such as `pacstrap`.
 - Bootstrap with the guest’s pacman inside nspawn.
+- New boxes enable Arch's `[multilib]` (exactly that stanza, never
+  `[multilib-testing]`) before the first sync, so 32-bit libraries come from the
+  official repos instead of AUR look-alikes. Existing boxes are not changed.
+- New boxes get the Vulkan driver of the host's Mesa GPU (`_host_mesa_vulkan`:
+  Intel → `vulkan-intel`, AMD → `vulkan-radeon`; NVIDIA is never chosen because
+  its userspace must match the host driver version) and `ttf-dejavu`. The 32-bit
+  driver is not installed (too large for boxes that never need it). Instead
+  `LIB32_VULKAN_REPO_SCRIPT` puts an empty package named `lib32-vulkan-driver`,
+  depending on the matching `lib32-vulkan-*`, in a box-local repository
+  (`/var/lib/waterbox/repo`, `[waterbox]` in `pacman.conf`). pacman resolves a
+  dependency to a package with that exact name before asking among providers,
+  so Steam/Wine get the right 32-bit driver instead of the alphabetically first
+  (NVIDIA) one, and only when they are installed. The package ships nothing and
+  conflicts with/replaces nothing; another driver installed explicitly satisfies
+  the dependency as well. Removing the repository directory requires removing
+  the `[waterbox]` stanza too, or `pacman -Sy` fails. The harness checks the
+  choice against a real pacman with fake providers.
+- The box runs on the host kernel and never installs a kernel package. Arch's
+  `wine` (through `ntsync-autoload`) needs the virtual `NTSYNC-MODULE`, so
+  bootstrap installs `waterbox-uses-host-kernel` (`HOST_KERNEL_PKGBUILD`): empty,
+  explicitly installed, providing only that name, with no conflicts/replaces so a
+  real kernel can still sit beside it. Its failure is a warning, never a failed
+  bootstrap. Existing boxes are not changed; they can install it by hand.
 - Verify the downloaded Arch bootstrap signature against the pinned signing key.
 - Dependency installation may vary by package manager; security behavior must not.
 - Do not add desktop-environment branches merely to handle terminal behavior.
@@ -975,8 +1072,14 @@ Before considering a security change complete, inspect these regressions:
   device with a keyboard collection is not passed at all. A host seat change (fast user
   switching) can reset device ACLs; boot again with `--gamepad`.
 - Ctrl-b s inside a box lists only that box's sessions; the host picker lists all.
-- `--audio` gives the box an unrestricted PipeWire client (see above), not a
-  sandboxed audio channel.
+- The box's own X server (xwayland-satellite) manages windows minimally. A Wine
+  program that embeds another process's window (the Nexon launcher's browser
+  view, for example) stays white; the same program works with `--x11` (a full
+  window manager) or inside Wine's virtual desktop
+  (`wine explorer /desktop=<name>,<WxH> <exe>`), which is the recommended fix
+  because it keeps the host's X server out of the box. Help text says so.
+- `--audio` still exposes the microphone and host audio routing, and the
+  bridge's Pulse protocol code; it no longer exposes PipeWire's plugin loading.
 - All running environments share one memory budget; there is no per-environment
   budget.
 - Disk usage has no equivalent simple hard quota yet.

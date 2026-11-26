@@ -19,6 +19,7 @@ USER_NAME="water"               # fixed guest user (uid 1000; ID-mapped to host 
 RUN_USER="$(id -un)"            # the host user invoking this script
 HOST_RUNTIME_DIR="/run/user/$(id -u)"
 INSIDE_HOSTNAME="box"           # hostname shown inside the container
+BOX_X11_DISPLAY="42"            # the box's own X server (xwayland-satellite) on Wayland-only GUI boots
 TMUX_SESSION="box"              # tmux session that wraps the interactive shell
 CONTAINER_WORKSPACE="/home/$USER_NAME/workspace"
 
@@ -78,9 +79,99 @@ PKGS=(
     ripgrep tmux bind vim less
     openssh nano openbsd-netcat curl
     python           # JSON for the statusline (powerline pulls it in anyway; explicit here)
-    pipewire pipewire-pulse pipewire-alsa   # --audio: in-box Pulse/ALSA server on the host graph
+    libpulse pulseaudio-alsa   # --audio: Pulse (and ALSA through it) to the host's audio bridge
+    xwayland-satellite         # X11 programs on Wayland, private to the box
+    ttf-dejavu                 # a font for GUI programs (and every "ttf-font" dependency)
     openai-codex     # Codex CLI. In [extra], so pacman -Syu keeps it current
 )
+
+# Arch's wine depends on NTSYNC-MODULE, which only kernel packages provide. The box
+# always runs on the host's kernel, so a kernel package inside it would be dead
+# weight plus an initramfs rebuild on every upgrade. Bootstrap installs this empty
+# package instead. Kept harmless on purpose:
+#   - no files, no dependencies, no install scriptlet: it changes nothing on disk;
+#   - no conflicts= / replaces=: a real kernel can still be installed beside it,
+#     and pacman never swaps one in or out for it;
+#   - installed explicitly (makepkg -i), so orphan cleanup (pacman -Qdt) keeps it;
+#   - it provides only that one virtual name. If Arch renames the dependency it
+#     simply stops mattering. Wine works without ntsync (the device is not passed
+#     into the box); it falls back to its other synchronization methods.
+HOST_KERNEL_PKGBUILD=(
+    "pkgname=waterbox-uses-host-kernel"
+    "pkgver=1"
+    "pkgrel=1"
+    "pkgdesc='Waterbox: the box runs on the host kernel; satisfies NTSYNC-MODULE without a kernel package'"
+    "arch=(any)"
+    "license=(0BSD)"
+    "provides=(NTSYNC-MODULE)"
+    "package() { :; }"
+)
+
+# The Vulkan driver packages for the host's Mesa GPUs (Intel, AMD), one per line.
+# NVIDIA is left out on purpose: the box's NVIDIA libraries must match the host's
+# kernel driver version exactly, so that stays the user's choice.
+_host_mesa_vulkan() {   # [$1 = sysfs root, for tests]
+    local v p seen=" "
+    for v in "${1:-/sys}"/class/drm/card*/device/vendor; do
+        [ -r "$v" ] || continue
+        case "$(cat "$v" 2>/dev/null)" in
+            0x8086) p=vulkan-intel ;;
+            0x1002) p=vulkan-radeon ;;
+            *) continue ;;
+        esac
+        case "$seen" in *" $p "*) continue ;; esac
+        seen="$seen$p "
+        printf '%s\n' "$p"
+    done
+}
+
+# Steam, Wine and friends depend on the virtual "lib32-vulkan-driver", and pacman
+# offers its providers alphabetically with NVIDIA first. A package whose name IS
+# the dependency wins over every provider without a question, so bootstrap puts a
+# tiny one in a box-local repository: "lib32-vulkan-driver", depending on the
+# host GPU's real driver. Nothing is installed until a package asks for it.
+# Harmless by construction: it ships no files, conflicts with and replaces
+# nothing, and anyone who wants another driver installs it explicitly (it then
+# satisfies the dependency too). Runs as the guest user inside the build nspawn;
+# $@ = the lib32 driver packages.
+LIB32_VULKAN_REPO_SCRIPT='
+set -e
+repo=/var/lib/waterbox/repo
+d=$(mktemp -d)
+trap '"'"'cd / && rm -rf "$d"'"'"' EXIT
+cd "$d"
+printf "%s\n" "pkgname=lib32-vulkan-driver" "pkgver=1" "pkgrel=1" \
+    "pkgdesc=\"Waterbox: the 32-bit Vulkan driver for this host GPU ($*)\"" \
+    "arch=(any)" "license=(0BSD)" "depends=($*)" "package() { :; }" > PKGBUILD
+makepkg --nodeps --noconfirm >/dev/null
+sudo install -d -m 0755 "$repo"
+sudo cp ./lib32-vulkan-driver-*.pkg.tar.* "$repo"/
+sudo repo-add -q "$repo/waterbox.db.tar.gz" "$repo"/lib32-vulkan-driver-*.pkg.tar.*
+grep -q "^\[waterbox\]" /etc/pacman.conf \
+    || printf "\n# Managed by Waterbox: picks this host GPU'"'"'s drivers for virtual dependencies.\n[waterbox]\nSigLevel = Optional TrustAll\nServer = file://%s\n" "$repo" \
+       | sudo tee -a /etc/pacman.conf >/dev/null
+sudo pacman -Sy --noconfirm >/dev/null
+'
+
+# Gaming environments (env create --game) get Wine (staging) at build time, with a prefix
+# ready for launchers: no Mono/Gecko download prompts, DXVK, and Wine's virtual
+# desktop on by default (HKCU\Software\Wine\Explorer "Desktop" + "Desktops"),
+# so a plain `wine program.exe` opens inside one window. That keeps launchers
+# which embed another process's window (Nexon's, for example) working on the
+# box's own X server. Runs as the guest user inside the build nspawn.
+# wine-staging: Wine plus the staging patch set, which many games and launchers
+# rely on. It provides "wine", so winetricks is satisfied in the same transaction.
+WINE_GAMING_PKGS=(wine-staging winetricks)
+WINE_DESKTOP_SIZE="1600x900"
+WINE_PREFIX_SCRIPT='
+set -e
+export WINEPREFIX="$HOME/.wine" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree=;mshtml="
+wineboot -i >/dev/null 2>&1
+wine reg add "HKCU\\Software\\Wine\\Explorer" /v Desktop /d Default /f >/dev/null 2>&1
+wine reg add "HKCU\\Software\\Wine\\Explorer\\Desktops" /v Default /d "$1" /f >/dev/null 2>&1
+winetricks -q dxvk >/dev/null 2>&1
+wineserver -w
+'
 
 # --- Agent registry -----------------------------------------------------------
 # The CLI agents the box knows about. Everything else here is agent-agnostic:
@@ -233,22 +324,31 @@ _use_env() {
     if [ "$1" = 0 ]; then AUTOSTART_UNIT="waterbox-autostart.service"
     else AUTOSTART_UNIT="waterbox-autostart-$1.service"; fi
 }
-_env_rows() {        # "<id> <name>" per valid registry line, sorted by id
-    local id name extra
+# Registry lines are "<id> <name>" or "<id> <name> game" (a gaming environment,
+# see `env create --game`). _env_rows_full keeps the kind for rewriting the file;
+# everything else reads _env_rows' plain "<id> <name>".
+_env_rows_full() {
+    local id name kind extra
     [ -f "$ENV_REGISTRY" ] || return 0
-    while read -r id name extra || [ -n "$id" ]; do
+    while read -r id name kind extra || [ -n "$id" ]; do
         _valid_env_id "$id" && _valid_env_name "$name" && [ -z "$extra" ] \
-            && printf '%s %s\n' "$id" "$name"
+            && { [ -z "$kind" ] || [ "$kind" = game ]; } \
+            && printf '%s %s%s\n' "$id" "$name" "${kind:+ $kind}"
     done < "$ENV_REGISTRY" | sort -n -k1,1 -u
 }
+_env_rows()    { _env_rows_full | awk '{ print $1, $2 }'; }
+_env_is_game() { _env_rows_full | awk -v i="$1" '$1 == i && $3 == "game" { f = 1 } END { exit !f }'; }
 _env_id_of()   { _env_rows | awk -v n="$1" '$2 == n { print $1; f = 1; exit } END { exit !f }'; }
 _env_name_of() { _env_rows | awk -v i="$1" '$1 == i { print $2; f = 1; exit } END { exit !f }'; }
 _env_names()   { _env_rows | awk '{ print $2 }' | paste -sd' '; }
-# First run and upgrades from single-box releases: the box that exists (or will be
-# built) is env 0, named "main".
+# Upgrades from single-box releases: the box that already exists is env 0, named
+# "main". On a first run the registry starts empty, so _env_ensure_one creates the
+# first environment and can ask what it is for.
 _env_registry_init() {
     [ -f "$ENV_REGISTRY" ] && return 0
-    mkdir -p "$CONFIG_DIR" && printf '0 main\n' > "$ENV_REGISTRY"
+    mkdir -p "$CONFIG_DIR" || return 1
+    if [ -e "$(_env_dir_for "$HOME" 0)/root" ]; then printf '0 main\n' > "$ENV_REGISTRY"
+    else : > "$ENV_REGISTRY"; fi
 }
 _env_write_rows() {  # stdin = the complete new registry; replaced atomically
     local tmp
@@ -257,8 +357,8 @@ _env_write_rows() {  # stdin = the complete new registry; replaced atomically
         rm -f -- "$tmp"; return 1
     fi
 }
-_env_create() {      # $1 = name; prints the new id
-    local name="$1" id
+_env_create() {      # $1 = name, [$2 = game]; prints the new id
+    local name="$1" kind="${2:-}" id
     _valid_env_name "$name" \
         || { log_warn >&2 "Invalid environment name '$name' (letters, digits, . _ - only, not starting with '-')."; return 1; }
     _env_id_of "$name" >/dev/null && { log_warn >&2 "An environment named '$name' already exists."; return 1; }
@@ -268,7 +368,7 @@ _env_create() {      # $1 = name; prints the new id
         # an old share list would mount their projects into the new box.
         if [ "$id" = 0 ]; then [ -e "$(_env_dir_for "$HOME" 0)/root" ] && continue
         else [ -e "$(_env_dir_for "$HOME" "$id")" ] && continue; fi
-        { _env_rows; printf '%s %s\n' "$id" "$name"; } | _env_write_rows || return 1
+        { _env_rows_full; printf '%s %s%s\n' "$id" "$name" "${kind:+ $kind}"; } | _env_write_rows || return 1
         printf '%s\n' "$id"
         return 0
     done
@@ -282,7 +382,7 @@ _env_rename() {      # $1 = old name, $2 = new name
     _valid_env_name "$new" \
         || { log_warn >&2 "Invalid environment name '$new' (letters, digits, . _ - only, not starting with '-')."; return 1; }
     _env_id_of "$new" >/dev/null && { log_warn >&2 "An environment named '$new' already exists."; return 1; }
-    _env_rows | awk -v i="$id" -v n="$new" '$1 == i { $2 = n } { print }' | _env_write_rows
+    _env_rows_full | awk -v i="$id" -v n="$new" '$1 == i { $2 = n } { print }' | _env_write_rows
 }
 # --- end env identity
 _use_env 0
@@ -429,11 +529,11 @@ and Codex; inside the box, run ${C_CMD}claude${C_OFF} or ${C_CMD}codex${C_OFF}.
 
 ${C_HEAD}Usage:${C_OFF} ${C_CMD}waterbox${C_OFF} [command] [args] [--env <name>] [--gui|--no-gui|--x11] [--no-gpu] [--usb]
   Bare '${C_CMD}waterbox${C_OFF}' boots the box and attaches.   ${C_DIM}Ctrl-b d = detach · exit = end session${C_OFF}
-  ${C_DIM}Boot options for gaming: --audio (PipeWire sound) and --gamepad (controllers).${C_OFF}
+  ${C_DIM}Gaming: --game (= --gui --audio --gamepad), e.g. 'waterbox start --env gaming --game'.${C_OFF}
 
 ${C_HEAD}Environments${C_OFF}  ${C_DIM}(independent boxes: own packages, home, shares, network)${C_OFF}
   ${C_CMD}env${C_OFF}                         Manage them (Enter start · a new · r rename · d delete).
-  ${C_CMD}env${C_OFF} list | create <name> | rename <old> <new> | delete <name>
+  ${C_CMD}env${C_OFF} list | create <name> [--game] | rename <old> <new> | delete <name>
   ${C_CMD}--env <name>${C_OFF}                Pick the environment for any box command below. Without
                               it: the only one, the only running one, or a menu.
 
@@ -483,7 +583,7 @@ EOF
 # top-level help stays short and points here.
 help_start() {
     cat <<EOF
-${C_HEAD}Usage:${C_OFF} ${C_CMD}waterbox start${C_OFF} [<session> | --here] [--env <name>] [--gui|--no-gui|--x11] [--no-gpu] [--usb] [--audio] [--gamepad]
+${C_HEAD}Usage:${C_OFF} ${C_CMD}waterbox start${C_OFF} [<session> | --here] [--env <name>] [--gui|--no-gui|--x11] [--no-gpu] [--usb] [--audio] [--gamepad] [--game]
 
 Boot the box if it isn't already up, then attach to a tmux session inside it. This
 is the default command, so a bare '${C_CMD}waterbox${C_OFF}' does exactly the same thing. Sessions
@@ -511,18 +611,20 @@ outlive your terminal: ${C_CMD}Ctrl-b d${C_OFF} detaches (it keeps running), '${
                      the box gets raw access to EVERY attached USB device — it
                      could reflash a dongle or talk to a plugged-in security key.
                      Serial ports plugged in later need 'waterbox restart --usb'.
-  ${C_CMD}--audio${C_OFF}            Connect the box to the host's PipeWire (sound out and in).
-                     The box runs its own pipewire-pulse, so Pulse clients never
-                     reach the host's sound server directly. SECURITY: the box is
-                     a full PipeWire client — it can record your microphone, hear
-                     and reroute all host audio, and may be able to make PipeWire
-                     load code that runs as you on the host. Needs PipeWire.
+  ${C_CMD}--audio${C_OFF}            Sound out and in, through a sandboxed Pulse bridge on the
+                     host (never your PipeWire or Pulse socket itself). SECURITY:
+                     the box can record your microphone, hear all host audio, and
+                     change or reroute your sound devices. Needs PipeWire and
+                     pipewire-pulse on the host.
   ${C_CMD}--gamepad${C_OFF}          Pass in the game controllers connected now (their joystick
                      and HID nodes only — never keyboards, security keys or
                      /dev/uinput, so Steam Input's virtual pads do not work).
                      SECURITY: the box reads every input of those controllers and
                      can use their rumble/LED/firmware interfaces. A controller
                      connected later needs 'waterbox restart --gamepad'.
+  ${C_CMD}--game${C_OFF}             Gaming boot: --gui (Wayland, plus an X server of the box's
+                     own for X11-only programs like Steam) + --audio + --gamepad.
+                     Not --x11 and not --usb. The audio and gamepad warnings apply.
 
 ${C_HEAD}GUI apps: ON by default on Wayland, OFF by default on X11${C_OFF}
 Forwarding the display into the box lets an agent open a browser or any GUI app
@@ -545,6 +647,12 @@ is depends entirely on your display server.
 
 Pass ${C_CMD}--gui${C_OFF} on an X11 desktop only when you accept that trade. On Wayland,
 ${C_CMD}--x11${C_OFF} explicitly adds the unsafe Xwayland fallback; plain ${C_CMD}--gui${C_OFF} remains Wayland-only.
+X11-only programs (Steam, Wine) still work on Wayland: the box runs an X server of its
+own (xwayland-satellite) that shows them as normal windows and lets them see only
+the box's other X11 programs, never yours. Its window management is minimal: a Wine
+program that embeds another process's window (some game launchers) can stay blank.
+Run those in Wine's virtual desktop, which keeps all their windows inside one:
+  ${C_CMD}wine explorer /desktop=<name>,1600x900 <program.exe>${C_OFF}
 Use ${C_CMD}--no-gui${C_OFF} when you want nothing forwarded.
 
 Options may appear before or after the command. Use ${C_CMD}--${C_OFF} before a literal path
@@ -619,7 +727,7 @@ EOF
 }
 help_env() {
     cat <<EOF
-${C_HEAD}Usage:${C_OFF} ${C_CMD}waterbox env${C_OFF} [list | create <name> | rename <old> <new> | delete <name>]
+${C_HEAD}Usage:${C_OFF} ${C_CMD}waterbox env${C_OFF} [list | create <name> [--game] | rename <old> <new> | delete <name>]
 
 An environment is a complete, separate box: its own Arch rootfs, packages, guest
 home (agent accounts and chats), shares, schedules and network. Use one for most
@@ -629,6 +737,11 @@ Sessions belong to the environment they were created in.
   ${C_DIM}(no args)${C_OFF}               Menu: Enter start · a new · r rename · d delete · q quit.
   ${C_CMD}list${C_OFF}                    Names and state (running / stopped / not built).
   ${C_CMD}create <name>${C_OFF}           Add one. It is built the first time it starts.
+  ${C_CMD}create <name> --game${C_OFF}    A gaming environment: Wine (staging) comes installed with a ready
+                          prefix (DXVK; programs open in Wine's virtual desktop, so
+                          launchers draw correctly), and every boot has display,
+                          audio and controllers, as with --game. No Steam
+                          (sudo pacman -S steam asks nothing in new environments).
   ${C_CMD}rename <old> <new>${C_OFF}      Rename it, even while it runs.
   ${C_CMD}delete <name>${C_OFF}           Destroy its rootfs, home, share list, wakes and autostart.
                           It must be stopped, and you type the name to confirm.
@@ -822,6 +935,18 @@ configure_hosts() {
     rm -f "$tmp"
 }
 
+# New boxes come with Arch's [multilib] repository on, so 32-bit libraries (Steam,
+# Wine, umu) come from the official repos instead of AUR look-alikes. Only the
+# exact [multilib] stanza is uncommented, never [multilib-testing]; if the image
+# has no stanza at all, one is appended. Existing boxes are left as they are.
+_enable_multilib() {   # $1 = the rootfs pacman.conf (bootstrap only: box not running)
+    local conf="$1"
+    _guard_jail_path "$conf"
+    sudo sed -i '/^#\[multilib\]$/,/^#Include/ s/^#//' "$conf"
+    grep -q '^\[multilib\]$' "$conf" \
+        || printf '\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n' | sudo tee -a "$conf" >/dev/null
+}
+
 # --- Bootstrap (runs once) ----------------------------------------------------
 bootstrap_sandbox() {
     # A sentinel written only at the very end marks a *complete* build. Testing
@@ -893,10 +1018,15 @@ bootstrap_sandbox() {
     # CheckSpace mis-reports on overlay/df; disable while we install.
     _guard_jail_path "$JAIL_ROOT/etc/pacman.conf"
     sudo sed -i 's/^CheckSpace/#CheckSpace/' "$JAIL_ROOT/etc/pacman.conf"
+    _enable_multilib "$JAIL_ROOT/etc/pacman.conf"
 
     log_info "Initializing pacman keyring inside the rootfs..."
     _nspawn_build bash -c \
         'pacman-key --init && pacman-key --populate archlinux'
+
+    # The Vulkan driver of the host's GPU (Mesa vendors only; see _host_mesa_vulkan).
+    local gpu_pkgs=()
+    mapfile -t gpu_pkgs < <(_host_mesa_vulkan)
 
     log_info "Installing base packages inside the rootfs..."
     # pacman 7's download sandbox needs a WORKING kernel Landlock; live-ISO / VM /
@@ -907,12 +1037,12 @@ bootstrap_sandbox() {
     # so the files DB, yay, and in-box pacman all keep working on that same kernel;
     # Landlock-capable hosts never hit this and keep the sandbox.
     if ! _nspawn_build \
-            pacman -Syu --noconfirm --needed "${PKGS[@]}"; then
+            pacman -Syu --noconfirm --needed "${PKGS[@]}" "${gpu_pkgs[@]}"; then
         log_warn "pacman couldn't use its download sandbox (kernel Landlock unavailable) — disabling it and retrying."
         _guard_jail_path "$JAIL_ROOT/etc/pacman.conf"
         sudo sed -i '/^\[options\]/a DisableSandbox' "$JAIL_ROOT/etc/pacman.conf"
         _nspawn_build \
-            pacman -Syu --noconfirm --needed "${PKGS[@]}"
+            pacman -Syu --noconfirm --needed "${PKGS[@]}" "${gpu_pkgs[@]}"
     fi
 
     # Download the files database too, so `pacman -F` / `pkgfile` work and there's no
@@ -986,6 +1116,36 @@ bootstrap_sandbox() {
     # Run the build as $USER_NAME (makepkg refuses root). Use the short -u: its long
     # form was renamed --user= → --uid= in systemd 261, but -u has meant "run as this
     # user" since forever, so it works on both Arch (261) and the systemd 255 on Mint.
+    # The host-kernel placeholder (see HOST_KERNEL_PKGBUILD). Not fatal: without it
+    # the only cost is that 'pacman -S wine' asks which kernel to install.
+    log_info "Installing the host-kernel placeholder package (so 'pacman -S wine' needs no kernel)..."
+    _nspawn_build -u "$USER_NAME" bash -c '
+        d=$(mktemp -d) && cd "$d" && printf "%s\n" "$@" > PKGBUILD \
+            && makepkg -si --noconfirm >/dev/null
+        rc=$?; cd / && rm -rf "$d"; exit "$rc"
+    ' bash "${HOST_KERNEL_PKGBUILD[@]}" \
+        || log_warn "Could not install the host-kernel placeholder; 'pacman -S wine' will ask for a kernel (any choice works, none is needed)."
+
+    # Make the right 32-bit Vulkan driver pacman's answer without installing it now
+    # (it is large and many boxes never need it). See LIB32_VULKAN_REPO_SCRIPT.
+    if [ "${#gpu_pkgs[@]}" -gt 0 ]; then
+        log_info "Making ${gpu_pkgs[*]/#/lib32-} the 32-bit Vulkan driver pacman picks (installed only when something needs it)..."
+        _nspawn_build -u "$USER_NAME" bash -c "$LIB32_VULKAN_REPO_SCRIPT" bash "${gpu_pkgs[@]/#/lib32-}" \
+            || log_warn "Could not set the default 32-bit Vulkan driver; when pacman asks for lib32-vulkan-driver, choose ${gpu_pkgs[*]/#/lib32-}."
+    fi
+
+    # Gaming environments: Wine and a ready prefix (see WINE_PREFIX_SCRIPT). Not
+    # fatal: the box is usable without it, and the warning says what to run.
+    if _env_is_game "$WB_ENV"; then
+        log_info "Gaming environment: installing Wine and preparing its prefix (virtual desktop, DXVK)..."
+        if _nspawn_build pacman -S --needed --noconfirm "${WINE_GAMING_PKGS[@]}" >/dev/null; then
+            _nspawn_build -u "$USER_NAME" bash -c "$WINE_PREFIX_SCRIPT" bash "$WINE_DESKTOP_SIZE" \
+                || log_warn "Wine is installed, but its prefix was not fully prepared. In the box: winetricks dxvk, and enable the virtual desktop with: wine reg add 'HKCU\\Software\\Wine\\Explorer' /v Desktop /d Default /f"
+        else
+            log_warn "Could not install Wine. In the box: sudo pacman -S ${WINE_GAMING_PKGS[*]}"
+        fi
+    fi
+
     log_info "Installing yay + claude-code + extras inside the rootfs..."
     _nspawn_build -u "$USER_NAME" bash -c "
         cd /tmp &&
@@ -1018,30 +1178,58 @@ bootstrap_sandbox() {
     log_success "Rootfs ready at $JAIL_ROOT"
 }
 
-# --audio: the box never runs its own PipeWire graph. Its pipewire-pulse (socket-
-# activated for every user) serves Pulse clients inside the box and talks to the
-# host graph through the socket the helper binds at /tmp/.waterbox-pipewire; it
-# stays inactive on boots without --audio. Managed files, rewritten on refresh.
+# --audio: the host's per-box audio bridge (a sandboxed pipewire-pulse, see the
+# helper) is bound at /tmp/.waterbox-pulse. Pulse is the only audio path: the
+# box's own PipeWire and Pulse units are masked, so PipeWire-native programs
+# (SDL picks PipeWire first) fall back to Pulse instead of talking to an empty
+# local graph, and nothing listens on a Pulse socket that has no server behind it
+# (libpulse clients such as Steam crash on one). Without --audio the default
+# server is simply absent, which every Pulse client handles cleanly.
 configure_audio_units() {
-    local u="$JAIL_ROOT/etc/systemd/user" unit
-    _guard_jail_path "$u/pipewire-pulse.service.d"
-    _guard_jail_path "$u/sockets.target.wants"
-    sudo mkdir -p "$u/pipewire-pulse.service.d" "$u/sockets.target.wants"
+    local u="$JAIL_ROOT/etc/systemd/user" pc="$JAIL_ROOT/etc/pulse/client.conf.d" unit
+    _guard_jail_path "$u"
+    _guard_jail_path "$pc"
+    sudo mkdir -p "$u" "$pc"
     printf '%s\n' \
-        "# Managed by Waterbox: connect to the host's PipeWire (bound only with --audio)." \
-        "[Unit]" "ConditionPathExists=/tmp/.waterbox-pipewire" "" \
-        "[Service]" "Environment=PIPEWIRE_REMOTE=/tmp/.waterbox-pipewire" \
-        | wb_tee "$u/pipewire-pulse.service.d/waterbox.conf"
-    # These leaves are symlinks with absolute targets (a mask to /dev/null; Arch's
-    # own preset links), so resolving the leaf would follow them on the HOST and
-    # wrongly refuse. Guard the directory instead and replace the leaf itself:
-    # ln -T never follows or writes through an existing leaf.
-    for unit in pipewire.service pipewire.socket wireplumber.service; do
-        _guard_jail_path "$u"
+        "# Managed by Waterbox: the host's audio bridge (present only with --audio)." \
+        "default-server = unix:/tmp/.waterbox-pulse" \
+        "autospawn = no" \
+        | wb_tee "$pc/50-waterbox.conf"
+    # Leaves may be symlinks with absolute targets (masks to /dev/null, Arch's
+    # preset links), so resolving the leaf would follow it on the HOST and wrongly
+    # refuse. The directory is guarded; ln -T and rm never follow the leaf.
+    for unit in pipewire.service pipewire.socket wireplumber.service \
+                pipewire-pulse.service pipewire-pulse.socket; do
         sudo ln -sfnT /dev/null "$u/$unit"
     done
-    _guard_jail_path "$u/sockets.target.wants"
-    sudo ln -sfnT /usr/lib/systemd/user/pipewire-pulse.socket "$u/sockets.target.wants/pipewire-pulse.socket"
+    # Drop-ins from 1.23 development builds that targeted an in-box pipewire-pulse.
+    for unit in pipewire-pulse.service.d pipewire-pulse.socket.d; do
+        [ -d "$u/$unit" ] && [ ! -L "$u/$unit" ] || continue
+        _guard_jail_path "$u/$unit"
+        sudo rm -f -- "$u/$unit/waterbox.conf"
+        sudo rmdir -- "$u/$unit" 2>/dev/null || true
+    done
+}
+
+# Wayland-only GUI boots get an X server of their own: xwayland-satellite runs in
+# the box as an ordinary Wayland client and shows each X11 window (Steam, Wine and
+# Proton games) as a normal window. Box X11 programs see only each other, never
+# the host's X clients; --x11 remains the explicit way to share the host's X.
+# The helper starts the unit after it has mounted the Wayland socket.
+configure_box_x11() {
+    local units="$JAIL_ROOT/etc/systemd/system"
+    _guard_jail_path "$units"
+    sudo mkdir -p "$units"
+    printf '%s\n' \
+        "# Managed by Waterbox; started by the host helper on Wayland-only GUI boots." \
+        "[Unit]" "Description=Waterbox: X11 for this box's programs (xwayland-satellite)" \
+        "ConditionPathExists=/tmp/.waterbox-wayland" "" \
+        "[Service]" "User=$USER_NAME" \
+        "Environment=WAYLAND_DISPLAY=/tmp/.waterbox-wayland" \
+        "Environment=XDG_RUNTIME_DIR=/run/user/1000" \
+        "ExecStart=/usr/bin/xwayland-satellite :$BOX_X11_DISPLAY" \
+        "Restart=on-failure" "RestartSec=2" \
+        | wb_tee "$units/waterbox-xwayland.service"
 }
 
 # Dotfiles, claude defaults, git identity — all per-user, written once.
@@ -1058,6 +1246,7 @@ configure_dotfiles() {
         "d /var/tmp/claude 0700 $USER_NAME $USER_NAME 7d" \
         | wb_tee "$JAIL_ROOT/etc/tmpfiles.d/waterbox-claude-tmp.conf"
     configure_audio_units
+    configure_box_x11
     wb_tee "$JAIL_ROOT/home/$USER_NAME/.zshrc" <<'EOF'
 HISTFILE=~/.histfile
 HISTSIZE=20000
@@ -1109,11 +1298,6 @@ autoload -Uz compinit && compinit -u
 [ -f /etc/waterbox/gui-env ] && source /etc/waterbox/gui-env
 # Per-boot device env (--audio / --gamepad), written by the host helper at boot.
 [ -f /etc/waterbox/boot-env ] && source /etc/waterbox/boot-env
-# Boxes built before --audio existed lack the in-box PipeWire; packages are never
-# upgraded behind your back, so say once per shell what to install.
-if [[ -o interactive && -n "$PIPEWIRE_REMOTE" ]] && (( ! $+commands[pipewire-pulse] )); then
-    print "waterbox: audio needs PipeWire in this box once: sudo pacman -Syu pipewire pipewire-pulse pipewire-alsa"
-fi
 
 # Small orientation banner, printed once per tmux session.
 waterbox_welcome() {
@@ -2037,7 +2221,7 @@ is_running() {
 build_gui_bind_args() {
     : > "$GUI_ENV_FILE"; : > "$GUI_BINDS_FILE"
     [ "$WATERBOX_GUI" = "1" ] || return 0
-    local env_lines=() l have_x=0 have_wl=0 wlbase=""
+    local env_lines=() l have_x=0 have_wl=0 wlbase="" have_cookie=0
     local wl_runtime="$HOST_RUNTIME_DIR"
 
     # Wayland first. On a Wayland host, plain --gui (and the automatic default)
@@ -2079,9 +2263,22 @@ build_gui_bind_args() {
             if [ -s "$wx" ]; then
                 echo "$wx:/tmp/.waterbox-xauth" >> "$GUI_BINDS_FILE"
                 env_lines+=("XAUTHORITY=/tmp/.waterbox-xauth")
+                have_cookie=1
             fi
         fi
+        # The box's processes run under a mapped uid, so the X server's
+        # "localuser" rule below never matches them: only the cookie admits them.
+        [ "$have_cookie" = 1 ] \
+            || log_warn "X11: no auth cookie for $DISPLAY could be copied (needs the 'xauth' tool and your XAUTHORITY file); X11 apps in the box will likely be refused."
         command -v xhost >/dev/null 2>&1 && xhost +SI:localuser:"$RUN_USER" >/dev/null 2>&1 || true
+    elif [ "$WATERBOX_X11" = 1 ]; then
+        # --x11 was asked for explicitly; say why it is missing instead of
+        # quietly booting Wayland-only.
+        if [ -z "${DISPLAY:-}" ]; then
+            log_warn "--x11: DISPLAY is not set in this terminal, so no X11 display was forwarded. Run waterbox from a terminal of your desktop session."
+        else
+            log_warn "--x11: $xsock does not exist on the host (DISPLAY=$DISPLAY), so no X11 display was forwarded. Your desktop may not be running Xwayland."
+        fi
     fi
 
     # Pick a default backend from what actually bound: prefer Wayland if present
@@ -3069,10 +3266,21 @@ _env_state() {
 # There is always at least one environment to pick: on a first run (or after every
 # environment was deleted) create "main". It is built the first time it starts.
 _env_ensure_one() {
+    local kind=""
     _env_registry_init || log_error "Could not create $ENV_REGISTRY."
     [ -n "$(_env_rows)" ] && return 0
-    _env_create main >/dev/null || log_error "Could not create the first environment in $ENV_REGISTRY."
-    log_info "Created environment 'main'."
+    # Interactive first run: ask what the first environment is for. Scripts and
+    # pipes get an ordinary one without a question.
+    if [ -t 0 ] && [ -t 1 ] && _ask_gaming_env; then kind=game; fi
+    _env_create main "$kind" >/dev/null || log_error "Could not create the first environment in $ENV_REGISTRY."
+    log_info "Created ${kind:+gaming }environment 'main'."
+}
+# y/N on the terminal; returns 0 for a gaming environment.
+_ask_gaming_env() {
+    local ans=""
+    IFS= read -rep "Is this environment for games? (Wine ready; display, audio and controllers on every boot) [y/N] " ans \
+        < /dev/tty 2>/dev/tty || return 1
+    [[ "$ans" == [Yy]* ]]
 }
 
 # Choose the environment for a per-box command and make it active:
@@ -3120,14 +3328,15 @@ _resolve_env() {
 # a/r/d create, rename and delete in place. Sets ENV_PICK; returns 1 on cancel.
 ENV_PICK=""
 _env_menu() {
-    local verb="$1" keep="${2:-}" rows=() row ids=() names=() labels=() i n new name
+    local verb="$1" keep="${2:-}" rows=() row ids=() names=() labels=() i n new name kind
     while true; do
         _env_ensure_one
         mapfile -t rows < <(_env_rows)
         ids=(); names=(); labels=()
         for row in "${rows[@]}"; do
             ids+=("${row%% *}"); names+=("${row#* }")
-            labels+=("$(printf '%-20s [%s]' "${row#* }" "$(_env_state "${row%% *}")")")
+            labels+=("$(printf '%-20s [%s]%s' "${row#* }" "$(_env_state "${row%% *}")" \
+                "$(_env_is_game "${row%% *}" && printf ' · gaming')")")
         done
         MENU_SELECT=0
         for i in "${!ids[@]}"; do [ "${ids[$i]}" = "$keep" ] && MENU_SELECT=$i; done
@@ -3140,9 +3349,11 @@ _env_menu() {
                 new=""
                 IFS= read -rep "New environment name: " new < /dev/tty 2>/dev/tty || continue
                 [ -n "$new" ] || continue
-                if n=$(_env_create "$new"); then
+                kind=""
+                _ask_gaming_env && kind=game
+                if n=$(_env_create "$new" "$kind"); then
                     keep="$n"
-                    log_info "Created environment '$new'. It is built the first time it starts."
+                    log_info "Created ${kind:+gaming }environment '$new'. It is built the first time it starts."
                 fi
                 continue ;;
             rename)
@@ -3232,7 +3443,7 @@ _env_delete() {
     elif [ -L "$ENV_DIR" ] || ! sudo rm -rf -- "$ENV_DIR"; then
         log_warn "Deleted the rootfs, but could not remove $ENV_DIR; remove it by hand."
     fi
-    _env_rows | awk -v i="$id" '$1 != i' | _env_write_rows \
+    _env_rows_full | awk -v i="$id" '$1 != i' | _env_write_rows \
         || { log_warn "Deleted the files, but $ENV_REGISTRY could not be updated."; return 1; }
     log_success "Deleted environment '$name'."
 }
@@ -3250,11 +3461,17 @@ env_cmd() {
             mapfile -t rows < <(_env_rows)
             [ "${#rows[@]}" -gt 0 ] || { echo "  (none — 'waterbox' creates one)"; return 0; }
             for row in "${rows[@]}"; do
-                printf '  %-20s %s\n' "${row#* }" "$(_env_state "${row%% *}")"
+                printf '  %-20s %-10s%s\n' "${row#* }" "$(_env_state "${row%% *}")" \
+                    "$(_env_is_game "${row%% *}" && printf ' gaming')"
             done ;;
         create)
-            id=$(_env_create "$2") || exit 1
-            log_success "Created environment '$2'. It is built the first time it starts: waterbox start --env $2" ;;
+            if [ "${CLI_GAME_FLAG:-0}" = 1 ]; then
+                id=$(_env_create "$2" game) || exit 1
+                log_success "Created gaming environment '$2': Wine comes ready, and every boot has display, audio and controllers (--game). It is built the first time it starts: waterbox start --env $2"
+            else
+                id=$(_env_create "$2") || exit 1
+                log_success "Created environment '$2'. It is built the first time it starts: waterbox start --env $2"
+            fi ;;
         rename)
             _env_rename "$2" "$3" || exit 1
             log_success "Renamed environment '$2' → '$3'." ;;
@@ -3478,7 +3695,7 @@ _env_up() {
         fi
         # A hint only: boot-env lives in the box-controlled rootfs.
         if [ "$WATERBOX_AUDIO" = "1" ] \
-           && ! _read_jail_regular "$JAIL_ROOT/etc/waterbox/boot-env" 4096 2>/dev/null | grep -q PIPEWIRE_REMOTE; then
+           && ! _read_jail_regular "$JAIL_ROOT/etc/waterbox/boot-env" 4096 2>/dev/null | grep -q PULSE_SERVER; then
             log_warn "Audio is set at boot — 'waterbox restart --audio' to enable it."
         fi
         # Re-assert the fixed veth/firewall setup as well as DNS on every attach.
@@ -3493,6 +3710,17 @@ _env_up() {
         fi
     else
         log_info "Booting environment '$(_env_label)' as transient systemd unit '$MACHINE_NAME.service'..."
+
+        # A gaming environment (created with `env create --game`) always boots like
+        # --game; an explicit --no-gui still wins for the display.
+        if _env_is_game "$WB_ENV"; then
+            [ "${CLI_NO_GUI:-0}" = 1 ] || WATERBOX_GUI=1
+            WATERBOX_AUDIO=1; WATERBOX_GAMEPAD=1
+            log_info "Gaming environment: display, audio and controllers are on (--game)."
+            if [ "${CLI_NO_GUI:-0}" != 1 ] && [ "${HOST_WAYLAND:-0}" != 1 ]; then
+                log_warn "No Wayland display here, so this gaming environment uses your X11 display: its programs can see your other X11 windows, read what you type in them and control them."
+            fi
+        fi
 
         # Detect the display server + write the GUI bind/env spec files as YOU
         # (needs your DISPLAY/XAUTHORITY). Clears them when --gui is absent.
@@ -3519,7 +3747,7 @@ _env_up() {
             boot_args+=(--usb)
         fi
         if [ "$WATERBOX_AUDIO" = "1" ]; then
-            log_warn "--audio: the box becomes a full client of your PipeWire server. It can record your microphone, hear and reroute all host audio, and may be able to make PipeWire load code that runs as you on the host. Use it only for a box you trust that far."
+            log_warn "--audio: the box can record your microphone, hear all host audio, and change or reroute your sound devices. It reaches your sound server only through a sandboxed Pulse bridge."
             boot_args+=(--audio)
         fi
         if [ "$WATERBOX_GAMEPAD" = "1" ]; then
@@ -3949,6 +4177,7 @@ set -e
 WB_HELPER_VERSION="$hmark"
 USER_NAME="$USER_NAME"
 NET_CIDR="$NET_CIDR"
+BOX_X11_DISPLAY="$BOX_X11_DISPLAY"
 ALLOW_CONTAINER_TO_HOST_PORTS="$ALLOW_CONTAINER_TO_HOST_PORTS"
 CONTAINER_WORKSPACE="$CONTAINER_WORKSPACE"
 WATERBOX_MEMORY_HIGH="$WATERBOX_MEMORY_HIGH"
@@ -3970,6 +4199,7 @@ TASK_MSG_DIR="/etc/waterbox"        # inside the rootfs (schedule-command messag
 # and the user's home (the NOPASSWD caller cannot aim the write at another file).
 RESUME_MARK_DIR="/var/lib/waterbox"
 BOOT_COLD=0                         # set by boot_full when it really booted the box
+BOX_X11=0                           # set by write_gui_env when the box gets its own X server
 
 # wake and autostart can both fire while the host boots. Taking turns stops one from
 # mistaking the other's half-done boot for the user's box (wake would then stop it
@@ -4244,7 +4474,7 @@ if ".." in target.split("/"):
 allowed_gui = {
     "/tmp/.waterbox-wayland",
     "/tmp/.waterbox-xauth",
-    "/tmp/.waterbox-pipewire",
+    "/tmp/.waterbox-pulse",
 }
 if not (target.startswith(workspace + "/")
         or target in allowed_gui
@@ -4760,39 +4990,123 @@ devguard_clear() {
 }
 
 # --- Audio (--audio) -----------------------------------------------------------
-# PipeWire only. The box runs its own pipewire-pulse against this socket, so a
-# Pulse client's load-module lands inside the box; the host's Pulse socket (where
-# load-module would act on the host server) is never exposed. The path is fixed
-# and must be the host user's own socket, not a symlink.
-collect_audio_mount() {
-    local dir="/run/user/$wb_uid" sock="/run/user/$wb_uid/pipewire-0"
-    AUDIO_SOURCE=""
-    if [ -d "$dir" ] && [ ! -L "$dir" ] && [ "$(stat -c %u "$dir" 2>/dev/null)" = "$wb_uid" ] \
-       && [ -S "$sock" ] && [ ! -L "$sock" ] && [ "$(stat -c %u "$sock" 2>/dev/null)" = "$wb_uid" ]; then
-        AUDIO_SOURCE="$sock"
-        return 0
-    fi
-    echo "helper: --audio needs PipeWire on the host (no $sock owned by uid $wb_uid)" >&2
-    return 1
+# The box never gets the host's PipeWire socket. Any PipeWire client may create
+# nodes in the daemon from installed plugins with its own properties, and some of
+# those properties load code or write files (an audioconvert filter graph naming a
+# LADSPA library by absolute path; debug.wav-path). The host's own Pulse server is
+# out too: Pulse clients can load modules into it, and their stream properties
+# reach the same audioconvert inside it.
+#
+# Instead every --audio box gets its own pipewire-pulse on the host: a client of
+# the host's PipeWire like any music player, speaking only the Pulse protocol to
+# the box, with module loading off. Stream properties still reach the audioconvert
+# inside that bridge, so it runs sandboxed: nothing outside /usr may be mapped
+# executable, no W+X memory, the filesystem is read-only apart from its own
+# directory, the home and removable-media trees are hidden, and only Unix sockets
+# exist. The box keeps the microphone and the host's audio routing; it does not
+# get a way to run code as the user.
+AUDIO_ROOT="/run/waterbox-pulse"
+audio_paths() {
+    AUDIO_DIR="$AUDIO_ROOT/$wb_uid-$wb_env"
+    AUDIO_SOCK="$AUDIO_DIR/native"
+    AUDIO_CONF="$AUDIO_ROOT/$wb_uid-$wb_env.conf"
 }
-mount_collected_audio() {
+# Before boot: the host user's PipeWire must exist (fixed path, a socket owned by
+# that user, no symlinks) and so must the host's pipewire-pulse binary.
+check_audio_host() {
+    local dir="/run/user/$wb_uid" sock="/run/user/$wb_uid/pipewire-0"
+    if ! { [ -d "$dir" ] && [ ! -L "$dir" ] && [ "$(stat -c %u "$dir" 2>/dev/null)" = "$wb_uid" ] \
+           && [ -S "$sock" ] && [ ! -L "$sock" ] && [ "$(stat -c %u "$sock" 2>/dev/null)" = "$wb_uid" ]; }; then
+        echo "helper: --audio needs PipeWire on the host (no $sock owned by uid $wb_uid)" >&2
+        return 1
+    fi
+    AUDIO_BIN=$(command -v pipewire-pulse 2>/dev/null) && [ -x "$AUDIO_BIN" ] \
+        || { echo "helper: --audio needs the host's pipewire-pulse (install the pipewire-pulse package)" >&2; return 1; }
+}
+audio_bridge_conf() {
+    printf '%s\n' \
+        "# Generated by Waterbox: a Pulse server for one box and nothing else." \
+        "context.spa-libs = {" \
+        "    audio.convert.* = audioconvert/libspa-audioconvert" \
+        "    support.*       = support/libspa-support" \
+        "}" \
+        "context.modules = [" \
+        "    { name = libpipewire-module-protocol-native }" \
+        "    { name = libpipewire-module-client-node }" \
+        "    { name = libpipewire-module-adapter }" \
+        "    { name = libpipewire-module-metadata }" \
+        "    { name = libpipewire-module-protocol-pulse args = { } }" \
+        "]" \
+        "pulse.properties = {" \
+        "    server.address = [ \"unix:$AUDIO_SOCK\" ]" \
+        "    server.dbus-name = \"\"" \
+        "    pulse.allow-module-loading = false" \
+        "}"
+}
+# After boot: start the bridge (bound to the box's unit, so it stops with it) and
+# wait for its socket. Everything here is root-created under /run, so the caller
+# cannot pre-plant paths; the bridge's own directory is the only place it writes.
+start_audio_bridge() {
+    local gid t=100
+    audio_paths
+    gid=$(getent passwd "$wb_uid" | cut -d: -f4)
+    case "$gid" in ''|*[!0-9]*) echo "helper: no primary group for uid $wb_uid" >&2; return 1 ;; esac
+    systemctl stop "$MACHINE_NAME-pulse.service" >/dev/null 2>&1 || true
+    rm -rf -- "$AUDIO_DIR"
+    install -d -m 0755 -o root -g root "$AUDIO_ROOT" \
+        && install -d -m 0700 -o "$wb_uid" -g "$gid" "$AUDIO_DIR" || return 1
+    audio_bridge_conf > "$AUDIO_CONF" && chmod 0644 "$AUDIO_CONF" || return 1
+    systemd-run --unit="$MACHINE_NAME-pulse" --collect --quiet \
+        --description="Waterbox audio bridge ($MACHINE_NAME)" \
+        --uid="$wb_uid" --gid="$gid" \
+        --property=BindsTo="$MACHINE_NAME.service" --property=After="$MACHINE_NAME.service" \
+        --property=Environment="HOME=$AUDIO_DIR" \
+        --property=Environment="XDG_RUNTIME_DIR=$AUDIO_DIR" \
+        --property=Environment="XDG_CONFIG_HOME=$AUDIO_DIR" \
+        --property=Environment="XDG_STATE_HOME=$AUDIO_DIR" \
+        --property=Environment="PIPEWIRE_REMOTE=/run/user/$wb_uid/pipewire-0" \
+        --property=ProtectSystem=strict \
+        --property=ProtectHome=tmpfs \
+        --property=PrivateTmp=yes \
+        --property=NoNewPrivileges=yes \
+        --property=BindPaths="/run/user/$wb_uid/pipewire-0" \
+        --property=ReadWritePaths="$AUDIO_DIR" \
+        --property=InaccessiblePaths="-/mnt -/media -/run/media" \
+        --property=NoExecPaths=/ \
+        --property=ExecPaths="/usr -/lib -/lib64" \
+        --property=MemoryDenyWriteExecute=yes \
+        --property=RestrictAddressFamilies=AF_UNIX \
+        "$AUDIO_BIN" -c "$AUDIO_CONF" \
+        || { echo "helper: could not start the audio bridge" >&2; return 1; }
+    while [ "$t" -gt 0 ] && ! [ -S "$AUDIO_SOCK" ]; do sleep 0.1; t=$((t - 1)); done
+    [ -S "$AUDIO_SOCK" ] && [ ! -L "$AUDIO_SOCK" ] \
+        || { echo "helper: the audio bridge did not come up (see: journalctl -u $MACHINE_NAME-pulse)" >&2; return 1; }
+}
+mount_audio_bridge() {
     local map_uid="$wb_uid"
     run_in_approved_box /bin/sh -c '[ -e "$1" ] || : > "$1"; chown -h 1000:1000 "$1"' \
-        sh /tmp/.waterbox-pipewire \
+        sh /tmp/.waterbox-pulse \
         || { echo "helper: could not prepare the audio target" >&2; return 1; }
     unsafe_unit && map_uid="-"
-    mount_into_box "$AUDIO_SOURCE" /tmp/.waterbox-pipewire "$map_uid"
+    mount_into_box "$AUDIO_SOCK" /tmp/.waterbox-pulse "$map_uid"
+}
+stop_audio_bridge() {
+    audio_paths
+    systemctl stop "$MACHINE_NAME-pulse.service" >/dev/null 2>&1 || true
+    rm -rf -- "$AUDIO_DIR" "$AUDIO_CONF"
 }
 # The guest environment for this boot's devices, derived only from what the helper
 # itself accepted (never from a user-writable file). Removed when neither is on.
 write_boot_env() {   # $1 = audio, $2 = gamepad
     local target="$JAIL_ROOT/etc/waterbox/boot-env" tmp rc=0
-    _in_jail "$target" \
+    local old_marker="$JAIL_ROOT/etc/waterbox/audio-on"
+    _in_jail "$target" && _in_jail "$old_marker" \
         || { echo "helper: refusing to write boot-env — it resolves outside the rootfs" >&2; return 1; }
-    if [ "$1" != 1 ] && [ "$2" != 1 ]; then rm -f "$target"; return 0; fi
     mkdir -p "$JAIL_ROOT/etc/waterbox"
+    rm -f "$old_marker"     # 1.23 development builds; unused since the audio bridge
+    if [ "$1" != 1 ] && [ "$2" != 1 ]; then rm -f "$target"; return 0; fi
     tmp=$(mktemp)
-    [ "$1" = 1 ] && echo 'export PIPEWIRE_REMOTE="/tmp/.waterbox-pipewire"' >> "$tmp"
+    [ "$1" = 1 ] && echo 'export PULSE_SERVER="unix:/tmp/.waterbox-pulse"' >> "$tmp"
     # No udev database in the box: SDL (and Steam) then scan /dev/input directly.
     [ "$2" = 1 ] && echo 'export SDL_JOYSTICK_DISABLE_UDEV="1"' >> "$tmp"
     install -m 0644 "$tmp" "$target" || rc=1
@@ -4810,6 +5124,7 @@ power_off() {
     fi
     net_down
     devguard_clear || true
+    stop_audio_bridge || true
 }
 
 # --- Full interactive boot (shares + GUI + GPU), all validated helper-side ------
@@ -4917,10 +5232,14 @@ collect_gui_mounts() {
             *) continue ;;
         esac
         # Wayland + xauth are host-user-owned (usually mode 0600/0700): map target
-        # uid 1000 to that user. X sockets are normally mode 0777 and may be root-
-        # owned, so leave them unmapped; mapping them could map uid 1000 to host root.
+        # uid 1000 to that user. An X socket owned by the user (a desktop's
+        # per-session Xwayland, typically 0755) needs the same map, or the box
+        # cannot connect at all. A root-owned one (usually 0777) stays unmapped:
+        # mapping it would map uid 1000 to host root.
         case "$dst" in
-            /tmp/.X11-unix/*) map_uid="-" ;;
+            /tmp/.X11-unix/*)
+                if [ "$(stat -c %u "$src" 2>/dev/null)" = "$wb_uid" ]; then map_uid="$wb_uid"
+                else map_uid="-"; fi ;;
             *)
                 [ "$(stat -c %u "$src" 2>/dev/null)" = "$wb_uid" ] \
                     || { echo "helper: refusing GUI file not owned by uid $wb_uid: $src" >&2; continue; }
@@ -4991,6 +5310,12 @@ write_gui_env() {
         printf 'export DISPLAY=":%s"\n' "$xnum" >> "$tmp"
         [ "$have_xauth" = 1 ] \
             && echo 'export XAUTHORITY="/tmp/.waterbox-xauth"' >> "$tmp"
+    elif [ -f "$JAIL_ROOT/usr/bin/xwayland-satellite" ]; then
+        # Wayland-only: X11 programs get the box's own X server (see
+        # configure_box_x11), never the host's. Boxes without the package keep
+        # DISPLAY unset, as before, so toolkits do not pick a dead X11 display.
+        printf 'export DISPLAY=":%s"\n' "$BOX_X11_DISPLAY" >> "$tmp"
+        BOX_X11=1
     fi
     if ! install -m 0644 "$tmp" "$target"; then
         rm -f "$tmp"
@@ -5027,7 +5352,7 @@ boot_full() {
     else
         clear_gui_env || return 3
     fi
-    if [ "$audio" = 1 ]; then collect_audio_mount || return 3; fi
+    if [ "$audio" = 1 ]; then check_audio_host || return 3; fi
     GAMEPAD_NODES=()
     if [ "$gamepad" = 1 ]; then
         collect_gamepad_nodes
@@ -5125,8 +5450,15 @@ boot_full() {
         power_off || true
         return 3
     fi
-    if [ "$audio" = 1 ] && ! mount_collected_audio; then
-        echo "helper: the PipeWire socket could not be mounted securely; stopping the box" >&2
+    # The box's own X server (Wayland-only boots). Runs inside the box through its
+    # own systemd; not fatal, since Wayland programs work without it.
+    if [ "$BOX_X11" = 1 ]; then
+        timeout --signal=TERM --kill-after=5s 30s \
+            systemctl -M "$MACHINE_NAME" start --no-block waterbox-xwayland.service >/dev/null 2>&1 \
+            || echo "helper: could not start the box's X server; X11 programs will not open" >&2
+    fi
+    if [ "$audio" = 1 ] && ! { start_audio_bridge && mount_audio_bridge; }; then
+        echo "helper: the audio bridge could not be set up securely; stopping the box" >&2
         power_off || true
         return 3
     fi
@@ -7660,42 +7992,74 @@ _waterbox_envs() {
     while read -r id name extra; do [[ -n "$name" ]] && print -r -- "$name"; done < "$HOME/.waterbox/envs.list"
 }
 _waterbox() {
-    local root="$HOME/.waterbox/root"
-    local -a cmds items
+    local root="$HOME/.waterbox/root" cmd envname="" w i n dashdash=0
+    local -a cmds items pos opts boot sess
     cmds=(start stop restart status reset autostart update share env
           wake-claude schedule-command version help)
+    boot=(--gui --no-gui --x11 --no-gpu --usb --audio --gamepad --game)
 
-    # --env <name> anywhere: complete environment names.
+    # --env <name>: complete environment names, wherever it appears.
     if [[ "${words[CURRENT-1]}" == --env ]]; then
         items=(${(f)"$(_waterbox_envs)"}); compadd -a items
         return
     fi
-    if (( CURRENT == 2 )); then
+    # Options may come before or after the command (`waterbox --env gaming start`),
+    # so find the command and its positional words by skipping options and
+    # --env's value. After `--` everything is positional.
+    for (( i = 2; i < CURRENT; i++ )); do
+        w="${words[i]}"
+        if (( dashdash )); then pos+=("$w"); continue; fi
+        case "$w" in
+            --)      dashdash=1 ;;
+            --env)   envname="${words[i+1]}"; (( i++ )) ;;
+            --env=*) envname="${w#--env=}" ;;
+            -*)      ;;
+            *)       pos+=("$w") ;;
+        esac
+    done
+    cmd="${pos[1]}"
+    (( n = ${#pos} + 1 ))          # 1 = the command itself, 2 = its first argument, …
+
+    case "$cmd" in
+        start)   opts=(--env --here $boot) ;;
+        restart) opts=(--env $boot) ;;
+        stop|status|reset|share|autostart|schedule-command|wake-claude) opts=(--env) ;;
+        env)     [[ "${pos[2]}" == create ]] && opts=(--game) ;;
+    esac
+    if [[ "$PREFIX" == -* ]] && (( ! dashdash )); then
+        if [[ -z "$cmd" ]]; then items=(--env --help); else items=($opts --help); fi
+        compadd -a items
+        return
+    fi
+    if (( n == 1 )); then
         _describe -t commands 'waterbox command' cmds
         return
     fi
 
-    case "${words[2]}" in
+    # Live sessions (best-effort, empty while nothing runs), of --env's box if given.
+    sess=(_sessions); [[ -n "$envname" ]] && sess+=(--env "$envname")
+
+    case "$cmd" in
         start)
             # `waterbox start <session>` boots (if needed) and attaches that session
             # directly — complete existing live session names, plus the flags.
-            items=(--env --here --gui --no-gui --x11 --no-gpu --usb --audio --gamepad ${(f)"$(command waterbox _sessions 2>/dev/null)"})
+            items=($opts)
+            (( n == 2 )) && items+=(${(f)"$(command waterbox "${sess[@]}" 2>/dev/null)"})
             compadd -a items ;;
-        restart)
-            items=(--env --gui --no-gui --x11 --no-gpu --usb --audio --gamepad)
-            compadd -a items ;;
+        restart|stop|status|reset)
+            compadd -a opts ;;
         env)
-            if (( CURRENT == 3 )); then items=(list create rename delete); compadd -a items
-            elif [[ "${words[3]}" == (rename|delete) ]] && (( CURRENT == 4 )); then
+            if (( n == 2 )); then items=(list create rename delete); compadd -a items
+            elif [[ "${pos[2]}" == (rename|delete) ]] && (( n == 3 )); then
                 items=(${(f)"$(_waterbox_envs)"}); compadd -a items
             fi ;;
         autostart)
-            (( CURRENT == 3 )) && { items=(on off status); compadd -a items; } ;;
+            (( n == 2 )) && { items=(on off status $opts); compadd -a items; } ;;
         share)
-            if (( CURRENT == 3 )); then items=(add detach list); compadd -a items
+            if (( n == 2 )); then items=(add detach list $opts); compadd -a items
             else _files -/; fi ;;
         wake-claude)
-            if (( CURRENT == 3 )); then
+            if (( n == 2 )); then
                 # Multi-agent layout, or the pre-1.9 flat one on an unmigrated box.
                 local r
                 items=(list del)
@@ -7703,31 +8067,31 @@ _waterbox() {
                     items+=("$r"/home/water/.agent-env/claude/*(N/:t) "$r"/home/water/.claude-env/*(N/:t))
                 done
                 compadd -a items
-            elif [[ "${words[3]}" == (del|rm) ]]; then
+            elif [[ "${pos[2]}" == (del|rm) ]]; then
                 items=(/etc/systemd/system/waterbox-hostwake-*.timer(N:t:r))
                 items=(wake-${items#waterbox-hostwake-}); compadd -a items
-            elif (( CURRENT == 4 )); then
+            elif (( n == 3 )); then
                 _waterbox_time                          # <profile> <HH:MM>
-            elif (( CURRENT == 5 )); then
+            elif (( n == 4 )); then
                 items=(once daily); compadd -a items    # [once|daily]
             fi ;;
         schedule-command)
-            if (( CURRENT == 3 )); then
-                items=(list del ${(f)"$(command waterbox _sessions 2>/dev/null)"})
+            if (( n == 2 )); then
+                items=(list del ${(f)"$(command waterbox "${sess[@]}" 2>/dev/null)"})
                 compadd -a items
-            elif [[ "${words[3]}" == (del|rm) ]]; then
+            elif [[ "${pos[2]}" == (del|rm) ]]; then
                 items=("$root"/etc/systemd/system/waterbox-schd-com-*.timer(N:t:r)
                        "$HOME"/.waterbox/envs/*/root/etc/systemd/system/waterbox-schd-com-*.timer(N:t:r))
                 items=(${items#waterbox-}); compadd -a items
-            elif (( CURRENT == 4 )); then
+            elif (( n == 3 )); then
                 _waterbox_time                          # <session> <HH:MM>
-            elif (( CURRENT == 5 )); then
+            elif (( n == 4 )); then
                 _message -e command 'command to send — e.g. "continue"'
-            elif (( CURRENT == 6 )); then
+            elif (( n == 5 )); then
                 items=(once daily); compadd -a items    # [once|daily]
             fi ;;
         completion)
-            (( CURRENT == 3 )) && { items=(zsh); compadd -a items; } ;;
+            (( n == 2 )) && { items=(zsh); compadd -a items; } ;;
     esac
 }
 compdef _waterbox waterbox
@@ -7748,6 +8112,8 @@ CLI_HERE_FLAG_USED=0
 CLI_UNSAFE_FLAG_USED=0
 CLI_ENV_NAME=""
 CLI_ENV_SEEN=0
+CLI_GAME_FLAG=0
+CLI_NO_GUI=0
 _parse_flags=1
 while [ $# -gt 0 ]; do
     if [ "$_parse_flags" = 0 ]; then
@@ -7757,12 +8123,17 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --)       _parse_flags=0; shift ;;
         --gui)    WATERBOX_GUI=1; CLI_BOOT_FLAG_USED=1; CLI_FLAGS_SEEN+=("$1"); shift ;;
-        --no-gui) WATERBOX_GUI=0; CLI_BOOT_FLAG_USED=1; CLI_FLAGS_SEEN+=("$1"); shift ;;
+        --no-gui) WATERBOX_GUI=0; CLI_NO_GUI=1; CLI_BOOT_FLAG_USED=1; CLI_FLAGS_SEEN+=("$1"); shift ;;
         --x11)    WATERBOX_GUI=1; WATERBOX_X11=1; CLI_BOOT_FLAG_USED=1; CLI_FLAGS_SEEN+=("$1"); shift ;;
         --no-gpu) WATERBOX_NO_GPU=1; CLI_BOOT_FLAG_USED=1; CLI_FLAGS_SEEN+=("$1"); shift ;;
         --usb)    WATERBOX_USB=1; CLI_BOOT_FLAG_USED=1; CLI_FLAGS_SEEN+=("$1"); shift ;;
         --audio)  WATERBOX_AUDIO=1; CLI_BOOT_FLAG_USED=1; CLI_FLAGS_SEEN+=("$1"); shift ;;
         --gamepad) WATERBOX_GAMEPAD=1; CLI_BOOT_FLAG_USED=1; CLI_FLAGS_SEEN+=("$1"); shift ;;
+        # Gaming bundle: display (Wayland, with the box's own X11 for X11-only
+        # games; plain --gui semantics on an X11-only host), audio, controllers.
+        # Never --usb or --x11: those stay separate, explicit decisions.
+        --game)   WATERBOX_GUI=1; WATERBOX_AUDIO=1; WATERBOX_GAMEPAD=1; CLI_GAME_FLAG=1
+                  CLI_BOOT_FLAG_USED=1; CLI_FLAGS_SEEN+=("$1"); shift ;;
         --here)   WATERBOX_HERE=1; CLI_HERE_FLAG_USED=1; CLI_FLAGS_SEEN+=("$1"); shift ;;
         --env)
             [ $# -ge 2 ] && [ -n "$2" ] || log_error "--env needs an environment name. See 'waterbox env list'."
@@ -7818,12 +8189,12 @@ fi
 case "$_cmd" in
     start|"")
         [ "$#" -le 2 ] \
-            || log_error "Usage: waterbox start [<session> | --here] [--env <name>] [--gui|--no-gui|--x11] [--no-gpu] [--usb] [--audio] [--gamepad]"
+            || log_error "Usage: waterbox start [<session> | --here] [--env <name>] [--gui|--no-gui|--x11] [--no-gpu] [--usb] [--audio] [--gamepad] [--game]"
         [ "$CLI_HERE_FLAG_USED" != 1 ] || [ "$#" -lt 2 ] \
             || log_error "--here and an explicit session name are mutually exclusive."
         ;;
     restart)
-        [ "$#" -eq 1 ] || log_error "Usage: waterbox restart [--env <name>] [--gui|--no-gui|--x11] [--no-gpu] [--usb] [--audio] [--gamepad]"
+        [ "$#" -eq 1 ] || log_error "Usage: waterbox restart [--env <name>] [--gui|--no-gui|--x11] [--no-gpu] [--usb] [--audio] [--gamepad] [--game]"
         [ "$CLI_HERE_FLAG_USED" != 1 ] || log_error "--here is valid with start, not restart."
         ;;
     reset)
@@ -7905,13 +8276,15 @@ case "$_cmd" in
         fi
         ;;
     env)
+        # `env create <name> --game` is the one option env takes.
         [ "${#CLI_FLAGS_SEEN[@]}" -eq 0 ] \
-            || log_error "Option '${CLI_FLAGS_SEEN[0]}' is not valid with env."
+            || { [ "${CLI_FLAGS_SEEN[*]}" = --game ] && [ "${2:-}" = create ]; } \
+            || log_error "Option '${CLI_FLAGS_SEEN[0]}' is not valid with env${2:+ $2}."
         case "$#:${2:-}" in
             1:|2:list) ;;
             3:create|3:delete) ;;
             4:rename) ;;
-            *) log_error "Usage: waterbox env [list | create <name> | rename <old> <new> | delete <name>]" ;;
+            *) log_error "Usage: waterbox env [list | create <name> [--game] | rename <old> <new> | delete <name>]" ;;
         esac
         ;;
     *) ;; # The final dispatcher prints the unknown-command error.
@@ -7926,19 +8299,17 @@ case "$_cmd" in
 esac
 
 # Resolve GUI=auto now that flags are parsed: on only when a Wayland socket is live.
-if [ "$WATERBOX_GUI" = auto ]; then
-    _wl="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/${WAYLAND_DISPLAY:-}"
-    [ -S "$_wl" ] || _wl="${WAYLAND_DISPLAY:-}"
-    _wl_base=$(basename -- "$_wl")
-    if [ -n "${WAYLAND_DISPLAY:-}" ] \
-       && [ "$_wl" = "$HOST_RUNTIME_DIR/$_wl_base" ] \
-       && [[ "$_wl_base" =~ ^wayland-[0-9]+$ ]] \
-       && [ -S "$_wl" ] && [ ! -L "$_wl" ]; then
-        WATERBOX_GUI=1
-    else
-        WATERBOX_GUI=0
-    fi
+HOST_WAYLAND=0
+_wl="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/${WAYLAND_DISPLAY:-}"
+[ -S "$_wl" ] || _wl="${WAYLAND_DISPLAY:-}"
+_wl_base=$(basename -- "$_wl")
+if [ -n "${WAYLAND_DISPLAY:-}" ] \
+   && [ "$_wl" = "$HOST_RUNTIME_DIR/$_wl_base" ] \
+   && [[ "$_wl_base" =~ ^wayland-[0-9]+$ ]] \
+   && [ -S "$_wl" ] && [ ! -L "$_wl" ]; then
+    HOST_WAYLAND=1
 fi
+[ "$WATERBOX_GUI" = auto ] && WATERBOX_GUI="$HOST_WAYLAND"
 
 # Every per-box command first picks its environment (see _resolve_env). Helper
 # calls name the environment, which a helper from an older release cannot parse,

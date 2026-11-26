@@ -164,29 +164,11 @@ warning stating the consequence when enabled.
 
 ### `--audio`
 
-- Host requirement: PipeWire. The helper accepts only
-  `/run/user/<host-uid>/pipewire-0`, a socket (not a symlink) owned by the host
-  user, and ID-map-binds it to `/tmp/.waterbox-pipewire` (container uid 1000
-  mapped to the host user, as for Wayland). No PipeWire socket: clear error,
-  no fallback.
-- The host Pulse socket is never exposed. A Pulse client can make the host
-  server load modules (for example a TCP listener). Instead the box runs its
-  own `pipewire-pulse` as the guest user, connected to the host graph through
-  `PIPEWIRE_REMOTE`; modules loaded over Pulse load inside the box.
-- Guest side: packages `pipewire pipewire-pulse pipewire-alsa` join `PKGS` for
-  new builds. Existing boxes are never package-upgraded implicitly; when the
-  binary is missing the shell prints the one-time install command.
-  `/etc/waterbox/boot-env` (written by the helper from the accepted mount,
-  never copied from a user file) exports `PIPEWIRE_REMOTE`. Managed guest config
-  masks the box's own `pipewire.service`, `pipewire.socket` and
-  `wireplumber.service` user units so no second graph starts, enables
-  `pipewire-pulse.socket` globally, and a drop-in gives `pipewire-pulse.service`
-  the remote plus `ConditionPathExists=/tmp/.waterbox-pipewire`.
-- Warning: the box is an unrestricted PipeWire client: microphone, all audio,
-  rerouting, and possibly code loaded by PipeWire's plugin factories as the host
-  user. A restricted-access socket is the deferred proper fix.
-- Environments never reach each other: one `FORWARD -i ve-waterbox+ -o
-  ve-waterbox+ -j DROP` stays above every per-environment ACCEPT.
+Superseded during implementation; see AGENTS.md "Audio goes through a sandboxed
+Pulse bridge". Summary: the box gets only a per-box, sandboxed host
+`pipewire-pulse` with module loading off, bound at `/tmp/.waterbox-pulse`.
+Exposing the host's PipeWire socket (the first design) let clients make the
+daemon load LADSPA code through audioconvert properties.
 
 ### `--gamepad`
 
